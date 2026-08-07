@@ -257,19 +257,30 @@ export async function buildClaudeDesktopState(config: OcxConfig, stored?: OcxCla
   for (const id of desktopVisibleNativeSlugs(config)) {
     effortByRoute.set(`native/${id}`, true);
   }
-  const models = Object.keys(profile.assignments).sort().map(route => ({
-    route,
-    label: modelByRoute.get(route)?.label ?? route,
-    available: available.has(route),
-    ...(modelByRoute.get(route)?.contextWindow ? { contextWindow: modelByRoute.get(route)!.contextWindow } : {}),
-    effortSupported: effortByRoute.get(route) ?? false,
-    // Read-only view of the 1M capability the written Desktop config already emits,
-    // derived from the SAME threshold so the dashboard chip can never disagree.
-    supports1m: (modelByRoute.get(route)?.contextWindow ?? 0) >= DESKTOP_SUPPORTS_1M_THRESHOLD,
-    assignment: profile.assignments[route]!,
-  }));
+  const { resolveDesktop1mFlags } = await import("../../claude/desktop-profile");
+  const models = Object.keys(profile.assignments).sort().map(route => {
+    const assignment = profile.assignments[route]!;
+    const contextWindow = modelByRoute.get(route)?.contextWindow;
+    const flags = resolveDesktop1mFlags(assignment, contextWindow);
+    // Catalog-derived eligibility (ignoring assignment overrides) — the GUI uses
+    // this to show whether the pin is automatic vs operator-forced.
+    const autoSupports1m = (contextWindow ?? 0) >= DESKTOP_SUPPORTS_1M_THRESHOLD;
+    return {
+      route,
+      label: modelByRoute.get(route)?.label ?? route,
+      available: available.has(route),
+      ...(contextWindow ? { contextWindow } : {}),
+      effortSupported: effortByRoute.get(route) ?? false,
+      supports1m: flags.supports1m,
+      prefer1m: flags.prefer1m,
+      autoSupports1m,
+      assignment,
+    };
+  });
   return {
-    profile,
+    // Surface the Chat-tab pin with its write-time default so the GUI never has
+    // to invent one and then mark a pristine profile dirty.
+    profile: { ...profile, chatTabEnabled: profile.chatTabEnabled !== false },
     models,
     rendered: renderDesktopProfile(profile, profileModels),
     port: config.port,

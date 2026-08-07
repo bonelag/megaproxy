@@ -2353,7 +2353,25 @@ button.prov-account-row.active { cursor: default; }
   background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent);
   font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
 }
+/* The preference chip must not read as a second capability chip: same shape, quieter tone. */
+.claude-1m-chip-prefer {
+  background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green);
+}
 .claude-model-body { padding: 10px 12px 12px; border-top: 1px solid var(--border-soft); }
+/* Per-model settings reuse the shared setting-row grammar, boxed so the two 1M toggles
+   read as one group between the default radio and the move control. */
+.claude-model-settings {
+  margin-top: 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-xs);
+  background: var(--raised); overflow: hidden;
+}
+.claude-model-settings .setting-row { padding: 9px 12px; }
+/* One family per rail pane: the pane owns the drop target the old <section> used to. */
+.claude-family-pane { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.claude-family-pane .claude-lane-search { width: 100%; margin: 0; }
+.claude-family-pane .claude-lane-models { padding: 0; min-height: 0; }
+.claude-family-pane .claude-default-needed { margin: 0; }
+.claude-hidden-note { margin: 0; color: var(--faint); font-size: 11.5px; }
+.claude-desktop-profile-io { min-width: 0; }
 .claude-field { display: block; margin-top: 10px; }
 .claude-model-body > .claude-field:first-child { margin-top: 0; }
 .claude-field > span, .claude-move-row > label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 11.5px; font-weight: 550; }

@@ -149,7 +149,17 @@ export async function handleClaudeDesktopCommand(argv: string[], deps: ApplyProf
       const [, familyRaw, routeRaw] = argv;
       if (!isFamily(familyRaw) || !routeRaw || argv.length !== 3) throw new Error("Usage: ocx claude desktop default <family> <route|none>");
       const route = routeRaw === "none" ? null : routeRaw;
-      if (route && !state.models.some(model => model.route === route && model.available)) throw new Error(`현재 사용할 수 없는 모델입니다: ${route}`);
+      if (route && !state.models.some(model => model.route === route && model.available)) {
+        // Mirrors the PUT route: an unavailable default is only a mistake while a live
+        // sibling could be chosen instead. A family whose every member is unavailable has
+        // no legal alternative — setDesktopFamilyDefault refuses to clear a non-empty
+        // family — so refusing here would make it unsettable.
+        const family = state.profile.assignments[route]?.family;
+        const hasAvailableSibling = state.models.some(
+          model => model.available && model.route !== route && state.profile.assignments[model.route]?.family === family,
+        );
+        if (!family || hasAvailableSibling) throw new Error(`현재 사용할 수 없는 모델입니다: ${route}`);
+      }
       const profile = setDesktopFamilyDefault(state.profile, familyRaw, route);
       config.claudeCode = { ...(config.claudeCode ?? {}), desktopProfile: profile };
       saveConfigPreservingClaudeCode(config);

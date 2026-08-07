@@ -1855,6 +1855,19 @@ export const en = {
   "claudeDesktop.health.stats": "{count} req / {errors} err",
   "claudeDesktop.effort.supported": "effort",
   "claudeDesktop.effort.displayOnly": "effort (display only)",
+  "claudeDesktop.section.general": "General",
+  "claudeDesktop.section.profileIo": "Import / export",
+  "claudeDesktop.chatTab": "Chat tab",
+  "claudeDesktop.chatTabDesc": "Keep Claude Desktop's Chat tab visible. When off, only Cowork and Code remain after applying.",
+  "claudeDesktop.supports1mLabel": "1M context support",
+  "claudeDesktop.supports1mAuto": "This model reports a 1M window, so support is on by default.",
+  "claudeDesktop.supports1mManual": "Only turn this on if the model really accepts a 1M window.",
+  "claudeDesktop.prefer1mLabel": "Prefer 1M by default",
+  "claudeDesktop.prefer1mDesc": "Claude Desktop selects the 1M variant of this model first.",
+  "claudeDesktop.prefer1mRequires": "Turn on 1M context support first.",
+  "claudeDesktop.prefer1mChip": "1M default",
+  "claudeDesktop.hiddenUnavailable": "{count} unavailable model hidden. Enable its provider to assign it.",
+  "claudeDesktop.profileIoHint": "Move this Desktop profile between machines as JSON. Import loads a draft you still have to save.",
 
 } as const;
 

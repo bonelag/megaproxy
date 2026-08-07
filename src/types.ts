@@ -478,12 +478,28 @@ export type OcxClaudeDesktopFamily = "opus" | "fable" | "sonnet" | "haiku";
 export interface OcxClaudeDesktopAssignment {
   family: OcxClaudeDesktopFamily;
   alias: string;
+  /**
+   * Desktop 1M capability pin written into the 3P config. When unset, derived from
+   * the route's authoritative context window (>= 1M). Explicit false suppresses the
+   * pin even for 1M-capable models; explicit true asserts it without requiring a window.
+   */
+  supports1m?: boolean;
+  /**
+   * When true (and supports1m is effective), Desktop selects the 1M variant by default.
+   * Ignored / forced off whenever supports1m is not effective.
+   */
+  prefer1m?: boolean;
 }
 
 export interface OcxClaudeDesktopProfile {
   version: 1;
   assignments: Record<string, OcxClaudeDesktopAssignment>;
   defaults: Record<OcxClaudeDesktopFamily, string | null>;
+  /**
+   * Keep Claude Desktop's Chat tab visible in the applied 3P gateway config.
+   * Default true: a missing key used to hide Chat after every re-apply.
+   */
+  chatTabEnabled?: boolean;
   /** SHA-256 fingerprint of the last successfully applied 3P config content. */
   appliedFingerprint?: string;
   /** ISO timestamp of the last successful apply. */

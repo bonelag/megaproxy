@@ -20,6 +20,18 @@ export interface RenderedDesktopModel extends DesktopProfileModel {
   family: DesktopFamily;
   isFamilyDefault: boolean;
   supports1m: boolean;
+  prefer1m: boolean;
+}
+
+/** Effective 1M pins for one assignment + optional authoritative context window. */
+export function resolveDesktop1mFlags(
+  assignment: { supports1m?: boolean; prefer1m?: boolean } | undefined,
+  contextWindow?: number,
+): { supports1m: boolean; prefer1m: boolean } {
+  const auto = typeof contextWindow === "number" && contextWindow >= 1_000_000;
+  const supports1m = assignment?.supports1m ?? auto;
+  const prefer1m = supports1m && (assignment?.prefer1m ?? supports1m);
+  return { supports1m, prefer1m };
 }
 
 const DATE_ALIAS = /^claude-opus-4-8-(2026\d{4})$/;
@@ -60,13 +72,38 @@ function assertExactKeys(value: Record<string, unknown>, keys: readonly string[]
  * another family — would erase the fingerprint the apply route wrote, and the GUI would report
  * "not applied" for a config that is applied on disk.
  */
-function appliedMarkers(source: { appliedFingerprint?: unknown; appliedAt?: unknown }): {
+function appliedMarkers(source: {
+  appliedFingerprint?: unknown;
+  appliedAt?: unknown;
+  chatTabEnabled?: unknown;
+}): {
   appliedFingerprint?: string;
   appliedAt?: string;
+  chatTabEnabled?: boolean;
 } {
   return {
     ...(typeof source.appliedFingerprint === "string" ? { appliedFingerprint: source.appliedFingerprint } : {}),
     ...(typeof source.appliedAt === "string" ? { appliedAt: source.appliedAt } : {}),
+    // Default is "on" at write time; only an explicit false is preserved as a stored opt-out.
+    ...(typeof source.chatTabEnabled === "boolean" ? { chatTabEnabled: source.chatTabEnabled } : {}),
+  };
+}
+
+function parseOptionalBool(value: unknown, path: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new DesktopProfileError("must be a boolean", path);
+  return value;
+}
+
+function assignment1mFields(
+  supports1m: boolean | undefined,
+  prefer1m: boolean | undefined,
+): Pick<OcxClaudeDesktopAssignment, "supports1m" | "prefer1m"> {
+  // prefer1m is meaningless without supports1m — drop or force it off at the parse boundary.
+  const effectivePrefer = supports1m === false ? false : prefer1m;
+  return {
+    ...(supports1m !== undefined ? { supports1m } : {}),
+    ...(effectivePrefer !== undefined ? { prefer1m: effectivePrefer } : {}),
   };
 }
 
@@ -98,7 +135,15 @@ export function parseDesktopProfile(value: unknown): DesktopProfile {
   // `appliedFingerprint`/`appliedAt` are written back by the apply route once a profile
   // reaches Claude Desktop (see server/management/agent-settings-routes.ts). Rejecting them
   // here made every reload after the first apply fail with `unknown field`.
-  assertExactKeys(value, ["version", "assignments", "defaults", "appliedFingerprint", "appliedAt"], "profile");
+  // `chatTabEnabled` is the Desktop Chat-tab pin written into the 3P gateway config.
+  assertExactKeys(value, [
+    "version",
+    "assignments",
+    "defaults",
+    "chatTabEnabled",
+    "appliedFingerprint",
+    "appliedAt",
+  ], "profile");
   if (value.version !== 1) throw new DesktopProfileError("version must be 1", "profile.version");
   if (!isPlainObject(value.assignments)) throw new DesktopProfileError("must be an object", "profile.assignments");
   if (!isPlainObject(value.defaults)) throw new DesktopProfileError("must be an object", "profile.defaults");
@@ -109,13 +154,16 @@ export function parseDesktopProfile(value: unknown): DesktopProfile {
   if (value.appliedAt !== undefined && typeof value.appliedAt !== "string") {
     throw new DesktopProfileError("must be a string", "profile.appliedAt");
   }
+  if (value.chatTabEnabled !== undefined && typeof value.chatTabEnabled !== "boolean") {
+    throw new DesktopProfileError("must be a boolean", "profile.chatTabEnabled");
+  }
 
   const assignments: Record<string, OcxClaudeDesktopAssignment> = {};
   const aliases = new Set<string>();
   for (const [route, raw] of Object.entries(value.assignments)) {
     if (!route.trim() || !route.includes("/")) throw new DesktopProfileError("route must be provider/model", `profile.assignments.${route || "<empty>"}`);
     if (!isPlainObject(raw)) throw new DesktopProfileError("must be an object", `profile.assignments.${route}`);
-    assertExactKeys(raw, ["family", "alias"], `profile.assignments.${route}`);
+    assertExactKeys(raw, ["family", "alias", "supports1m", "prefer1m"], `profile.assignments.${route}`);
     if (!isFamily(raw.family)) throw new DesktopProfileError("unknown family", `profile.assignments.${route}.family`);
     if (typeof raw.alias !== "string" || !raw.alias) throw new DesktopProfileError("must be a non-empty string", `profile.assignments.${route}.alias`);
     if (isRealAnthropicRoute(route)) {
@@ -125,7 +173,16 @@ export function parseDesktopProfile(value: unknown): DesktopProfile {
     }
     if (aliases.has(raw.alias)) throw new DesktopProfileError(`duplicate alias "${raw.alias}"`, `profile.assignments.${route}.alias`);
     aliases.add(raw.alias);
-    assignments[route] = { family: raw.family, alias: raw.alias };
+    const supports1m = parseOptionalBool(raw.supports1m, `profile.assignments.${route}.supports1m`);
+    const prefer1m = parseOptionalBool(raw.prefer1m, `profile.assignments.${route}.prefer1m`);
+    if (prefer1m === true && supports1m === false) {
+      throw new DesktopProfileError("prefer1m requires supports1m", `profile.assignments.${route}.prefer1m`);
+    }
+    assignments[route] = {
+      family: raw.family,
+      alias: raw.alias,
+      ...assignment1mFields(supports1m, prefer1m),
+    };
   }
 
   const defaults = {} as DesktopProfile["defaults"];
@@ -189,7 +246,12 @@ export function reconcileDesktopProfile(
     const current = defaults[family];
     defaults[family] = current && assignments[current]?.family === family ? current : (members[0] ?? null);
   }
-  return parseDesktopProfile({ version: 1, assignments, defaults, ...appliedMarkers(profile) });
+  return parseDesktopProfile({
+    version: 1,
+    assignments,
+    defaults,
+    ...appliedMarkers(profile),
+  });
 }
 
 export function moveDesktopRoute(
@@ -252,12 +314,14 @@ export function renderDesktopProfile(
   return [...defaultOrder, ...rest].map(route => {
     const model = modelByRoute.get(route)!;
     const assignment = parsed.assignments[route]!;
+    const flags = resolveDesktop1mFlags(assignment, model.contextWindow);
     return {
       ...model,
       name: assignment.alias,
       family: assignment.family,
       isFamilyDefault: effectiveDefaults[assignment.family] === route,
-      supports1m: typeof model.contextWindow === "number" && model.contextWindow >= 1_000_000,
+      supports1m: flags.supports1m,
+      prefer1m: flags.prefer1m,
     };
   });
 }

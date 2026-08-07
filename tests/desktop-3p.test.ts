@@ -160,6 +160,8 @@ describe("Claude Desktop 3P models", () => {
       inferenceCredentialKind: "static",
       inferenceGatewayBaseUrl: "http://127.0.0.1:4096",
       inferenceGatewayApiKey: "test-key",
+      // Apply rewrites the whole entry; without this Desktop hides Chat after every apply.
+      chatTabEnabled: true,
       modelDiscoveryEnabled: false,
     });
     // Static list carries the pinned entries.
@@ -173,6 +175,11 @@ describe("Claude Desktop 3P models", () => {
     expect((byName.get(desktop3pAlias("cursor", "gpt-5.6-luna")) as { supports1m?: boolean }).supports1m).toBe(true);
     expect((byName.get("claude-opus-4-8-ncb") as { supports1m?: boolean }).supports1m).toBeUndefined();
     expect((byName.get("claude-opus-4-6") as { supports1m?: boolean }).supports1m).toBeUndefined();
+    // prefer1m rides along with supports1m in profile-less mode: with no profile there is
+    // nowhere to express "1M-capable but not the default", so the capable model gets both,
+    // and a model without support must never carry a preference the writer would ignore.
+    expect((byName.get(desktop3pAlias("cursor", "gpt-5.6-luna")) as { prefer1m?: boolean }).prefer1m).toBe(true);
+    expect((byName.get("claude-opus-4-6") as { prefer1m?: boolean }).prefer1m).toBeUndefined();
     expect(resolveDesktop3pAlias("claude-opus-4-8-ncb")).toBe("native/gpt-5.6-sol");
   });
 
@@ -180,6 +187,7 @@ describe("Claude Desktop 3P models", () => {
     const config = generateDesktop3pConfig(4096, ["gpt-5.6-sol"], [], "test-key", "hybrid");
     const reparsed = JSON.parse(JSON.stringify(config));
     expect(reparsed.modelDiscoveryEnabled).toBe(true);
+    expect(reparsed.chatTabEnabled).toBe(true);
     expect(reparsed.inferenceModels.map((m: { name: string }) => m.name)).toEqual(["claude-opus-4-8-ncb"]);
   });
 
@@ -187,6 +195,7 @@ describe("Claude Desktop 3P models", () => {
     const config = generateDesktop3pConfig(4096, ["gpt-5.6-sol"], [], "test-key", "discovery");
     const reparsed = JSON.parse(JSON.stringify(config));
     expect(reparsed.modelDiscoveryEnabled).toBe(true);
+    expect(reparsed.chatTabEnabled).toBe(true);
     expect(reparsed.inferenceModels).toBeUndefined();
     expect(resolveDesktop3pAlias("claude-opus-4-8-ncb")).toBe("native/gpt-5.6-sol");
   });
@@ -216,6 +225,7 @@ describe("Claude Desktop 3P models", () => {
       inferenceCredentialKind: "static",
       inferenceGatewayBaseUrl: "http://127.0.0.1:4096",
       inferenceGatewayApiKey: "test-key",
+      chatTabEnabled: true,
       modelDiscoveryEnabled: false,
     });
     expect(reparsed.inferenceModels.map((model: { name: string }) => model.name)).toEqual([
@@ -239,6 +249,72 @@ describe("Claude Desktop 3P models", () => {
     expect(luna).toMatchObject({ anthropicFamilyTier: "haiku", isFamilyDefault: true, supports1m: true });
     expect(luna?.name).toMatch(/^claude-opus-4-8-2026\d{4}$/);
     expect(resolveDesktop3pAlias(luna!.name)).toBe("cursor/gpt-5.6-luna");
+  });
+
+  // Per-model 1M pins are the only reason a profile-driven config can disagree with the
+  // catalog. Both directions must reach the written entry, or the GUI toggles are decorative.
+  test("profile 1M pins override the catalog in the written model list", () => {
+    const routed = [
+      { provider: "cursor", id: "gpt-5.6-luna", contextWindow: 1_000_000 },
+      { provider: "cursor", id: "grok-4.5", contextWindow: 200_000 },
+    ];
+    const catalog = [
+      { route: "native/gpt-5.6-sol", label: "GPT 5.6 Sol" },
+      { route: "cursor/gpt-5.6-luna", label: "GPT 5.6 Luna", contextWindow: 1_000_000 },
+      { route: "cursor/grok-4.5", label: "Grok 4.5", contextWindow: 200_000 },
+    ];
+    const base = reconcileDesktopProfile(undefined, catalog);
+    const profile = {
+      ...base,
+      assignments: {
+        ...base.assignments,
+        // A 1M model held back from being the 1M default.
+        "cursor/gpt-5.6-luna": { ...base.assignments["cursor/gpt-5.6-luna"]!, supports1m: true, prefer1m: false },
+        // A 200k model forced 1M-capable by the operator.
+        "cursor/grok-4.5": { ...base.assignments["cursor/grok-4.5"]!, supports1m: true },
+      },
+    };
+    const models = generateDesktop3pModels(["gpt-5.6-sol"], routed, profile);
+    const luna = models.find(model => model.labelOverride.includes("Luna"));
+    const grok = models.find(model => model.labelOverride.includes("Grok"));
+    expect(luna?.supports1m).toBe(true);
+    expect(luna?.prefer1m).toBeUndefined();
+    expect(grok?.supports1m).toBe(true);
+    expect(grok?.prefer1m).toBe(true);
+  });
+
+  test("a supports1m: false pin suppresses 1M for an above-threshold model", () => {
+    const routed = [{ provider: "cursor", id: "gpt-5.6-luna", contextWindow: 1_000_000 }];
+    const catalog = [
+      { route: "native/gpt-5.6-sol", label: "GPT 5.6 Sol" },
+      { route: "cursor/gpt-5.6-luna", label: "GPT 5.6 Luna", contextWindow: 1_000_000 },
+    ];
+    const base = reconcileDesktopProfile(undefined, catalog);
+    const profile = {
+      ...base,
+      assignments: {
+        ...base.assignments,
+        "cursor/gpt-5.6-luna": { ...base.assignments["cursor/gpt-5.6-luna"]!, supports1m: false },
+      },
+    };
+    const luna = generateDesktop3pModels(["gpt-5.6-sol"], routed, profile)
+      .find(model => model.labelOverride.includes("Luna"));
+    expect(luna?.supports1m).toBeUndefined();
+    expect(luna?.prefer1m).toBeUndefined();
+  });
+
+  // The Chat tab regression this pin exists for: apply rewrites the whole entry, and Desktop
+  // reads a missing key as off, so a user's manually enabled Chat tab vanished on every apply.
+  test("chatTabEnabled follows the profile, defaulting to on", () => {
+    const catalog = [{ route: "native/gpt-5.6-sol", label: "GPT 5.6 Sol" }];
+    const profile = reconcileDesktopProfile(undefined, catalog);
+    const on = JSON.parse(JSON.stringify(generateDesktop3pConfig(4096, ["gpt-5.6-sol"], [], "k", "static", profile)));
+    expect(on.chatTabEnabled).toBe(true);
+
+    const off = JSON.parse(JSON.stringify(
+      generateDesktop3pConfig(4096, ["gpt-5.6-sol"], [], "k", "static", { ...profile, chatTabEnabled: false }),
+    ));
+    expect(off.chatTabEnabled).toBe(false);
   });
 
   test("backs up owned config and preserves old bytes when atomic replacement fails", () => {

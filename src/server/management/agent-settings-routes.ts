@@ -683,8 +683,22 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       }
       for (const family of ["opus", "fable", "sonnet", "haiku"] as const) {
         const nextDefault = parsed.defaults[family];
-        const target = nextDefault ? current.models.find(model => model.route === nextDefault) : undefined;
-        if (target && !target.available && current.profile.defaults[family] !== nextDefault) {
+        if (!nextDefault || nextDefault === current.profile.defaults[family]) continue;
+        const target = current.models.find(model => model.route === nextDefault);
+        if (!target || target.available) continue;
+        /*
+         * An unavailable default is only a mistake when a live sibling could have been
+         * picked instead. Once every member of a family is unavailable there is NO legal
+         * alternative: parseDesktopProfile requires a non-empty family to name one of its
+         * own members, and an assignment for a disabled provider is deliberately retained
+         * (dropping it would lose the alias). Rejecting here made such a family
+         * unsaveable — and because the check runs before anything is written, it froze the
+         * whole profile on whatever edit had emptied that family.
+         */
+        const hasAvailableSibling = current.models.some(
+          model => model.available && parsed.assignments[model.route]?.family === family,
+        );
+        if (hasAvailableSibling) {
           throw new Error(`현재 사용할 수 없는 모델은 기본값으로 지정할 수 없습니다: ${nextDefault}`);
         }
       }

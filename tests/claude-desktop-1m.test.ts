@@ -8,8 +8,12 @@ import type { OcxConfig } from "../src/types";
 
 /**
  * D1c: the dashboard surfaces the same 1M eligibility the writer emits, from one
- * threshold — never a second rule that could drift. The chip is read-only; the
- * prefer1m toggle needs a profile field and is deferred (030a §D1-3).
+ * threshold — never a second rule that could drift.
+ *
+ * The chip is no longer read-only: the profile carries per-model `supports1m`/`prefer1m`
+ * pins, so the DTO reports BOTH the catalog-derived eligibility (`autoSupports1m`, which
+ * the GUI needs to explain why a toggle defaults where it does) and the effective pin the
+ * writer will emit (`supports1m`/`prefer1m`).
  */
 
 const config = {
@@ -39,6 +43,19 @@ test("supports1m is true at and above the threshold, false below it", async () =
     if (exact1M) expect(exact1M.supports1m).toBe(true);      // 1_000_000 exactly
     if (below) expect(below.supports1m).toBe(false);         // 983_616
     if (blank) expect(blank.supports1m).toBe(false);         // no window known
+
+    // With no pins stored, the effective flag and the catalog-derived one must agree —
+    // that is what lets the GUI present "auto" as the toggle's resting state.
+    for (const model of state.models) {
+      expect(model.assignment.supports1m).toBeUndefined();
+      expect(model.supports1m).toBe(model.autoSupports1m);
+      // prefer1m defaults to support: resolveDesktop1mFlags is the single rule, and the
+      // writer, the DTO and the GUI toggles all read it.
+      expect(model.prefer1m).toBe(model.autoSupports1m);
+    }
+
+    // Chat tab is reported explicitly, so the GUI never has to guess from an absent key.
+    expect(state.profile.chatTabEnabled).toBe(true);
 
     // The boundary rule itself: 983616 must never qualify, 1000000 always does.
     expect(983_616 >= DESKTOP_SUPPORTS_1M_THRESHOLD).toBe(false);

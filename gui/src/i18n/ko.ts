@@ -1849,5 +1849,18 @@ export const ko: Record<TKey, string> = {
   "claudeDesktop.health.stats": "{count} 요청 / {errors} 에러",
   "claudeDesktop.effort.supported": "effort",
   "claudeDesktop.effort.displayOnly": "effort (표시만)",
+  "claudeDesktop.section.general": "일반",
+  "claudeDesktop.section.profileIo": "가져오기 / 내보내기",
+  "claudeDesktop.chatTab": "채팅 탭",
+  "claudeDesktop.chatTabDesc": "Claude Desktop의 채팅 탭을 계속 표시합니다. 끄면 적용 후 Cowork와 Code만 남습니다.",
+  "claudeDesktop.supports1mLabel": "1M 컨텍스트 지원",
+  "claudeDesktop.supports1mAuto": "이 모델은 1M 창을 보고하므로 기본으로 켜집니다.",
+  "claudeDesktop.supports1mManual": "모델이 실제로 1M 창을 받는 경우에만 켜세요.",
+  "claudeDesktop.prefer1mLabel": "기본으로 1M 사용",
+  "claudeDesktop.prefer1mDesc": "Claude Desktop이 이 모델의 1M 변형을 먼저 선택합니다.",
+  "claudeDesktop.prefer1mRequires": "먼저 1M 컨텍스트 지원을 켜세요.",
+  "claudeDesktop.prefer1mChip": "1M 기본",
+  "claudeDesktop.hiddenUnavailable": "사용할 수 없는 모델 {count}개를 숨겼습니다. 해당 프로바이더를 켜면 배치할 수 있습니다.",
+  "claudeDesktop.profileIoHint": "이 Desktop 프로필을 JSON으로 다른 컴퓨터에 옮깁니다. 가져오기는 초안만 불러오므로 저장이 필요합니다.",
 
 };

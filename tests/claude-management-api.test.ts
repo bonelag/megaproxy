@@ -623,6 +623,114 @@ test("Claude Desktop profile GET, PUT and apply round-trip four-family assignmen
 });
 
 /*
+ * A family whose LAST available member is moved away must still be saveable.
+ *
+ * parseDesktopProfile requires a non-empty family to name one of its own members as the
+ * default, and an assignment whose provider went away is deliberately retained (dropping
+ * it would lose the alias). So once every remaining member is unavailable there is no
+ * legal alternative default — rejecting that combination froze the whole profile on the
+ * edit that emptied the family, and no later edit could be saved either.
+ */
+async function seedFamilyWithOneDeadMember(): Promise<{ live: string; dead: string }> {
+  const live = "mock/test-model";
+  const dead = "doomed/dying-model";
+  const seeded = loadConfig();
+  seeded.providers = {
+    ...seeded.providers,
+    doomed: { adapter: "openai-chat", baseUrl: "http://127.0.0.1:1/v1", apiKey: "k", allowPrivateNetwork: true, liveModels: false, models: ["dying-model"] },
+  };
+  saveConfig(seeded);
+
+  // Both models exist, so putting them into Fable is an ordinary edit.
+  const server = startServer(0);
+  try {
+    const initial = await fetch(new URL("/api/claude-desktop", server.url)).then(r => r.json()) as Record<string, any>;
+    const edited = structuredClone(initial.profile);
+    edited.assignments[live].family = "fable";
+    edited.assignments[dead].family = "fable";
+    edited.defaults.fable = live;
+    edited.defaults.opus = Object.keys(edited.assignments)
+      .filter(route => edited.assignments[route].family === "opus")
+      .sort()[0] ?? null;
+    const put = await fetch(new URL("/api/claude-desktop", server.url), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: edited }),
+    });
+    expect(put.status).toBe(200);
+  } finally {
+    await server.stop(true);
+  }
+
+  // Drop the provider: its model stays assigned to Fable but is no longer available.
+  const pruned = loadConfig();
+  delete pruned.providers.doomed;
+  saveConfig(pruned);
+  return { live, dead };
+}
+
+test("Claude Desktop PUT accepts an unavailable default once the family has no available member", async () => {
+  const { live, dead } = await seedFamilyWithOneDeadMember();
+  const server = startServer(0);
+  try {
+    const state = await fetch(new URL("/api/claude-desktop", server.url)).then(r => r.json()) as Record<string, any>;
+    expect(state.models.find((m: { route: string }) => m.route === dead).available).toBe(false);
+    expect(state.profile.defaults.fable).toBe(live);
+
+    // Move the one live member out of Fable. The only sibling left is unavailable, so it
+    // is the only default the parser will accept for a still-non-empty family.
+    const edited = structuredClone(state.profile);
+    edited.assignments[live].family = "sonnet";
+    edited.defaults.sonnet = live;
+    edited.defaults.fable = dead;
+    const put = await fetch(new URL("/api/claude-desktop", server.url), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: edited }),
+    });
+    expect(put.status).toBe(200);
+    expect(loadConfig().claudeCode?.desktopProfile?.defaults.fable).toBe(dead);
+
+    // The profile is not stuck: a further unrelated edit still saves.
+    const after = await fetch(new URL("/api/claude-desktop", server.url)).then(r => r.json()) as Record<string, any>;
+    const again = structuredClone(after.profile);
+    again.chatTabEnabled = false;
+    const second = await fetch(new URL("/api/claude-desktop", server.url), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: again }),
+    });
+    expect(second.status).toBe(200);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+// The relaxation above is narrow: while a live sibling exists, picking the dead model is
+// still an operator mistake that would hand Claude Desktop a model it cannot reach.
+test("Claude Desktop PUT still rejects an unavailable default when an available sibling exists", async () => {
+  const { live, dead } = await seedFamilyWithOneDeadMember();
+  const server = startServer(0);
+  try {
+    const state = await fetch(new URL("/api/claude-desktop", server.url)).then(r => r.json()) as Record<string, any>;
+    const edited = structuredClone(state.profile);
+    // live stays in Fable, so Fable has an available member to prefer.
+    expect(edited.assignments[live].family).toBe("fable");
+    edited.defaults.fable = dead;
+    const put = await fetch(new URL("/api/claude-desktop", server.url), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: edited }),
+    });
+    expect(put.status).toBe(400);
+    expect((await put.json() as { error: string }).error).toContain(dead);
+    expect(loadConfig().claudeCode?.desktopProfile?.defaults.fable).toBe(live);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+/*
  * Mechanism guard for #859: the apply route must keep building the alias
  * registry in the serving process. (The CLI→daemon delegation half is pinned
  * in tests/claude-desktop-cli.test.ts; this module-global registry is shared

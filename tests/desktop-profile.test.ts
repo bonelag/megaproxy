@@ -140,4 +140,87 @@ describe("Claude Desktop profile", () => {
         .toThrow('unknown field "bogusField"');
     });
   });
+
+  // The Chat-tab pin and the per-model 1M pins are the only profile fields the GUI can set
+  // beyond family and default. Both must survive the same rebuild paths as the applied
+  // markers: a drag between families used to be enough to erase them.
+  describe("chatTabEnabled", () => {
+    test("absent stays absent, so the writer's own default (on) applies", () => {
+      const parsed = parseDesktopProfile(reconcileDesktopProfile(emptyDesktopProfile(), models));
+      expect(parsed).not.toHaveProperty("chatTabEnabled");
+    });
+
+    test("an explicit opt-out is preserved through parse, reconcile and move", () => {
+      const off = { ...reconcileDesktopProfile(emptyDesktopProfile(), models), chatTabEnabled: false };
+      expect(parseDesktopProfile(off).chatTabEnabled).toBe(false);
+      expect(reconcileDesktopProfile(off, [...models, { route: "test/new", label: "New" }]).chatTabEnabled).toBe(false);
+      expect(moveDesktopRoute(off, "cursor/gpt-5.6-luna", "sonnet").chatTabEnabled).toBe(false);
+      expect(setDesktopFamilyDefault(off, "opus", "native/gpt-5.6-sol").chatTabEnabled).toBe(false);
+    });
+
+    test("a non-boolean is rejected with the field named", () => {
+      const profile = reconcileDesktopProfile(emptyDesktopProfile(), models);
+      expect(() => parseDesktopProfile({ ...profile, chatTabEnabled: "yes" }))
+        .toThrow("profile.chatTabEnabled");
+    });
+  });
+
+  describe("per-model 1M pins", () => {
+    function pinned(route: string, pins: { supports1m?: boolean; prefer1m?: boolean }) {
+      const profile = reconcileDesktopProfile(emptyDesktopProfile(), models);
+      return {
+        ...profile,
+        assignments: { ...profile.assignments, [route]: { ...profile.assignments[route]!, ...pins } },
+      };
+    }
+
+    // Absent pins mean "derive from the context window", which is what resolveDesktop1mFlags
+    // does. Materializing them on save would freeze today's catalog value forever.
+    test("absent pins stay absent", () => {
+      const parsed = parseDesktopProfile(reconcileDesktopProfile(emptyDesktopProfile(), models));
+      expect(parsed.assignments["cursor/gpt-5.6-luna"]).not.toHaveProperty("supports1m");
+      expect(parsed.assignments["cursor/gpt-5.6-luna"]).not.toHaveProperty("prefer1m");
+    });
+
+    test("supports1m forces a below-threshold model on, and prefer1m follows it", () => {
+      const profile = pinned("cursor/gpt-5.6-luna", { supports1m: true });
+      const rendered = renderDesktopProfile(profile, models);
+      const luna = rendered.find(model => model.route === "cursor/gpt-5.6-luna");
+      // 200_000 window, so only the explicit pin can make this 1M-capable.
+      expect(luna?.supports1m).toBe(true);
+      expect(luna?.prefer1m).toBe(true);
+    });
+
+    test("supports1m false overrides an above-threshold window and clears preference", () => {
+      const profile = pinned("native/gpt-5.6-sol", { supports1m: false });
+      const sol = renderDesktopProfile(profile, models).find(model => model.route === "native/gpt-5.6-sol");
+      expect(sol?.supports1m).toBe(false);
+      expect(sol?.prefer1m).toBe(false);
+    });
+
+    test("support without the 1M default is expressible", () => {
+      const profile = pinned("native/gpt-5.6-sol", { supports1m: true, prefer1m: false });
+      const sol = renderDesktopProfile(profile, models).find(model => model.route === "native/gpt-5.6-sol");
+      expect(sol?.supports1m).toBe(true);
+      expect(sol?.prefer1m).toBe(false);
+    });
+
+    // Preference without support is a contradiction the writer would silently ignore, so it
+    // is rejected at the parse boundary rather than stored as a lie.
+    test("prefer1m with supports1m false is rejected", () => {
+      expect(() => parseDesktopProfile(pinned("native/gpt-5.6-sol", { supports1m: false, prefer1m: true })))
+        .toThrow("prefer1m requires supports1m");
+    });
+
+    test("non-boolean pins are rejected with the route named", () => {
+      expect(() => parseDesktopProfile(pinned("native/gpt-5.6-sol", { supports1m: 1 as unknown as boolean })))
+        .toThrow("profile.assignments.native/gpt-5.6-sol.supports1m");
+    });
+
+    test("pins survive a move between families", () => {
+      const moved = moveDesktopRoute(pinned("cursor/gpt-5.6-luna", { supports1m: true }), "cursor/gpt-5.6-luna", "haiku");
+      expect(moved.assignments["cursor/gpt-5.6-luna"]?.supports1m).toBe(true);
+      expect(moved.assignments["cursor/gpt-5.6-luna"]?.family).toBe("haiku");
+    });
+  });
 });

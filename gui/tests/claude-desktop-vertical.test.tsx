@@ -1,17 +1,16 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { act } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import type { Root } from "react-dom/client";
 import ClaudeDesktop from "../src/pages/ClaudeDesktop";
 import { LanguageProvider } from "../src/i18n/provider";
 import { clearClientResourceStoresForTests } from "../src/client-resource";
 
 /**
- * The family stack is vertical and collapsible. These are mounted rather than
- * source-shape tests because the interesting failures are interactive: a folded family
- * must still accept a drop, the header must keep reporting the TRUE total while a
- * search narrows the body, and a collapse must never be re-derived out from under the
- * user when a move changes the family counts.
+ * Desktop settings use the same rail-and-pane layout as Claude Code: one category per
+ * rail row instead of four stacked collapsibles. Mounted rather than source-shape,
+ * because the interesting failures are interactive — selecting a category, dropping a
+ * model onto a family pane, and keeping the save bar honest across panes.
  */
 
 const globals = ["document", "window", "navigator", "localStorage", "fetch", "IS_REACT_ACT_ENVIRONMENT"] as const;
@@ -21,14 +20,25 @@ let container: HTMLElement;
 let root: Root | null = null;
 
 function model(route: string, label: string, family: string, available = true) {
-  return { route, label, available, contextWindow: 200_000, effortSupported: true, assignment: { family, alias: `alias-${label}` } };
+  return {
+    route,
+    label,
+    available,
+    contextWindow: 200_000,
+    effortSupported: true,
+    supports1m: false,
+    prefer1m: false,
+    autoSupports1m: false,
+    assignment: { family, alias: `alias-${label}` },
+  };
 }
 
-// Eight models so the lane pager and the search input are both in play (LANE_PAGE = 6,
-// LANE_SEARCH_MIN = 4).
+// Eight available models so the lane pager and the search input are both in play
+// (LANE_PAGE = 6, LANE_SEARCH_MIN = 4), plus one unavailable model that must stay hidden.
 const MODELS = [
   ...Array.from({ length: 7 }, (_, i) => model(`prov/opus-${i}`, `Opus Model ${i}`, "opus")),
   model("prov/only-sonnet", "Sonnet Model", "sonnet"),
+  model("prov/dead", "Dead Model", "opus", false),
 ];
 
 function payload() {
@@ -37,6 +47,7 @@ function payload() {
       version: 1,
       assignments: Object.fromEntries(MODELS.map(m => [m.route, m.assignment])),
       defaults: { opus: "prov/opus-0", fable: null, sonnet: "prov/only-sonnet", haiku: null },
+      chatTabEnabled: true,
     },
     models: MODELS,
     rendered: [],
@@ -67,8 +78,11 @@ beforeEach(() => {
     },
   });
 
-  container = testWindow.document.createElement("div") as unknown as HTMLElement;
-  testWindow.document.body.appendChild(container as never);
+  // Use the GLOBAL document (which beforeEach points at testWindow): React reads globals,
+  // so a container created off the raw window object is not the document it renders into,
+  // and synthetic input events never reach the tree.
+  container = document.createElement("div");
+  document.body.append(container);
 });
 
 afterEach(async () => {
@@ -84,6 +98,10 @@ afterEach(async () => {
 });
 
 async function mount() {
+  // Import AFTER beforeEach installed the globals: a module-level import binds react-dom
+  // to whatever document existed at load time, and synthetic events then never reach the
+  // tree React actually rendered into.
+  const { createRoot } = await import("react-dom/client");
   await act(async () => {
     root = createRoot(container);
     root.render(<LanguageProvider><ClaudeDesktop apiBase="" /></LanguageProvider>);
@@ -91,10 +109,10 @@ async function mount() {
   await act(async () => { await new Promise(r => setTimeout(r, 50)); });
 }
 
-function familyToggle(name: string): HTMLButtonElement {
-  const found = Array.from(container.querySelectorAll("button.ocx-group-toggle"))
-    .find(button => (button.textContent ?? "").includes(name));
-  if (!found) throw new Error(`family toggle not found: ${name}`);
+function railRow(name: string): HTMLButtonElement {
+  const found = Array.from(container.querySelectorAll("button.claudecode-workspace-rail-row"))
+    .find(button => (button.querySelector(".claudecode-workspace-rail-name")?.textContent ?? "") === name);
+  if (!found) throw new Error(`rail row not found: ${name}`);
   return found as unknown as HTMLButtonElement;
 }
 
@@ -102,106 +120,111 @@ async function click(element: HTMLElement) {
   await act(async () => { element.click(); });
 }
 
-test("families render as a vertical stack, Opus first", async () => {
+async function selectPane(name: string) {
+  await click(railRow(name));
+}
+
+test("categories render as rail rows, General first and the families in tier order", async () => {
   await mount();
-  expect(container.querySelector(".ocx-group-stack")).not.toBeNull();
-  // The old 4-column kanban container is gone.
-  expect(container.querySelector(".claude-lanes")).toBeNull();
-  const names = Array.from(container.querySelectorAll(".ocx-group-name")).map(n => n.textContent);
-  expect(names).toEqual(["Opus", "Fable", "Sonnet", "Haiku"]);
+  expect(container.querySelector(".claudecode-workspace-root")).not.toBeNull();
+  // The old collapsible family stack is gone.
+  expect(container.querySelector(".ocx-group-stack")).toBeNull();
+  const names = Array.from(container.querySelectorAll(".claudecode-workspace-rail-name")).map(n => n.textContent);
+  expect(names).toEqual(["General", "Opus", "Fable", "Sonnet", "Haiku", "Import / export"]);
 });
 
-test("all families fold on first load", async () => {
+test("General is the initial pane and owns the Chat tab toggle", async () => {
   await mount();
-  expect(familyToggle("Opus").getAttribute("aria-expanded")).toBe("false");
-  expect(familyToggle("Sonnet").getAttribute("aria-expanded")).toBe("false");
-  expect(familyToggle("Fable").getAttribute("aria-expanded")).toBe("false");
-  expect(familyToggle("Haiku").getAttribute("aria-expanded")).toBe("false");
+  expect(railRow("General").getAttribute("aria-current")).toBe("true");
+  const toggle = container.querySelector(".setting-row input[type=checkbox]") as unknown as HTMLInputElement;
+  expect(toggle).not.toBeNull();
+  // The server sends chatTabEnabled: true, so the control opens on.
+  expect(toggle.checked).toBe(true);
 });
 
-test("toggling a family hides its body and persists the preference", async () => {
+test("selecting a family pane shows only that family's models", async () => {
   await mount();
-  expect(container.querySelector("#claude-lane-body-opus")).toBeNull();
-  await click(familyToggle("Opus"));
-  expect(familyToggle("Opus").getAttribute("aria-expanded")).toBe("true");
-  expect(container.querySelector("#claude-lane-body-opus")).not.toBeNull();
-
-  await click(familyToggle("Opus"));
-  expect(familyToggle("Opus").getAttribute("aria-expanded")).toBe("false");
-  expect(container.querySelector("#claude-lane-body-opus")).toBeNull();
-
-  const stored = testWindow.localStorage.getItem("ocx.claudeDesktop.collapsedFamilies.v2");
-  expect(stored).not.toBeNull();
-  expect(JSON.parse(stored!)).toContain("opus");
+  await selectPane("Sonnet");
+  const labels = Array.from(container.querySelectorAll(".claude-model-names strong")).map(n => n.textContent);
+  expect(labels).toEqual(["Sonnet Model"]);
 });
 
-// The drop handler lives on the <section>, so folding a family must not remove it as a
-// drop target — otherwise collapse would silently break drag-and-drop assignment.
-test("a collapsed family still accepts a dropped model", async () => {
+// Unavailable models cannot be assigned or made default, so a wall of dead rows was
+// noise. They stay in the profile — the note is what proves they were not dropped.
+test("unavailable models are hidden and reported as a count", async () => {
   await mount();
-  // Fable is empty, so it is already folded by the load-time default.
-  expect(familyToggle("Fable").getAttribute("aria-expanded")).toBe("false");
+  await selectPane("Opus");
+  const labels = Array.from(container.querySelectorAll(".claude-model-names strong")).map(n => n.textContent);
+  expect(labels).not.toContain("Dead Model");
+  expect(container.querySelector(".claude-hidden-note")?.textContent).toContain("1");
+});
 
-  const fableSection = Array.from(container.querySelectorAll("section.ocx-group"))
-    .find(section => (section.querySelector(".ocx-group-name")?.textContent ?? "") === "Fable")!;
+test("the rail count reports available models only", async () => {
+  await mount();
+  // Seven available Opus models; the eighth is unavailable and hidden.
+  expect(railRow("Opus").parentElement).not.toBeNull();
+  await selectPane("Opus");
+  expect(container.querySelector(".ccw-main-title .count")?.textContent).toBe("7");
+});
+
+// The pane owns the drop target the old <section> used to. Dropping must still move the
+// model even though the destination family is not the visible pane.
+test("dropping a model on a family pane moves it there", async () => {
+  await mount();
+  await selectPane("Fable");
+  const pane = container.querySelector(".claude-family-pane")!;
 
   await act(async () => {
     const event = new testWindow.Event("drop", { bubbles: true }) as unknown as Event & { dataTransfer: unknown };
     Object.defineProperty(event, "dataTransfer", { value: { getData: () => "prov/opus-0" } });
-    fableSection.dispatchEvent(event as never);
+    pane.dispatchEvent(event as never);
   });
 
-  // Fable's header count proves the move landed even though the family is folded.
-  const fableCount = fableSection.querySelector(".ocx-group-count")?.textContent ?? "";
-  expect(fableCount).toContain("1");
+  expect(container.querySelector(".ccw-main-title .count")?.textContent).toBe("1");
+  const labels = Array.from(container.querySelectorAll(".claude-model-names strong")).map(n => n.textContent);
+  expect(labels).toEqual(["Opus Model 0"]);
 });
 
-// Search narrows the RENDERED list only. If the header count followed the filter, a user
+// Search narrows the RENDERED list only. If the rail count followed the filter, a user
 // typing in the box would believe models had been unassigned.
-test("the header count ignores the search", async () => {
+test("the pane count ignores the search", async () => {
   await mount();
-  await click(familyToggle("Opus"));
-  const opusSection = Array.from(container.querySelectorAll("section.ocx-group"))
-    .find(section => (section.querySelector(".ocx-group-name")?.textContent ?? "") === "Opus")!;
-  expect(opusSection.querySelector(".ocx-group-count")?.textContent).toContain("7");
+  await selectPane("Opus");
+  expect(container.querySelector(".ccw-main-title .count")?.textContent).toBe("7");
 
-  const search = opusSection.querySelector("input.claude-lane-search") as unknown as HTMLInputElement;
+  const search = container.querySelector("input.claude-lane-search") as unknown as HTMLInputElement;
   await act(async () => {
-    search.value = "Opus Model 3";
+    // React caches the last value it wrote on an internal tracker, so a plain
+    // `search.value = …` leaves the tracker holding the same value and onChange never
+    // fires. Writing through the prototype setter and clearing the tracker is what makes
+    // a synthetic edit look like a real one.
+    const proto = Object.getPrototypeOf(search) as object;
+    Object.getOwnPropertyDescriptor(proto, "value")!.set!.call(search, "Opus Model 3");
+    (search as unknown as { _valueTracker?: { setValue(v: string): void } })._valueTracker?.setValue("");
     search.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as never);
   });
 
-  expect(opusSection.querySelector(".ocx-group-count")?.textContent).toContain("7");
+  expect(container.querySelector(".ccw-main-title .count")?.textContent).toBe("7");
+  const labels = Array.from(container.querySelectorAll(".claude-model-names strong")).map(n => n.textContent);
+  expect(labels).toEqual(["Opus Model 3"]);
 });
 
-// Regression for the WP1 focused audit: an earlier design derived collapse from the
-// live family counts, so moving the last model out of a family folded it mid-gesture.
-test("moving a model does not re-fold the family the user is working in", async () => {
+// Save is profile-wide, so unlike Claude Code it must stay reachable from every pane —
+// including the read-only-looking import/export one.
+test("the save bar is present on every pane and starts clean", async () => {
   await mount();
-  await click(familyToggle("Sonnet"));
-  const sonnetSection = Array.from(container.querySelectorAll("section.ocx-group"))
-    .find(section => (section.querySelector(".ocx-group-name")?.textContent ?? "") === "Sonnet")!;
-  expect(sonnetSection.querySelector("button.ocx-group-toggle")!.getAttribute("aria-expanded")).toBe("true");
-
-  // Move Sonnet's only model to Opus by dropping it there.
-  const opusSection = Array.from(container.querySelectorAll("section.ocx-group"))
-    .find(section => (section.querySelector(".ocx-group-name")?.textContent ?? "") === "Opus")!;
-  await act(async () => {
-    const event = new testWindow.Event("drop", { bubbles: true });
-    Object.defineProperty(event, "dataTransfer", { value: { getData: () => "prov/only-sonnet" } });
-    opusSection.dispatchEvent(event as never);
-  });
-
-  // Sonnet is now empty, but it must stay OPEN: the user never asked to fold it.
-  const sonnetAfter = Array.from(container.querySelectorAll("section.ocx-group"))
-    .find(section => (section.querySelector(".ocx-group-name")?.textContent ?? "") === "Sonnet")!;
-  expect(sonnetAfter.querySelector("button.ocx-group-toggle")!.getAttribute("aria-expanded")).toBe("true");
+  expect(container.querySelector(".claude-dirty")?.textContent).toBe("Profile is up to date");
+  await selectPane("Import / export");
+  expect(container.querySelector(".claudecode-workspace-save")).not.toBeNull();
+  expect(container.querySelector(".claude-dirty.active")).toBeNull();
 });
 
-test("a stored preference wins over the load-time default", async () => {
-  // Only Opus folded — every other family stays open despite the all-collapsed default.
-  testWindow.localStorage.setItem("ocx.claudeDesktop.collapsedFamilies.v2", JSON.stringify(["opus"]));
+test("flipping the Chat tab toggle marks the profile dirty", async () => {
   await mount();
-  expect(familyToggle("Opus").getAttribute("aria-expanded")).toBe("false");
-  expect(familyToggle("Fable").getAttribute("aria-expanded")).toBe("true");
+  const toggle = container.querySelector(".setting-row input[type=checkbox]") as unknown as HTMLInputElement;
+  // Click rather than assigning `checked`: React tracks the property on the instance and
+  // treats a direct write as no change.
+  await act(async () => { toggle.click(); });
+  expect(toggle.checked).toBe(false);
+  expect(container.querySelector(".claude-dirty.active")).not.toBeNull();
 });

@@ -183,7 +183,10 @@ function collectDesktop3pModels(
         labelOverride: model.label,
         anthropicFamilyTier: model.family,
         ...(model.isFamilyDefault ? { isFamilyDefault: true } : {}),
-        ...(model.supports1m ? { supports1m: true, prefer1m: true } : {}),
+        // prefer1m is independent of the auto default once supports1m is on —
+        // renderDesktopProfile already gates prefer1m behind supports1m.
+        ...(model.supports1m ? { supports1m: true as const } : {}),
+        ...(model.supports1m && model.prefer1m ? { prefer1m: true as const } : {}),
       });
     }
     // Legacy hashes are compatibility-only and can collide. Bind them in stable route order so
@@ -220,7 +223,7 @@ function collectDesktop3pModels(
         labelOverride: `${displayModelId(id)} (${provider})`,
         anthropicFamilyTier: "opus",
         ...supports1m,
-      ...(supports1m.supports1m ? { prefer1m: true as const } : {}),
+        ...(supports1m.supports1m ? { prefer1m: true as const } : {}),
       });
       continue;
     }
@@ -287,6 +290,11 @@ export function activeDesktop3pAlias(provider: string, modelId: string): string 
  * channel for supports1m/tier pins and it overrides discovery anyway (no merge), so
  * discovery stays off for determinism. supports1m makes Desktop offer a separate 1M
  * row; selecting it sends the bare id + `anthropic-beta: context-1m-2025-08-07`.
+ *
+ * `chatTabEnabled` defaults to true. Apply used to rewrite the whole configLibrary
+ * entry without this key, so a Chat tab the user had turned on in Desktop
+ * disappeared after every re-apply — only Cowork and Code remained. Desktop treats
+ * a missing key as off. An explicit `profile.chatTabEnabled: false` opts out.
  */
 export function generateDesktop3pConfig(
   port: number,
@@ -301,6 +309,8 @@ export function generateDesktop3pConfig(
     inferenceCredentialKind: "static",
     inferenceGatewayBaseUrl: `http://127.0.0.1:${port}`,
     inferenceGatewayApiKey: apiKey,
+    // Keep the Chat tab visible across re-applies unless the profile opts out.
+    chatTabEnabled: profile?.chatTabEnabled !== false,
   };
   if (mode === "discovery") {
     // Build/refresh the decode registry even though no static list is emitted.
