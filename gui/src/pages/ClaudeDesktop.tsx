@@ -66,7 +66,7 @@ export default function ClaudeDesktop({
   const [draftProfile, setProfile] = useState<DesktopProfile | null>(() => cached.profile);
   const [savedDraftProfile, setSavedProfile] = useState<DesktopProfile | null>(() => cached.savedProfile);
   const [draftDestinations, setDestinations] = useState<Record<string, Family>>(() => cached.destinations);
-  const [message, setMessage] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [message, setMessage] = useState<{ tone: "ok" | "err" | "warn"; text: string } | null>(null);
   const [announcement, setAnnouncement] = useState("");
   const [pending, setPending] = useState<PendingAction>(null);
   /*
@@ -239,9 +239,20 @@ export default function ClaudeDesktop({
       if (applyAfter) {
         setPending("apply");
         const applyResponse = await fetch(`${apiBase}/api/claude-desktop/apply`, { method: "POST" });
-        await readJsonOrThrow<{ error?: string }>(applyResponse, t("claudeDesktop.applyFailed"));
-        setMessage({ tone: "ok", text: t("claudeDesktop.savedApplied") });
-        setAnnouncement(t("claudeDesktop.savedAppliedAnnounce"));
+        const applyBody = await readJsonOrThrow<{ error?: string; saved?: boolean; warning?: string }>(
+          applyResponse,
+          t("claudeDesktop.applyFailed"),
+        );
+        // Partial success: Desktop WAS written, but the applied marker did not
+        // persist, so the saved-vs-applied strip will read stale. Say so rather
+        // than showing the clean success the user did not get.
+        if (applyBody?.saved === false) {
+          setMessage({ tone: "warn", text: t("claudeDesktop.appliedMarkerUnsaved") });
+          setAnnouncement(t("claudeDesktop.appliedMarkerUnsaved"));
+        } else {
+          setMessage({ tone: "ok", text: t("claudeDesktop.savedApplied") });
+          setAnnouncement(t("claudeDesktop.savedAppliedAnnounce"));
+        }
       } else {
         setMessage({ tone: "ok", text: t("claudeDesktop.saved") });
         setAnnouncement(t("claudeDesktop.savedAnnounce"));
@@ -383,6 +394,8 @@ export default function ClaudeDesktop({
             ? "not-applied"
             : !status
               ? "pending"
+              : !status.desiredEnabled
+                ? "not-applied"
               : status.activeProfile === false
                 ? "not-applied"
                 : status.stale
@@ -401,6 +414,8 @@ export default function ClaudeDesktop({
             ? t("claudeDesktop.loadFail")
             : !status
               ? t("claudeDesktop.loading")
+              : !status.desiredEnabled
+                ? t("claudeDesktop.status.disabled")
               : status.activeProfile === false
                 ? t("claudeDesktop.status.notActiveProfile")
                 : status.stale

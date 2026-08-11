@@ -38,6 +38,21 @@ afterEach(() => {
 });
 
 describe("usage log", () => {
+  test("preserves explicitly empty attempts through normalization", () => {
+    const normalized = normalizeUsageEntryForTest({
+      requestId: "ocx-empty-attempts",
+      timestamp: 1,
+      provider: "openai",
+      model: "gpt-test",
+      status: 200,
+      durationMs: 1,
+      usageStatus: "unreported",
+      attempts: [],
+    });
+
+    expect(normalized.attempts).toEqual([]);
+  });
+
   test("persists the rate-limit-429 recovery kind on attempts", () => {
     const entry: PersistedUsageEntry = {
       requestId: "ocx-ratelimit-kind",
@@ -768,4 +783,18 @@ describe("usage log", () => {
     expect(readRecentUsageEntries(0)).toEqual([]);
     expect(readRecentUsageEntries(-1)).toEqual([]);
   });
+
+  test("readRecentUsageEntries does not expand beyond its bounded tail window", () => {
+    const path = usageLogPath();
+    const fd = openSync(path, "w");
+    try {
+      const older = Buffer.from(`${persistedLine("outside-tail")}\n`);
+      writeSync(fd, older, 0, older.byteLength, 0);
+      truncateSync(fd, 64 * 1024 * 1024 + older.byteLength + 1);
+    } finally {
+      closeSync(fd);
+    }
+
+    expect(readRecentUsageEntries(1)).toEqual([]);
+  }, STORE_BUDGET_MS);
 });

@@ -36,6 +36,9 @@ package-lock.json
 .omo/
 **/.omo/
 
+# Local development worktrees
+.worktrees/
+
 # Test-generated artifacts
 tests/.tmp-*/
 .claude/
