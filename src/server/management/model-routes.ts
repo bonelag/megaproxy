@@ -412,6 +412,18 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
   // only those ids ship to Codex's catalog / /v1/models. GET returns the CURRENT selection plus the
   // FULL available set per provider (unfiltered — the picker needs everything to choose from).
   if (url.pathname === "/api/selected-models" && req.method === "GET") {
+    // ?refresh=1 forces a live re-fetch (bypass TTL). Optional ?provider= scopes the
+    // cache clear so a Models-tab "Fetch" button only re-pays one provider's /models.
+    const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
+    if (forceRefresh) {
+      const { clearModelCache } = await import("../../codex/model-cache");
+      const only = url.searchParams.get("provider");
+      if (typeof only === "string" && only.trim() && hasOwnProvider(config.providers, only.trim())) {
+        clearModelCache(only.trim());
+      } else if (!only || !only.trim()) {
+        clearModelCache();
+      }
+    }
     const models = await fetchAllModels(config);
     const available: Record<string, string[]> = {};
     for (const m of models) (available[m.provider] ??= []).push(m.id);

@@ -36,6 +36,7 @@ import type { RequestLogContext } from "./request-log";
 import { codexLogAccountId, decodeRequestErrorResponse } from "./responses";
 import type { AdmissionLease } from "../lib/admission";
 import { codexAccountSelectionForTurn } from "./lifecycle";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 /**
  * Default TOTAL deadline for one search relay. alpha/search is non-streaming JSON — response
@@ -139,7 +140,7 @@ export async function handleSearch(
   }
 
   const headers: Record<string, string> = { "content-type": "application/json" };
-  if (upstream.provider.headers) Object.assign(headers, upstream.provider.headers);
+  applyProviderHeaders(headers, upstream.provider);
   for (const [name, value] of upstream.headers) headers[name] = value;
   const url = `${upstream.provider.baseUrl}/alpha/search`;
   const timeoutMs = config.search?.timeoutMs ?? SEARCH_UPSTREAM_TIMEOUT_MS;

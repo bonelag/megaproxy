@@ -6,6 +6,7 @@ import { recordOwnedConfigPath } from "../lib/config-ownership";
 import type { OcxProviderConfig, OcxParsedRequest } from "../types";
 import { createOpenAIChatAdapter } from "./openai-chat";
 import type { ProviderAdapter, AdapterRequest, IncomingMeta } from "./base";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 const BOOTSTRAP_URL = "https://api.xiaomimimo.com/api/free-ai/bootstrap";
 export const MIMO_CHAT_URL = "https://api.xiaomimimo.com/api/free-ai/openai/chat";
@@ -219,6 +220,8 @@ export function createMimoFreeAdapter(provider: OcxProviderConfig): ProviderAdap
         "x-session-affinity": sessionId,
         "Accept": parsed.stream ? "text/event-stream" : "application/json",
       };
+
+      applyProviderHeaders(headers, provider);
 
       return {
         url: MIMO_CHAT_URL,

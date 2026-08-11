@@ -559,11 +559,17 @@ export function copyIfDefined<K extends keyof OcxProviderConfig>(
 export function safeConfigDTO(config: OcxConfig): unknown {
   const providers: Record<string, Record<string, unknown>> = {};
   for (const [name, provider] of Object.entries(config.providers)) {
+    const headers = provider.headers && Object.keys(provider.headers).length > 0
+      ? { ...provider.headers }
+      : undefined;
     const dto: Record<string, unknown> = {
       adapter: provider.adapter,
       baseUrl: publicProviderBaseUrl(provider.baseUrl),
       hasApiKey: !!provider.apiKey,
-      hasHeaders: !!provider.headers && Object.keys(provider.headers).length > 0,
+      hasHeaders: !!headers,
+      // Operator-configured outbound headers (User-Agent + custom). Not auth secrets —
+      // those are rejected at write time and live in apiKey / OAuth stores.
+      ...(headers ? { headers } : {}),
     };
     for (const key of [
       "defaultModel",

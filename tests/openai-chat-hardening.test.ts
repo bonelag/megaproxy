@@ -246,6 +246,20 @@ describe("openai-chat credential hardening", () => {
     });
   });
 
+  test("applies provider.headers including custom User-Agent on the outbound request", () => {
+    const adapter = createOpenAIChatAdapter(provider({
+      headers: {
+        "User-Agent": "claude-cli/2.1.220 (external, cli)",
+        "X-Custom": "provider-secret",
+      },
+    }));
+    const headers = adapter.buildRequest(parsed()).headers;
+    expect(headers["User-Agent"]).toBe("claude-cli/2.1.220 (external, cli)");
+    expect(headers["X-Custom"]).toBe("provider-secret");
+    expect(headers.Authorization).toBe("Bearer sk-test");
+    expect(headers["Content-Type"]).toBe("application/json");
+  });
+
   test("forwards prompt_cache_key to the outbound chat body when the provider opts in", () => {
     const adapter = createOpenAIChatAdapter(provider({ promptCacheKey: true }));
     const req = parsed();

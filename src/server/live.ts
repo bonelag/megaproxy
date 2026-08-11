@@ -41,6 +41,7 @@ import type { RequestLogContext } from "./request-log";
 import { codexLogAccountId } from "./responses";
 import type { AdmissionLease } from "../lib/admission";
 import { codexAccountSelectionForTurn } from "./lifecycle";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 /** Voice call create can wait on SDP negotiation; bound a hung upstream. */
 const LIVE_UPSTREAM_TIMEOUT_MS = 120_000;
@@ -483,7 +484,7 @@ export async function resolveLiveRelay(
   const headers: Record<string, string> = clientProtocolHeaders(req.headers);
   if (forward) {
     const { provider } = forward;
-    if (provider.headers) Object.assign(headers, provider.headers);
+    applyProviderHeaders(headers, provider);
     for (const [name, value] of forward.headers) headers[name] = value;
     logCtx.model = "gpt-live";
     return {
@@ -497,7 +498,7 @@ export async function resolveLiveRelay(
   if (forwardAuthError) return forwardAuthError;
   if (candidates.keyed) {
     const { provider, apiKey, providerName } = candidates.keyed;
-    if (provider.headers) Object.assign(headers, provider.headers);
+    applyProviderHeaders(headers, provider);
     headers.authorization = `Bearer ${apiKey}`;
     logCtx.provider = providerName;
     logCtx.model = "gpt-live";

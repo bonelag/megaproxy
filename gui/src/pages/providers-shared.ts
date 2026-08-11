@@ -6,6 +6,7 @@ export interface ProvidersConfig {
     baseUrl: string;
     hasApiKey?: boolean;
     hasHeaders?: boolean;
+    headers?: Record<string, string>;
     defaultModel?: string;
     models?: string[];
     liveModels?: boolean;

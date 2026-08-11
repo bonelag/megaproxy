@@ -31,6 +31,7 @@ import {
 } from "../lib/translator-budget";
 import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
 import { configuredReasoningEfforts, mapReasoningEffort } from "../reasoning-effort";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 // Google-family models (Gemini/Vertex/Antigravity) tend to emit long running commentary between
 // tool calls. This steers them to keep the BETWEEN-STEP text to one line and reason internally
@@ -376,7 +377,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       const method = parsed.stream ? "streamGenerateContent" : "generateContent";
       const streamParam = parsed.stream ? "?alt=sse" : "";
       const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (provider.headers) Object.assign(headers, provider.headers);
+      applyProviderHeaders(headers, provider);
 
       if (provider.googleMode === "cloud-code-assist") {
         // Google Antigravity (Cloud Code Assist): wrap the flat Gemini body in the CCA envelope.
@@ -442,6 +443,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         };
         headers["User-Agent"] = ANTIGRAVITY_REQUEST_UA;
         headers["Authorization"] = `Bearer ${token}`;
+        // User-configured headers last so a custom User-Agent / gateway fingerprint wins.
+        applyProviderHeaders(headers, provider);
         return { url, method: "POST", headers, body: JSON.stringify(envelope) };
       }
 

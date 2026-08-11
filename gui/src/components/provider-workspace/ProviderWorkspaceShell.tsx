@@ -172,6 +172,7 @@ export default function ProviderWorkspaceShell({
     return !cached || Object.keys(cached).length === 0;
   });
   const [modelsLoadEpoch, setModelsLoadEpoch] = useState(0);
+  const modelsForceProviderRef = useRef<string | null>(null);
   const filterWrapRef = useRef<HTMLDivElement>(null);
 
   const sections = useMemo(() => {
@@ -179,7 +180,8 @@ export default function ProviderWorkspaceShell({
     return applyActiveAccountReauth(base, activeAccountNeedsReauth ?? {});
   }, [providers, activeAccountNeedsReauth]);
 
-  const retryModels = useCallback(() => {
+  const retryModels = useCallback((providerName?: string) => {
+    modelsForceProviderRef.current = providerName?.trim() ? providerName.trim() : null;
     setModelsLoadEpoch(epoch => epoch + 1);
   }, []);
 
@@ -191,7 +193,14 @@ export default function ProviderWorkspaceShell({
       setModelsLoading(true);
       void (async () => {
         try {
-          const res = await fetch(`${apiBase}/api/selected-models`);
+          const forceProvider = modelsForceProviderRef.current;
+          modelsForceProviderRef.current = null;
+          const qs = new URLSearchParams();
+          if (forceProvider) {
+            qs.set("refresh", "1");
+            qs.set("provider", forceProvider);
+          }
+          const res = await fetch(`${apiBase}/api/selected-models${qs.toString() ? `?${qs}` : ""}`);
           const data = await readJsonOrThrow(res);
           if (cancelled) return;
           setModelCounts(countAvailableModels(data));
@@ -581,7 +590,7 @@ export default function ProviderWorkspaceShell({
             selectedModels: selectedModels[selectedItem.name] ?? [],
             modelsLoading,
             modelsLoadFailed,
-            onRetryModels: retryModels,
+            onRetryModels: () => retryModels(selectedItem.name),
           }) ?? (
             <div className="pws-detail-placeholder">
               <h3>{formatProviderDisplayName(selectedItem.name, t)}</h3>

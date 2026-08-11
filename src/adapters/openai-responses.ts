@@ -10,6 +10,7 @@ import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
 import { OCX_REASONING_PREFIX } from "../responses/reasoning-envelope";
 import { modelRecordValue } from "../reasoning-effort";
 import type { TranslatorBudget } from "../lib/translator-budget";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 // Headers relayed verbatim from the caller in OAuth-passthrough ("forward") mode.
 // Exported so the web-search sidecar reuses the exact same forwarded-auth set for its ChatGPT call.
@@ -1172,7 +1173,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       if (provider.authMode === "forward") {
         // OAuth passthrough: ChatGPT backend path is `${baseUrl}/responses` (no /v1).
         url = `${provider.baseUrl}/responses`;
-        if (provider.headers) Object.assign(headers, provider.headers); // static headers first…
+        applyProviderHeaders(headers, provider); // static headers first…
         const runtimeProvider = provider as {
           _codexAccountOverride?: { accessToken: string; chatgptAccountId: string };
           _codexAccountRequired?: boolean;
@@ -1198,7 +1199,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
           url = `${base}${provider.responsesPath}`;
         }
         if (provider.apiKey) headers["Authorization"] = `Bearer ${provider.apiKey}`;
-        if (provider.headers) Object.assign(headers, provider.headers);
+        applyProviderHeaders(headers, provider);
       }
 
       const forward = provider.authMode === "forward";

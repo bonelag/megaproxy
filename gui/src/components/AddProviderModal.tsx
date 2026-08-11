@@ -149,6 +149,8 @@ export default function AddProviderModal({
         apiKeyTransport: undefined,
         defaultModel: p.defaultModel ?? "",
         allowPrivateNetwork: false,
+        userAgent: "",
+        headerRows: [],
       },
     });
   };
@@ -166,8 +168,15 @@ export default function AddProviderModal({
     let postBody: { name: string; provider: ProviderPayload };
     try {
       postBody = buildProviderPostBody(preset ?? { id: "custom" }, submitForm);
-    } catch {
-      dispatch({ type: "set-error", error: t("modal.invalidPreset") });
+    } catch (err) {
+      const code = err instanceof Error ? err.message : "";
+      if (code === "user-agent-row") {
+        dispatch({ type: "set-error", error: t("modal.headersUserAgentRow") });
+      } else if (code === "empty-name" || code === "duplicate" || code === "crlf") {
+        dispatch({ type: "set-error", error: t("modal.headersInvalid") });
+      } else {
+        dispatch({ type: "set-error", error: t("modal.invalidPreset") });
+      }
       return;
     }
 

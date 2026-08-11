@@ -6,6 +6,7 @@ import { fetchWithResetRetry } from "../lib/upstream-retry";
 import { getValidAccessToken } from "../oauth";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../oauth/anthropic";
 import type { DescribeOutcome, VisionSettings } from "./describe";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 const ANTHROPIC_VISION_MAX_TOKENS = 1024;
 const ALLOWED_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
@@ -130,7 +131,7 @@ export async function describeImageAnthropic(
     "X-Claude-Code-Session-Id": claudeCodeSessionId(token),
     "x-client-request-id": crypto.randomUUID(),
   };
-  if (provider.headers) Object.assign(headers, provider.headers);
+  applyProviderHeaders(headers, provider);
 
   const content: unknown[] = [];
   if (contextText) content.push({ type: "text", text: `The user's request about this image: ${contextText}` });

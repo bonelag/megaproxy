@@ -18,6 +18,7 @@ import {
   TRANSLATOR_MAX_SSE_EVENT_BYTES,
   type TranslatorBudget,
 } from "../lib/translator-budget";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 // Providers may opt into stripping one trailing "[...]" group from the wire model id.
 // Z.AI needs this because its OpenAI path rejects glm-5.2[1m] with 400 code 1211;
@@ -845,7 +846,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const url = `${provider.baseUrl}/chat/completions`;
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (hasCredential) headers["Authorization"] = `Bearer ${provider.apiKey}`;
-      if (provider.headers) Object.assign(headers, provider.headers);
+      applyProviderHeaders(headers, provider);
 
       const bodyJson = JSON.stringify(body);
       if (isDebugEnabled()) {

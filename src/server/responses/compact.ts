@@ -129,6 +129,7 @@ import {
   usesCodexForwardPoolAuth,
 } from "./core";
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel } from "./fetch-helpers";
+import { applyProviderHeadersToHeadersInit } from "../../lib/provider-request-headers";
 
 export const COMPACT_RESPONSE_MAX_BYTES = 32 * 1024 * 1024;
 
@@ -183,6 +184,7 @@ async function resolveAlternateCompactContext(args: {
       headers.set("chatgpt-account-id", override.chatgptAccountId);
     }
     if (provider.apiKey) headers.set("authorization", `Bearer ${resolveEnvValue(provider.apiKey)}`);
+    applyProviderHeadersToHeadersInit(headers, provider);
     return { authCtx, provider, headers };
   } catch (err) {
     if (err instanceof CodexMainProfileDrainingError) {
@@ -394,6 +396,8 @@ export async function handleResponsesCompact(
     if (compactProvider.authMode !== "forward" && compactProvider.apiKey) {
       headers.set("authorization", `Bearer ${resolveEnvValue(compactProvider.apiKey)}`);
     }
+    // Custom endpoint headers (User-Agent, gateway fingerprints) must ride compact too.
+    applyProviderHeadersToHeadersInit(headers, compactProvider);
     const { reasoning: _reasoning, ...compactBodyRaw } = raw as typeof raw & { reasoning?: unknown };
     // The regular /v1/responses path applies sanitizeReasoningInputContent via the adapter's
     // buildRequest, but the compact endpoint forwards directly. Apply the same sanitizer here

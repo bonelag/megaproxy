@@ -100,4 +100,11 @@ export type ProviderUpdatePatch = {
   liveModels?: boolean;
   /** Dedicated field: the API PATCHes it alone for the canonical `openai` provider. */
   codexAccountMode?: "direct" | "pool";
+  /**
+   * Custom outbound headers (incl. User-Agent). null/{} clears user-managed headers.
+   * With headersReplace: true the object fully replaces the stored set (GUI Settings).
+   */
+  headers?: Record<string, string> | null;
+  /** When true with headers, replace the full user-managed map instead of merging. */
+  headersReplace?: boolean;
 };

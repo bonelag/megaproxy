@@ -206,11 +206,18 @@ function applyProviderPatchFields(
     touched = true;
   }
 
-  // headers is the one object-valued field in the mask. PATCH semantics merge it
-  // shallowly into the existing block so a single fingerprint header can be added
+  // headers is the one object-valued field in the mask. Default PATCH semantics merge
+  // it shallowly into the existing block so a single fingerprint header can be added
   // without wiping the rest; null or an empty object clears user-managed headers.
+  // headersReplace: true (GUI Settings editor) replaces the whole user-managed set
+  // because management GET never returns header values (#959), so the form cannot
+  // round-trip prior keys for a merge.
   if (Object.hasOwn(rawBody, "headers")) {
     const headersValue = rawBody.headers;
+    const replace = rawBody.headersReplace === true;
+    if (Object.hasOwn(rawBody, "headersReplace") && typeof rawBody.headersReplace !== "boolean") {
+      return { error: "headersReplace must be a boolean" };
+    }
     if (headersValue === null || (isPlainRecord(headersValue) && Object.keys(headersValue).length === 0)) {
       // Registry-owned static metadata (e.g. opencode-free's x-opencode-client marker)
       // is not user-managed: restoring it keeps the upstream transport intact after a
@@ -225,18 +232,25 @@ function applyProviderPatchFields(
       if (!isPlainRecord(headersValue)) return { error: "headers must be an object" };
       const headersError = providerHeadersConfigError(headersValue);
       if (headersError) return { error: headersError };
-      // Header names are case-insensitive on the wire. Drop any existing key whose
-      // lowercase name collides with an incoming one, or Headers normalization would
-      // send a combined "x-custom: v1, v2" value upstream.
+      // Header names are case-insensitive on the wire. Collapse incoming keys by
+      // lowercase so "X-Custom" and "x-custom" cannot both survive into the stored map.
       const incoming = new Map(
         Object.entries(headersValue as Record<string, string>).map(([key, value]) => [key.toLowerCase(), [key, value] as const]),
       );
-      const merged: Record<string, string> = {};
-      for (const [key, value] of Object.entries(next.headers ?? {})) {
-        if (!incoming.has(key.toLowerCase())) merged[key] = value;
+      const replaced: Record<string, string> = {};
+      for (const [key, value] of incoming.values()) replaced[key] = value;
+      if (replace) {
+        next.headers = replaced;
+      } else {
+        // Merge: keep existing keys that do not collide case-insensitively, then apply
+        // incoming — otherwise Headers normalization would send "x-custom: v1, v2".
+        const merged: Record<string, string> = {};
+        for (const [key, value] of Object.entries(next.headers ?? {})) {
+          if (!incoming.has(key.toLowerCase())) merged[key] = value;
+        }
+        for (const [key, value] of Object.entries(replaced)) merged[key] = value;
+        next.headers = merged;
       }
-      for (const [key, value] of incoming.values()) merged[key] = value;
-      next.headers = merged;
     }
     touched = true;
     headersTouched = true;
@@ -281,22 +295,29 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
   }
 
   if (url.pathname === "/api/providers" && req.method === "GET") {
-    return jsonResponse(Object.entries(config.providers).map(([name, p]) => ({
-      name, adapter: p.adapter, baseUrl: publicProviderBaseUrl(p.baseUrl), defaultModel: p.defaultModel,
-      hasApiKey: !!p.apiKey,
-      // Presence only (#959 review): header names and values never leave the process.
-      hasHeaders: !!p.headers && Object.keys(p.headers).length > 0,
-      allowPrivateNetwork: p.allowPrivateNetwork === true,
-      liveModels: p.liveModels !== false,
-      models: p.models ?? [],
-      contextWindow: p.contextWindow,
-      modelContextWindows: p.modelContextWindows,
-      authMode: p.authMode,
-      apiKeyTransport: p.apiKeyTransport,
-      disabled: p.disabled === true,
-      codexAccountMode: providerCodexAccountMode(name, p),
-      discovery: p.liveModels === false ? undefined : getProviderDiscoveryStatus(name),
-    })));
+    return jsonResponse(Object.entries(config.providers).map(([name, p]) => {
+      const headers = p.headers && Object.keys(p.headers).length > 0
+        ? { ...p.headers }
+        : undefined;
+      return {
+        name, adapter: p.adapter, baseUrl: publicProviderBaseUrl(p.baseUrl), defaultModel: p.defaultModel,
+        hasApiKey: !!p.apiKey,
+        // Full headers (incl. User-Agent) so Settings can show and edit them.
+        // Auth secrets stay out of this map via providerHeadersConfigError.
+        hasHeaders: !!headers,
+        ...(headers ? { headers } : {}),
+        allowPrivateNetwork: p.allowPrivateNetwork === true,
+        liveModels: p.liveModels !== false,
+        models: p.models ?? [],
+        contextWindow: p.contextWindow,
+        modelContextWindows: p.modelContextWindows,
+        authMode: p.authMode,
+        apiKeyTransport: p.apiKeyTransport,
+        disabled: p.disabled === true,
+        codexAccountMode: providerCodexAccountMode(name, p),
+        discovery: p.liveModels === false ? undefined : getProviderDiscoveryStatus(name),
+      };
+    }));
   }
 
   // Add (or overwrite) a single provider. Merges into the live in-memory config and

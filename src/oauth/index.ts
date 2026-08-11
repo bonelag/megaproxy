@@ -24,6 +24,7 @@ import { logOAuthEvent } from "./log";
 import { captureConfigGeneration, sweepExpiredOnWrite, type GenerationContext } from "../lib/state-store-sweeper";
 import { retainedUtf8Bytes } from "../lib/admission";
 import { randomUUID } from "node:crypto";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 export {
   CODEX_HEALTH_AUTH_FAILED_NOTE,
   CODEX_HEALTH_MANAGEMENT_API_UNAVAILABLE_NOTE,
@@ -674,6 +675,8 @@ export function buildModelsRequest(
     headers["Content-Type"] = "application/json";
     headers["User-Agent"] = ANTIGRAVITY_REQUEST_UA;
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    // Re-apply after the mode default so a configured User-Agent still wins on discovery.
+    applyProviderHeaders(headers, effectiveProvider);
     return {
       method: "POST",
       url: discoveryUrl(`${effectiveProvider.baseUrl.replace(/\/+$/, "")}/v1internal:fetchAvailableModels`),

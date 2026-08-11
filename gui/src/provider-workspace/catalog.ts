@@ -32,6 +32,8 @@ export interface WorkspaceProvider {
   baseUrl: string;
   hasApiKey?: boolean;
   hasHeaders?: boolean;
+  /** Operator-configured outbound headers (User-Agent + custom). */
+  headers?: Record<string, string>;
   defaultModel?: string;
   apiKeyTransport?: "x-api-key" | "bearer";
   /** Static/configured model ids from provider config (offline fallback). */

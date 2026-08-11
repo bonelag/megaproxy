@@ -8,6 +8,7 @@ import { sidecarEnter } from "../lib/sidecar-tracker";
 import { fetchWithResetRetry } from "../lib/upstream-retry";
 import type { WebSearchSource } from "./parse";
 import { BASE_INSTRUCTION, IMAGE_INSTRUCTION, type SidecarOutcome, type SidecarSettings } from "./executor";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 /** Hardcoded per-turn search bound handed to the server tool (mirrors the loop's maxSearches intent). */
 const ANTHROPIC_MAX_USES = 3;
@@ -140,7 +141,7 @@ export async function runAnthropicWebSearch(
     "X-Claude-Code-Session-Id": claudeCodeSessionId(token),
     "x-client-request-id": crypto.randomUUID(),
   };
-  if (provider.headers) Object.assign(headers, provider.headers);
+  applyProviderHeaders(headers, provider);
 
   const instruction = settings.describeImages ? BASE_INSTRUCTION + IMAGE_INSTRUCTION : BASE_INSTRUCTION;
   const body = {

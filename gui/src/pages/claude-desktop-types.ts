@@ -56,6 +56,8 @@ export interface DesktopModel {
 }
 
 export interface DesktopStatus {
+  /** Desired-state pin from config: false means the integration is intentionally off. */
+  desiredEnabled: boolean;
   applied: boolean;
   appliedAt: string | null;
   stale: boolean;

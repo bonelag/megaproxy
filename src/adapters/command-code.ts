@@ -12,6 +12,7 @@ import { commandCodeReasoningEfforts, refreshCommandCodeReasoningEfforts } from 
 import { identifyRoutedModel } from "./identity";
 import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
 import { parseDataUrl } from "./image";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 // Retain the short ids emitted by the first local integration. New requests use the live catalog's
 // provider-native IDs directly; this map is compatibility-only and is not a model fallback list.
@@ -448,6 +449,7 @@ export function createCommandCodeAdapter(provider: OcxProviderConfig): ProviderA
         "x-session-id": randomUUID(),
       };
       if (cwd) headers["x-project-slug"] = projectSlug(cwd);
+      applyProviderHeaders(headers, provider);
       return {
         url: `${provider.baseUrl.replace(/\/$/, "")}/alpha/generate`, method: "POST",
         headers,

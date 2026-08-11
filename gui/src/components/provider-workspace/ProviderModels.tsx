@@ -159,9 +159,21 @@ export default function ProviderModels({
     <div className="pws-section">
       <div className="pws-section-head">
         <h3 className="pws-section-title">{t("pws.tab.models")}</h3>
-        {models.length > 0 && (
-          <span className="muted">{t("pws.modelsAvailable", { count: models.length })}</span>
-        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {models.length > 0 && (
+            <span className="muted">{t("pws.modelsAvailable", { count: models.length })}</span>
+          )}
+          {onRetryModels && (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={onRetryModels}
+              disabled={modelsLoading}
+            >
+              {modelsLoading ? t("pws.modelsLoading") : t("pws.fetchModels")}
+            </button>
+          )}
+        </div>
       </div>
       {needsReauth && (
         <div className="pws-inline-error" role="status">

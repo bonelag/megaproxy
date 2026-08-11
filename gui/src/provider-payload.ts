@@ -1,3 +1,5 @@
+import { composeProviderHeaders, type ProviderHeaderRow } from "./provider-headers";
+
 export interface ProviderPayloadForm {
   name: string;
   adapter: string;
@@ -8,6 +10,10 @@ export interface ProviderPayloadForm {
   apiKeyTransport?: "x-api-key" | "bearer";
   defaultModel: string;
   allowPrivateNetwork?: boolean;
+  /** Convenience field → headers["User-Agent"] when non-blank. */
+  userAgent?: string;
+  /** Extra header rows (not including User-Agent). */
+  headerRows?: ProviderHeaderRow[];
 }
 
 export interface ProviderPostPreset {
@@ -78,6 +84,7 @@ export interface ProviderPayload {
   authMode?: "key" | "forward" | "oauth";
   codexAccountMode?: "pool" | "direct";
   allowPrivateNetwork?: boolean;
+  headers?: Record<string, string>;
 }
 
 export function buildProviderPayload(form: ProviderPayloadForm): ProviderPayload {
@@ -103,6 +110,17 @@ export function buildProviderPayload(form: ProviderPayloadForm): ProviderPayload
   }
   if (form.allowPrivateNetwork) {
     provider.allowPrivateNetwork = true;
+  }
+
+  // Compose optional custom UA + header rows into provider.headers for POST create.
+  // Invalid rows throw so the modal can surface a validation message instead of
+  // silently dropping bad input.
+  if (form.userAgent !== undefined || (form.headerRows && form.headerRows.length > 0)) {
+    const composed = composeProviderHeaders(form.userAgent ?? "", form.headerRows ?? []);
+    if (!composed.ok) {
+      throw new Error(composed.error);
+    }
+    if (composed.headers) provider.headers = composed.headers;
   }
 
   return provider;

@@ -413,13 +413,14 @@ describe("server local API auth", () => {
     };
     const serialized = JSON.stringify(dto);
     for (const forbidden of [
-      "sk-secret-value", "provider-secret", "openaiProviderTierVersion",
+      "sk-secret-value", "openaiProviderTierVersion",
       "apiKeyPool", "pool-secret", "private-pool-label", "modelMaxInputTokens",
       "virtualModels", "codexAuthContext", "selectedForwardHeaders",
       "sidecarOutcomeRecorder", "recorder-runtime", "_codexAccountOverride",
       "_codexAccountRequired", "runtime-token", "override-token",
       "codexAccountNamespaces", "private-account-id",
     ]) expect(serialized).not.toContain(forbidden);
+    // provider-secret is the custom header value — intentionally visible for Settings.
     expect(dto.providers.openai).toMatchObject({
       adapter: "openai-chat",
       baseUrl: "https://api.example.test/v1",
@@ -430,7 +431,8 @@ describe("server local API auth", () => {
       reasoningWireFormat: "gateway-object",
     });
     expect(dto.providers.openai).not.toHaveProperty("apiKey");
-    expect(dto.providers.openai).not.toHaveProperty("headers");
+    // Custom headers are operator-visible (Settings); apiKey stays stripped.
+    expect(dto.providers.openai.headers).toEqual({ "X-Custom": "provider-secret" });
     expect(dto.providers.openai.disabled).toBeUndefined();
   });
 
@@ -460,18 +462,19 @@ describe("server local API auth", () => {
     expect(dto.providers.required.requiresReasoningPlaceholderModels).toEqual(["deepseek-reasoner"]);
     expect(dto.providers.optedOut.requiresReasoningPlaceholderModels).toEqual([]);
     expect(dto.providers.required).not.toHaveProperty("apiKey");
-    expect(dto.providers.required).not.toHaveProperty("headers");
+    expect(dto.providers.required.headers).toEqual({ Authorization: "Bearer required-header-secret" });
     expect(dto.providers.optedOut).not.toHaveProperty("apiKey");
-    expect(dto.providers.optedOut).not.toHaveProperty("headers");
+    expect(dto.providers.optedOut.headers).toEqual({ "X-Private-Key": "opt-out-header-secret" });
     const serialized = JSON.stringify(dto);
+    // Custom headers are intentionally visible for Settings; apiKey / URL secrets stay stripped.
     for (const secret of [
       "password",
       "url-secret",
       "required-api-secret",
-      "required-header-secret",
       "opt-out-api-secret",
-      "opt-out-header-secret",
     ]) expect(serialized).not.toContain(secret);
+    expect(serialized).toContain("required-header-secret");
+    expect(serialized).toContain("opt-out-header-secret");
   });
 
   test("safeConfigDTO exposes keyOptional for saved free-tier providers", () => {

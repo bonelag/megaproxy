@@ -40,6 +40,7 @@ import { ANTIGRAVITY_REQUEST_UA } from "../adapters/google-antigravity-wire";
 import { decodeValidatedImageBase64, MAX_ENCODED_BYTES_PER_IMAGE } from "../images/artifacts";
 import type { AdmissionLease } from "../lib/admission";
 import { codexAccountSelectionForTurn } from "./lifecycle";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 export type ImagesEndpoint = "generations" | "edits";
 
@@ -457,7 +458,7 @@ export async function handleImages(
   let url: string;
   if (forward) {
     const { provider } = forward;
-    if (provider.headers) Object.assign(headers, provider.headers);
+    applyProviderHeaders(headers, provider);
     for (const [name, value] of forward.headers) headers[name] = value;
     // The ChatGPT codex backend takes bare paths (matches the adapter's `${baseUrl}/responses`).
     url = `${provider.baseUrl}/images/${endpoint}`;
@@ -471,7 +472,7 @@ export async function handleImages(
     return forwardAuthError;
   } else if (candidates.keyed) {
     const { provider, apiKey, providerName } = candidates.keyed;
-    if (provider.headers) Object.assign(headers, provider.headers);
+    applyProviderHeaders(headers, provider);
     headers["authorization"] = `Bearer ${apiKey}`;
     logCtx.provider = providerName;
     // Keyed providers tolerate baseUrl with or without /v1 (mirrors openai-responses.ts).

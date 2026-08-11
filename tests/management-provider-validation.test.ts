@@ -2273,12 +2273,74 @@ describe("provider management validation", () => {
     expect(catalogRefreshes).toBeGreaterThan(0);
   });
 
-  test("GET /api/providers exposes hasHeaders but never header names or values (#959)", async () => {
+  test("provider PATCH headersReplace replaces the full user-managed set", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig: OcxConfig = {
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "openai",
+      openaiProviderTierVersion: 2,
+      providers: {
+        openai: { ...canonicalDirect },
+        agw: {
+          adapter: "openai-chat",
+          baseUrl: "https://agw.example.test/v1",
+          apiKey: "sk-agw",
+          headers: { "X-Old": "keep-me", "User-Agent": "old-ua" },
+        },
+      },
+    };
+    saveConfig(liveConfig);
+    const patch = async (body: unknown) => {
+      const req = new Request("http://127.0.0.1/api/providers?name=agw", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return handleManagementAPI(req, new URL(req.url), liveConfig, {
+        createManagementConvergeCodex: catalogConvergenceFactory(() => {}),
+      });
+    };
+
+    // Merge (default) keeps keys not in the patch.
+    expect((await patch({ headers: { "X-New": "1" } }))?.status).toBe(200);
+    expect(liveConfig.providers.agw.headers).toEqual({
+      "X-Old": "keep-me",
+      "User-Agent": "old-ua",
+      "X-New": "1",
+    });
+
+    // Replace drops every prior user key; only the new object remains.
+    const replaced = await patch({
+      headers: { "User-Agent": "claude-cli/2.1.220 (external, cli)", "X-App": "gui" },
+      headersReplace: true,
+    });
+    expect(replaced?.status).toBe(200);
+    expect(liveConfig.providers.agw.headers).toEqual({
+      "User-Agent": "claude-cli/2.1.220 (external, cli)",
+      "X-App": "gui",
+    });
+    expect(liveConfig.providers.agw.headers).not.toHaveProperty("X-Old");
+    expect(liveConfig.providers.agw.headers).not.toHaveProperty("X-New");
+
+    // headersReplace alone is not a recognized field update.
+    const alone = await patch({ headersReplace: true });
+    expect(alone?.status).toBe(400);
+
+    // Non-boolean headersReplace is rejected without mutating.
+    const before = { ...liveConfig.providers.agw.headers };
+    expect((await patch({ headers: { "X-Z": "z" }, headersReplace: "yes" }))?.status).toBe(400);
+    expect(liveConfig.providers.agw.headers).toEqual(before);
+  });
+
+  test("GET /api/providers returns full custom headers for Settings editing", async () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     const sentinelName = "x-fingerprint-sentinel";
-    const sentinelValue = "sentinel-secret-header-value";
+    const sentinelValue = "sentinel-header-value";
     const liveConfig: OcxConfig = {
       port: 0,
       hostname: "127.0.0.1",
@@ -2290,7 +2352,7 @@ describe("provider management validation", () => {
           adapter: "openai-chat",
           baseUrl: "http://127.0.0.1:9/v1",
           allowPrivateNetwork: true,
-          headers: { [sentinelName]: sentinelValue },
+          headers: { [sentinelName]: sentinelValue, "User-Agent": "custom-ua/1" },
         },
       },
     };
@@ -2298,12 +2360,12 @@ describe("provider management validation", () => {
     const req = new Request("http://127.0.0.1/api/providers", { method: "GET" });
     const res = await handleManagementAPI(req, new URL(req.url), liveConfig, {});
     expect(res?.status).toBe(200);
-    const raw = await res!.text();
-    const rows = JSON.parse(raw) as { name: string; hasHeaders?: boolean }[];
-    expect(rows.find(row => row.name === "hdr")?.hasHeaders).toBe(true);
+    const rows = await res!.json() as { name: string; hasHeaders?: boolean; headers?: Record<string, string> }[];
+    const hdr = rows.find(row => row.name === "hdr");
+    expect(hdr?.hasHeaders).toBe(true);
+    expect(hdr?.headers).toEqual({ [sentinelName]: sentinelValue, "User-Agent": "custom-ua/1" });
     expect(rows.find(row => row.name === "openai")?.hasHeaders).toBe(false);
-    expect(raw).not.toContain(sentinelName);
-    expect(raw).not.toContain(sentinelValue);
+    expect(rows.find(row => row.name === "openai")?.headers).toBeUndefined();
   });
   test("provider PATCH merges headers case-insensitively", async () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });

@@ -13,8 +13,10 @@ import { readJsonIfOk } from "../../fetch-json";
 import { useT } from "../../i18n/shared";
 import { IconLock } from "../../icons";
 import { isCatalogProviderId } from "../../provider-icons";
+import { composeProviderHeaders, splitProviderHeaders, type ProviderHeaderRow } from "../../provider-headers";
 import { openAiAccountProviderState } from "../../provider-payload";
 import type { CatalogPreset } from "../provider-catalog/provider-presets";
+import ProviderHeadersEditor from "../provider-headers-editor";
 import { authModeLabel } from "./ProviderRail";
 import type { WorkspaceItem, ProviderUpdatePatch } from "./types";
 
@@ -45,6 +47,11 @@ export default function ProviderSettings({
   const [note, setNote] = useState(item.note ?? "");
   const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(item.allowPrivateNetwork ?? false);
   const [liveModels, setLiveModels] = useState(item.liveModels !== false);
+  // Seed from GET headers so Settings shows the full current set.
+  const seededHeaders = splitProviderHeaders(item.headers);
+  const [userAgent, setUserAgent] = useState(seededHeaders.userAgent);
+  const [headerRows, setHeaderRows] = useState<ProviderHeaderRow[]>(() => seededHeaders.rows);
+  const [headersTouched, setHeadersTouched] = useState(false);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [accountMode, setAccountMode] = useState<"pool" | "direct">(item.codexAccountMode ?? "pool");
@@ -64,10 +71,16 @@ export default function ProviderSettings({
     setNote(item.note ?? "");
     setAllowPrivateNetwork(item.allowPrivateNetwork ?? false);
     setLiveModels(item.liveModels !== false);
+    // Re-seed from the latest saved headers (GET now returns full values).
+    // Keep headersTouched false so an unrelated field save omits the headers mask.
+    const nextHeaders = splitProviderHeaders(item.headers);
+    setUserAgent(nextHeaders.userAgent);
+    setHeaderRows(nextHeaders.rows);
+    setHeadersTouched(false);
     setMsg(null);
     setModeMsg(null);
     queueMicrotask(() => setEndpointChoice(matchChoiceId(baseUrlChoices, item.baseUrl)));
-  }, [item.adapter, item.baseUrl, item.defaultModel, item.authMode, item.apiKeyTransport, item.keyOptional, item.note, item.allowPrivateNetwork, item.liveModels, baseUrlChoices]);
+  }, [item.adapter, item.baseUrl, item.defaultModel, item.authMode, item.apiKeyTransport, item.keyOptional, item.note, item.allowPrivateNetwork, item.liveModels, item.headers, baseUrlChoices]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
   // Account mode syncs on its own: a mode PATCH refresh must not reset an in-progress
@@ -115,7 +128,8 @@ export default function ProviderSettings({
     || (adapter.trim() === "anthropic" && authMode === "key" && apiKeyTransport !== (item.apiKeyTransport ?? "x-api-key"))
     || note.trim() !== (item.note ?? "")
     || allowPrivateNetwork !== (item.allowPrivateNetwork ?? false)
-    || liveModels !== (item.liveModels !== false);
+    || liveModels !== (item.liveModels !== false)
+    || headersTouched;
 
   useEffect(() => { onDirtyChange?.(dirty); return () => onDirtyChange?.(false); }, [dirty, onDirtyChange]);
 
@@ -148,16 +162,39 @@ export default function ProviderSettings({
       ? resolvedBaseUrlForChoice(baseUrlChoices, endpointChoice, baseUrl)
       : baseUrl.trim();
     if (!adapter.trim() || !nextBaseUrl) { setMsg({ ok: false, text: t("pws.adapterBaseRequired") }); return false; }
+
+    let headersPatch: Pick<ProviderUpdatePatch, "headers" | "headersReplace"> | undefined;
+    if (headersTouched) {
+      const composed = composeProviderHeaders(userAgent, headerRows);
+      if (!composed.ok) {
+        setMsg({
+          ok: false,
+          text: composed.error === "user-agent-row" ? t("modal.headersUserAgentRow") : t("modal.headersInvalid"),
+        });
+        return false;
+      }
+      // null clears; a non-empty object replaces the full user-managed set so the
+      // blind editor can drop keys it cannot re-read from GET.
+      headersPatch = composed.headers
+        ? { headers: composed.headers, headersReplace: true }
+        : { headers: null };
+    }
+
     setSaving(true);
     setMsg(null);
     try {
-      const patch: ProviderUpdatePatch = { adapter: adapter.trim(), baseUrl: nextBaseUrl, defaultModel: defaultModel.trim(), authMode, note: note.trim(), allowPrivateNetwork };
+      const patch: ProviderUpdatePatch = { adapter: adapter.trim(), baseUrl: nextBaseUrl, defaultModel: defaultModel.trim(), authMode, note: note.trim(), allowPrivateNetwork, ...headersPatch };
       // Keep omitted legacy values omitted unless the user actually changes this toggle.
       // Otherwise an unrelated settings save manufactures `liveModels: true` provenance.
       if (liveModels !== (item.liveModels !== false)) patch.liveModels = liveModels;
       if (supportsApiKeyTransport) patch.apiKeyTransport = apiKeyTransport;
       else if (item.apiKeyTransport !== undefined) patch.apiKeyTransport = "";
       const res = await onUpdateProvider(item.name, patch);
+      if (res.ok && headersTouched) {
+        setHeadersTouched(false);
+        // Keep the draft the operator just saved so a second open of the same
+        // mount still shows what they typed (values still never come from GET).
+      }
       setMsg(res.ok ? { ok: true, text: t("pws.settingsSaved") } : { ok: false, text: res.error || t("prov.saveFailed") });
       return res.ok;
     } finally {
@@ -199,7 +236,12 @@ export default function ProviderSettings({
     setAdapter(item.adapter); setBaseUrl(item.baseUrl);
     setDefaultModel(item.defaultModel ?? ""); setAuthMode(initialAuth);
     setApiKeyTransport(item.apiKeyTransport ?? "x-api-key");
-    setNote(item.note ?? ""); setAllowPrivateNetwork(item.allowPrivateNetwork ?? false); setLiveModels(item.liveModels !== false); setMsg(null);
+    setNote(item.note ?? ""); setAllowPrivateNetwork(item.allowPrivateNetwork ?? false); setLiveModels(item.liveModels !== false);
+    const nextHeaders = splitProviderHeaders(item.headers);
+    setUserAgent(nextHeaders.userAgent);
+    setHeaderRows(nextHeaders.rows);
+    setHeadersTouched(false);
+    setMsg(null);
     setEndpointChoice(matchChoiceId(baseUrlChoices, item.baseUrl));
   };
 
@@ -340,6 +382,15 @@ export default function ProviderSettings({
           <span className="muted text-label" style={{ display: "block", marginTop: 2 }}>{t("pws.liveModelsDesc")}</span>
         </span>
       </label>
+      <ProviderHeadersEditor
+        idPrefix={`pws-headers-${item.name}`}
+        userAgent={userAgent}
+        rows={headerRows}
+        onUserAgentChange={setUserAgent}
+        onRowsChange={setHeaderRows}
+        onTouch={() => setHeadersTouched(true)}
+        disabled={saving || modeSaving}
+      />
       {dirty && (
         <div className="pwi-settings-sticky-bar">
           <span className="muted">{t("pws.settingsUnsavedBar")}</span>

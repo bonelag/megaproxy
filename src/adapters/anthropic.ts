@@ -24,6 +24,7 @@ import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "./client-fingerprint";
 import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
 import { decodeServerSentEvents } from "../lib/sse-decoder";
 import { isTranslatorBudgetExceededError, retainTranslatedEventBatch, type TranslatorBudget } from "../lib/translator-budget";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 
 /** Map a user content part to an Anthropic content block (text or image source). */
 function toAnthropicContentPart(p: OcxContentPart): unknown {
@@ -931,7 +932,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         if (anthropicKeyUsesBearer(provider)) headers["Authorization"] = `Bearer ${provider.apiKey}`;
         else headers["x-api-key"] = provider.apiKey;
       }
-      if (provider.headers) Object.assign(headers, provider.headers);
+      applyProviderHeaders(headers, provider);
 
       // Prompt caching: native Anthropic supports top-level automatic caching, which
       // follows the moving final block across turns. Keep one breakpoint slot free for it.
