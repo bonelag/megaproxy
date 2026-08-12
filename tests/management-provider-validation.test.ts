@@ -125,6 +125,53 @@ afterEach(() => {
 });
 
 describe("provider management validation", () => {
+  test("validates and exposes structured-output model opt-outs", () => {
+    const provider = {
+      adapter: "openai-chat",
+      baseUrl: "https://relay.example/v1",
+      noStructuredOutputModels: ["deepseek-v4-flash"],
+    };
+    expect(providerManagementConfigError("relay", provider)).toBeNull();
+    for (const noStructuredOutputModels of [
+      "deepseek-v4-flash",
+      [""],
+      ["   "],
+      [42],
+    ]) {
+      expect(providerManagementConfigError("relay", {
+        ...provider,
+        noStructuredOutputModels,
+      })).toContain("noStructuredOutputModels");
+    }
+
+    const dto = safeConfigDTO({
+      port: 10100,
+      defaultProvider: "relay",
+      providers: { relay: provider },
+    } as OcxConfig) as { providers: Record<string, { noStructuredOutputModels?: string[] }> };
+    expect(dto.providers.relay?.noStructuredOutputModels).toEqual(["deepseek-v4-flash"]);
+  });
+
+  test("normalizes hand-edited structured-output model opt-outs at load", () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    writeFileSync(join(TEST_DIR, "config.json"), JSON.stringify({
+      ...config("127.0.0.1"),
+      defaultProvider: "relay",
+      providers: {
+        relay: {
+          adapter: "openai-chat",
+          baseUrl: "https://relay.example/v1",
+          noStructuredOutputModels: [" deepseek-v4-flash ", "deepseek-v4-flash", " other-model "],
+        },
+      },
+    }));
+
+    expect(loadConfig().providers.relay?.noStructuredOutputModels)
+      .toEqual(["deepseek-v4-flash", "other-model"]);
+  });
+
   test("provider management rejects modelCosts rows with extra fields", () => {
     const error = providerManagementConfigError("blsc", {
       adapter: "openai-chat",
@@ -378,6 +425,120 @@ describe("provider management validation", () => {
     } finally {
       await server.stop(true);
     }
+  });
+
+  // #1409: the add/edit form's payload type has no member for contextWindow or
+  // modelContextWindows, so an overwrite arrives without them. Registry enrichment then fills
+  // the absent fields from the seed and the stored row loses the user's values — for
+  // opencode-go the seed is exactly {"kimi-k3": 262144}, which is what the reporter found in
+  // place of their deepseek-v4-flash override.
+  describe("provider POST overwrite preserves hand-edited context windows (#1409)", () => {
+    async function seedProvider(url: URL, extra: Record<string, unknown>): Promise<Response> {
+      return fetch(new URL("/api/providers", url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "opencode-go",
+          provider: { adapter: "openai-chat", baseUrl: "https://opencode.ai/zen/go/v1", apiKey: "k", ...extra },
+        }),
+      });
+    }
+
+    function freshHome(): void {
+      if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+      mkdirSync(TEST_DIR, { recursive: true });
+      process.env.OPENCODEX_HOME = TEST_DIR;
+      saveConfig(config("127.0.0.1"));
+    }
+
+    test("an omitted modelContextWindows keeps the user's map, without registry seed keys", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { modelContextWindows: { "deepseek-v4-flash": 900000 } })).status).toBe(200);
+        expect((await seedProvider(server.url, {})).status).toBe(200);
+
+        // The user's key survives, and the registry seed is NOT persisted into user config:
+        // router.ts fills registry values beneath user entries at resolve time, so writing
+        // them here would be a side effect of an unrelated save.
+        expect(loadConfig().providers["opencode-go"]?.modelContextWindows).toEqual({ "deepseek-v4-flash": 900000 });
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("a submitted modelContextWindows updates that key and keeps the others", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { modelContextWindows: { "deepseek-v4-flash": 900000 } })).status).toBe(200);
+        expect((await seedProvider(server.url, { modelContextWindows: { "kimi-k3": 300000 } })).status).toBe(200);
+
+        expect(loadConfig().providers["opencode-go"]?.modelContextWindows)
+          .toEqual({ "deepseek-v4-flash": 900000, "kimi-k3": 300000 });
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("an omitted contextWindow keeps the user's scalar", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { contextWindow: 777000 })).status).toBe(200);
+        expect((await seedProvider(server.url, {})).status).toBe(200);
+
+        expect(loadConfig().providers["opencode-go"]?.contextWindow).toBe(777000);
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("a submitted contextWindow still wins", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { contextWindow: 777000 })).status).toBe(200);
+        expect((await seedProvider(server.url, { contextWindow: 512000 })).status).toBe(200);
+
+        expect(loadConfig().providers["opencode-go"]?.contextWindow).toBe(512000);
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("a brand-new provider still receives the registry seed", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, {})).status).toBe(200);
+
+        // No prior row exists, so enrichment is authoritative and the seed must land.
+        expect(loadConfig().providers["opencode-go"]?.modelContextWindows).toBeDefined();
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("PATCH can still delete a key with an explicit null", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { modelContextWindows: { "deepseek-v4-flash": 900000 } })).status).toBe(200);
+
+        const patch = await fetch(new URL("/api/providers?name=opencode-go", server.url), {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ modelContextWindows: { "deepseek-v4-flash": null } }),
+        });
+        expect(patch.status).toBe(200);
+
+        // Deletion is an explicit null through PATCH, which the POST carry-over must not undo.
+        expect(loadConfig().providers["opencode-go"]?.modelContextWindows?.["deepseek-v4-flash"]).toBeUndefined();
+      } finally {
+        await server.stop(true);
+      }
+    });
   });
 
   test("provider management accepts modelCosts on the canonical openai provider", async () => {
@@ -1058,6 +1219,68 @@ describe("provider management validation", () => {
         providers: Record<string, { liveModels?: boolean }>;
       };
       expect(saved.providers["discovery-toggle"].liveModels).toBe(false);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("provider PATCH persists and clears structured-output model opt-outs", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig(config("127.0.0.1"));
+
+    const server = startServer(0);
+    try {
+      const createRes = await fetch(new URL("/api/providers", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "structured-output-toggle",
+          provider: {
+            adapter: "openai-chat",
+            baseUrl: "https://relay.example/v1",
+            liveModels: false,
+            models: ["deepseek-v4-flash"],
+          },
+        }),
+      });
+      expect(createRes.status).toBe(200);
+
+      const invalid = await fetch(new URL("/api/providers?name=structured-output-toggle", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ noStructuredOutputModels: "deepseek-v4-flash" }),
+      });
+      expect(invalid.status).toBe(400);
+
+      const patchRes = await fetch(new URL("/api/providers?name=structured-output-toggle", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          noStructuredOutputModels: [" deepseek-v4-flash ", "deepseek-v4-flash"],
+        }),
+      });
+      expect(patchRes.status).toBe(200);
+
+      const providers = await fetch(new URL("/api/providers", server.url)).then(response => response.json()) as Array<{
+        name: string;
+        noStructuredOutputModels?: string[];
+      }>;
+      expect(providers.find(provider => provider.name === "structured-output-toggle")?.noStructuredOutputModels)
+        .toEqual(["deepseek-v4-flash"]);
+
+      const clearRes = await fetch(new URL("/api/providers?name=structured-output-toggle", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ noStructuredOutputModels: null }),
+      });
+      expect(clearRes.status).toBe(200);
+
+      const saved = await fetch(new URL("/api/config", server.url)).then(response => response.json()) as {
+        providers: Record<string, { noStructuredOutputModels?: string[] }>;
+      };
+      expect(saved.providers["structured-output-toggle"].noStructuredOutputModels).toBeUndefined();
     } finally {
       await server.stop(true);
     }

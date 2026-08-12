@@ -8,6 +8,8 @@ import {
   hasOwnProvider,
   isValidProviderName,
   multiAgentGuidanceEnabled,
+  nonBlankStringArrayConfigError,
+  normalizeNonBlankStringArray,
   providerBaseUrlConfigError,
   providerHeadersConfigError,
   saveConfigPreservingClaudeCode,
@@ -205,6 +207,19 @@ function applyProviderPatchFields(
     }
     touched = true;
   }
+  if (Object.hasOwn(rawBody, "noStructuredOutputModels")) {
+    const value = rawBody.noStructuredOutputModels;
+    if (value === null) {
+      delete next.noStructuredOutputModels;
+    } else {
+      const error = nonBlankStringArrayConfigError(value, "noStructuredOutputModels");
+      if (error) return { error };
+      const models = normalizeNonBlankStringArray(value as string[]);
+      if (models.length > 0) next.noStructuredOutputModels = models;
+      else delete next.noStructuredOutputModels;
+    }
+    touched = true;
+  }
 
   // headers is the one object-valued field in the mask. Default PATCH semantics merge
   // it shallowly into the existing block so a single fingerprint header can be added
@@ -311,6 +326,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
         models: p.models ?? [],
         contextWindow: p.contextWindow,
         modelContextWindows: p.modelContextWindows,
+        noStructuredOutputModels: p.noStructuredOutputModels,
         authMode: p.authMode,
         apiKeyTransport: p.apiKeyTransport,
         disabled: p.disabled === true,
@@ -355,6 +371,12 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     }
     // Catalog providers (e.g. ollama-cloud) carry a models + vision/reasoning classification the GUI
     // doesn't send — merge it in so the sidecars are gated correctly.
+    // Sample request ownership BEFORE enrichment. Enrichment fills absent fields from the
+    // registry seed, after which "the client omitted this" and "the registry supplied it" are
+    // indistinguishable — so a carry-over guard written as `prov.x === undefined` after this
+    // call can never fire.
+    const submittedContextWindow = Object.hasOwn(prov, "contextWindow");
+    const submittedModelContextWindows = Object.hasOwn(prov, "modelContextWindows");
     enrichProviderFromCatalog(name, prov);
     const { saveConfigPreservingClaudeCode: save } = await import("../../config");
     // Overwriting an existing provider must not drop its multi-key pool: carry it over, then
@@ -366,6 +388,23 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     // erase hand-edited per-model prices from Logs/Usage estimates.
     const existingCosts = config.providers[name]?.modelCosts;
     if (existingCosts && !prov.modelCosts) prov.modelCosts = existingCosts;
+    // ...and to hand-edited context windows. `ProviderPayload` (gui/src/provider-payload.ts)
+    // has no member for either field, so the add/edit form structurally cannot send them:
+    // absence in the request means "not carried", never "the user deleted it". Deletion goes
+    // through PATCH with an explicit null (#1409).
+    const existing = config.providers[name];
+    if (!submittedContextWindow && existing?.contextWindow !== undefined) {
+      prov.contextWindow = existing.contextWindow;
+    }
+    if (existing?.modelContextWindows) {
+      // When the client did send a map, its keys win and the user's other keys survive. When
+      // it did not, the stored value is the user's map alone: merging the registry seed in
+      // would persist seed keys into user config as a side effect of an unrelated save, and
+      // router.ts already fills registry values beneath user entries at resolve time.
+      prov.modelContextWindows = submittedModelContextWindows
+        ? { ...existing.modelContextWindows, ...(prov.modelContextWindows ?? {}) }
+        : { ...existing.modelContextWindows };
+    }
     config.providers[name] = stripRegistryOnlyStaticHeaders(name, prov);
     if (body.setDefault === true) config.defaultProvider = name;
     save(config);

@@ -70,6 +70,7 @@ import { handleComboRoutes } from "./management/combo-routes";
 import { handleSystemRoutes } from "./management/system-routes";
 import { handleLabRoutes } from "./management/lab-routes";
 import { handleChatRelayRoutes } from "./management/chat-routes";
+import { handleLabAutomationRoutes } from "./management/lab-automation-routes";
 import { handleSidebarRoutes } from "./management/sidebar-routes";
 import { handleIntegrationRoutes } from "./management/integration-routes";
 import { handleNativeIntegrationRoutes } from "./management/native-integration-routes";
@@ -189,6 +190,7 @@ export async function handleManagementAPI(
     ??     (await handleOauthAccountRoutes(ctx))
     ??     (await handleComboRoutes(ctx))
     ??     (await handleSystemRoutes(ctx))
+    ??     (await handleLabAutomationRoutes(ctx))
     ??     (await handleLabRoutes(ctx))
     ??     (await handleChatRelayRoutes(ctx))
       ?? (await handleSidebarRoutes(ctx));

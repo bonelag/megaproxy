@@ -180,6 +180,29 @@ function invalidToolCallsEvent(usage?: OcxUsage): Extract<AdapterEvent, { type: 
   };
 }
 
+/**
+ * A streamed tool call is only dispatchable once the upstream has named the function.
+ *
+ * The OpenAI streaming convention puts `function.name` in the first chunk for a tool-call
+ * index and leaves later chunks carrying only `arguments` deltas, so a stream that never
+ * sends a name is non-conforming for every provider rather than quirky for one. The
+ * reference implementations accumulate such a call with an empty name and let the caller
+ * fail; we sit at the boundary where it would become a Codex tool-call contract event, so
+ * the equivalent is to refuse to emit it.
+ *
+ * Failing closed rather than dropping is deliberate, and matches #1325: a claimed tool call
+ * that silently disappears can leave the matching result orphaned on the next turn. Naming
+ * it ourselves is worse still — the id is synthesizable because it is an opaque correlation
+ * handle, but a function name is a guess at intent.
+ */
+function unnamedToolCallEvent(usage?: OcxUsage): Extract<AdapterEvent, { type: "error" }> {
+  return {
+    type: "error",
+    message: "upstream streamed a tool call without a function name — cannot dispatch",
+    ...(usage !== undefined ? { usage } : {}),
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -228,7 +251,7 @@ function toolResultImageChatParts(content: string | OcxContentPart[]): unknown[]
 function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderConfig): unknown[] {
   const out: unknown[] = [];
   const { context, options } = parsed;
-  const replayCacheScope = parsed._clientThreadId ?? "global";
+  const replayCacheScope = parsed._reasoningReplayScope;
 
   interface PendingToolCall { id: string; name: string }
   let pendingToolCalls: PendingToolCall[] = [];
@@ -843,19 +866,25 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       if (provider.promptCacheKey && parsed.options.promptCacheKey !== undefined) {
         body.prompt_cache_key = parsed.options.promptCacheKey;
       }
-      const textFormat = parsed.options.textFormat;
-      if (textFormat?.type === "json_object") {
-        body.response_format = { type: "json_object" };
-      } else if (textFormat?.type === "json_schema") {
-        body.response_format = {
-          type: "json_schema",
-          json_schema: {
-            name: textFormat.name ?? "response",
-            ...(textFormat.description !== undefined ? { description: textFormat.description } : {}),
-            ...(textFormat.schema !== undefined ? { schema: textFormat.schema } : {}),
-            ...(textFormat.strict !== undefined ? { strict: textFormat.strict } : {}),
-          },
-        };
+      // Structured-output support varies by the physical upstream model even when one
+      // gateway exposes a uniform OpenAI-compatible endpoint. Keep the #1137 translation
+      // as the default, but let an exact model opt out instead of forcing a provider-wide
+      // rollback that would silently return prose for siblings that support JSON Schema.
+      if (!provider.noStructuredOutputModels?.includes(parsed.modelId)) {
+        const textFormat = parsed.options.textFormat;
+        if (textFormat?.type === "json_object") {
+          body.response_format = { type: "json_object" };
+        } else if (textFormat?.type === "json_schema") {
+          body.response_format = {
+            type: "json_schema",
+            json_schema: {
+              name: textFormat.name ?? "response",
+              ...(textFormat.description !== undefined ? { description: textFormat.description } : {}),
+              ...(textFormat.schema !== undefined ? { schema: textFormat.schema } : {}),
+              ...(textFormat.strict !== undefined ? { strict: textFormat.strict } : {}),
+            },
+          };
+        }
       }
 
       if (tools) {
@@ -921,13 +950,27 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         pendingToolCalls.length = 0;
         return calls;
       };
-      const flushToolCalls = function* (): Generator<AdapterEvent> {
+      // Returns "terminate" when a pending call cannot be dispatched, so every flush site
+      // stops the turn instead of emitting an unusable call. `closeToolCalls()` runs first,
+      // so budget reservations are released for every pending call even on the early return.
+      const flushToolCalls = function* (): Generator<AdapterEvent, "continue" | "terminate"> {
         for (const call of closeToolCalls()) {
+          // Ingest already proved `name` is a string; the typeof guard keeps this branch
+          // total so a future ingest change cannot turn a malformed name into a throw.
+          if (typeof call.name !== "string" || call.name.trim().length === 0) {
+            debugProviderDiagnostic("openai-chat", "tool-call-unnamed", {
+              hadId: call.id.length > 0,
+              argsBytes: call.argsBytes,
+            });
+            yield unnamedToolCallEvent(pendingUsage);
+            return "terminate";
+          }
           if (!call.id) call.id = `call_${++toolCallSeq}`;
           yield { type: "tool_call_start", id: call.id, name: call.name };
           if (call.args.length > 0) yield { type: "tool_call_delta", arguments: call.args };
           yield { type: "tool_call_end" };
         }
+        return "continue";
       };
       const terminateWithError = function* (
         event: Extract<AdapterEvent, { type: "error" }>,
@@ -946,7 +989,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         const payload = rawPayload.trim();
         if (payload.length === 0) return "continue";
         if (payload === "[DONE]") {
-          yield* flushToolCalls();
+          if ((yield* flushToolCalls()) === "terminate") return "terminate";
           const stopReason = stopReasonFor(finishReason);
           yield { type: "done", usage: pendingUsage, ...(stopReason ? { stopReason } : {}) };
           return "terminate";
@@ -999,10 +1042,11 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           }
 
           const rawToolCalls = delta.tool_calls;
-          if (rawToolCalls !== undefined) {
-            // A claimed tool-call payload is not benign padding. Dropping it can leave the
+          if (rawToolCalls !== undefined && rawToolCalls !== null) {
+            // A non-null claimed tool-call payload is not benign padding. Dropping it can leave the
             // matching result permanently orphaned, so malformed nested shapes fail closed
-            // through the adapter error channel instead of escaping as TypeError (#1325).
+            // through the adapter error channel instead of escaping as TypeError (#1325). Null is
+            // tolerated as absent because OpenAI-compatible providers may emit it as stream padding.
             if (!Array.isArray(rawToolCalls)) {
               return yield* terminateWithError(invalidToolCallsEvent(pendingUsage));
             }
@@ -1015,6 +1059,25 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
                 id?: string;
                 function?: { name?: string; arguments?: string };
               };
+              // That cast is a TypeScript convenience, not a runtime guarantee: this is
+              // upstream JSON. Validate the fields before they are stored, so a non-string
+              // name or arguments value fails closed through the #1325 channel here rather
+              // than escaping later as a TypeError from string handling at flush time.
+              const rawFunction = (rawToolCall as { function?: unknown }).function;
+              if (rawFunction !== undefined && rawFunction !== null) {
+                if (!isRecord(rawFunction)) {
+                  return yield* terminateWithError(invalidToolCallsEvent(pendingUsage));
+                }
+                const rawName = rawFunction.name;
+                const rawArguments = rawFunction.arguments;
+                if ((rawName !== undefined && typeof rawName !== "string")
+                  || (rawArguments !== undefined && typeof rawArguments !== "string")) {
+                  return yield* terminateWithError(invalidToolCallsEvent(pendingUsage));
+                }
+              }
+              if (tc.id !== undefined && typeof tc.id !== "string") {
+                return yield* terminateWithError(invalidToolCallsEvent(pendingUsage));
+              }
               const key = typeof tc.index === "number"
                 ? `i:${tc.index}`
                 : tc.id
@@ -1048,7 +1111,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           }
         }
 
-        if (typeof choice.finish_reason === "string" && choice.finish_reason) yield* flushToolCalls();
+        if (typeof choice.finish_reason === "string" && choice.finish_reason) {
+          if ((yield* flushToolCalls()) === "terminate") return "terminate";
+        }
         return "continue";
       };
 
@@ -1108,7 +1173,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           yield { type: "error", message: "upstream stream ended without a terminal signal ([DONE] or finish_reason) — possible truncation" };
           return;
         }
-        yield* flushToolCalls();
+        if ((yield* flushToolCalls()) === "terminate") return;
         const stopReason = stopReasonFor(finishReason);
         yield { type: "done", usage: pendingUsage, ...(stopReason ? { stopReason } : {}) };
       } catch (error) {
@@ -1170,7 +1235,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         if (reasoningText !== undefined) events.push({ type: "reasoning_raw_delta", text: reasoningText });
         if (typeof msg.content === "string") events.push({ type: "text_delta", text: msg.content });
         const rawToolCalls = msg.tool_calls;
-        if (rawToolCalls !== undefined) {
+        if (rawToolCalls !== undefined && rawToolCalls !== null) {
           if (!Array.isArray(rawToolCalls)) return [invalidToolCallsEvent(usage)];
           for (const rawToolCall of rawToolCalls) {
             if (!isRecord(rawToolCall) || !isRecord(rawToolCall.function)) {
@@ -1179,7 +1244,11 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
             const id = rawToolCall.id;
             const name = rawToolCall.function.name;
             const args = rawToolCall.function.arguments;
-            if (typeof id !== "string" || typeof name !== "string" || typeof args !== "string") {
+            // A blank name is as undispatchable as a missing one, so it fails closed here
+            // for the same reason the streamed path refuses it. Trimmed length, not `!name`:
+            // a whitespace-only function name is not a legitimate tool-call shape either.
+            if (typeof id !== "string" || typeof name !== "string" || typeof args !== "string"
+              || name.trim().length === 0) {
               return [invalidToolCallsEvent(usage)];
             }
             events.push({ type: "tool_call_start", id, name });
