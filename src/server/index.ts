@@ -814,6 +814,13 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       }
 
       if (url.pathname.startsWith("/api/")) {
+        // The GUI chat relay is a management path that carries a MODEL turn, so it
+        // inherits the data plane's timeout problem: a long thinking phase emits no
+        // bytes and the 255s idle timeout would cut the stream. Every `/v1` turn
+        // branch disables it; this one has to as well.
+        if (url.pathname === "/api/chat/completions" && req.method === "POST") {
+          disableResponsesRequestTimeout(req, requestServer);
+        }
         const localManagementAuth = {
           attestationSecret: localAttestationSecret,
           pid: process.pid,

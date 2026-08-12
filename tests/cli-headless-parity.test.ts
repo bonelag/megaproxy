@@ -56,6 +56,12 @@ describe("headless GUI parity CLI", () => {
       ["/api/claude-code", "ocx claude config"],
       ["/api/claude-desktop", "ocx claude desktop"],
       ["/api/claude/", "ocx observe"],
+      // GUI-only by construction: the dashboard Chat tab's relay. A CLI already has
+      // the data plane — `POST /v1/chat/completions` with an API key — and the relay
+      // exists precisely because a BROWSER cannot hold that key (gui/src/api.ts only
+      // attaches the management credential to /api/*). Mirroring it as a CLI verb
+      // would hand headless callers a second path to the same turn with weaker auth.
+      ["/api/chat/completions", "(none — GUI-only; CLI uses POST /v1/chat/completions)"],
       ["/api/codex-auth", "ocx account"],
       // GUI-only affordance: starring the repo from the sidebar. There is deliberately
       // no CLI mirror — the headless surface has nothing to gain from a one-click

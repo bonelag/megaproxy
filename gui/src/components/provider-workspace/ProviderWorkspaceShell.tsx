@@ -171,8 +171,16 @@ export default function ProviderWorkspaceShell({
     const cached = readFreshQuotaReportCache(quotasCacheKey);
     return !cached || Object.keys(cached).length === 0;
   });
-  const [modelsLoadEpoch, setModelsLoadEpoch] = useState(0);
-  const modelsForceProviderRef = useRef<string | null>(null);
+  /**
+   * One state value drives a model reload: the epoch makes every request
+   * distinct, and `provider` names the provider whose upstream `/models` should
+   * be re-fetched (Settings' "Fetch models"). It is state rather than a ref
+   * because `retryModels` is handed to the detail pane during render, and a
+   * callback that writes a ref cannot be passed there (react-hooks/refs).
+   */
+  const [modelsLoad, setModelsLoad] = useState<{ epoch: number; provider: string | null }>(
+    { epoch: 0, provider: null },
+  );
   const filterWrapRef = useRef<HTMLDivElement>(null);
 
   const sections = useMemo(() => {
@@ -181,8 +189,8 @@ export default function ProviderWorkspaceShell({
   }, [providers, activeAccountNeedsReauth]);
 
   const retryModels = useCallback((providerName?: string) => {
-    modelsForceProviderRef.current = providerName?.trim() ? providerName.trim() : null;
-    setModelsLoadEpoch(epoch => epoch + 1);
+    const target = providerName?.trim() ? providerName.trim() : null;
+    setModelsLoad(current => ({ epoch: current.epoch + 1, provider: target }));
   }, []);
 
   useEffect(() => {
@@ -193,8 +201,7 @@ export default function ProviderWorkspaceShell({
       setModelsLoading(true);
       void (async () => {
         try {
-          const forceProvider = modelsForceProviderRef.current;
-          modelsForceProviderRef.current = null;
+          const forceProvider = modelsLoad.provider;
           const qs = new URLSearchParams();
           if (forceProvider) {
             qs.set("refresh", "1");
@@ -220,7 +227,7 @@ export default function ProviderWorkspaceShell({
       cancelled = true;
       window.clearTimeout(timeout);
     };
-  }, [apiBase, modelsRefreshToken, modelsLoadEpoch]);
+  }, [apiBase, modelsRefreshToken, modelsLoad]);
 
   useEffect(() => {
     let cancelled = false;

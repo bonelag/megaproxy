@@ -19,6 +19,7 @@ import {
   type TranslatorBudget,
 } from "../lib/translator-budget";
 import { applyProviderHeaders } from "../lib/provider-request-headers";
+import { adaptiveEffort, usesAdaptiveThinking } from "../claude/adaptive-thinking";
 
 // Providers may opt into stripping one trailing "[...]" group from the wire model id.
 // Z.AI needs this because its OpenAI path rejects glm-5.2[1m] with 400 code 1211;
@@ -745,7 +746,16 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const nativeOpenAI = isNativeOpenAIChatTarget(provider);
       let reasoningLog: AdapterRequest["reasoningLog"];
       if (!reasoningDisabled && provider.reasoningWireFormat === "gateway-object" && parsed.options.reasoning === "none") {
-        if (nativeOpenAI) {
+        // Adaptive Claude families reject `thinking.type: "enabled"` and some of
+        // them also reject an explicit disable. Omitting the field is safer than
+        // sending a shape the gateway rewrites into a 400.
+        if (usesAdaptiveThinking(parsed.modelId)) {
+          reasoningLog = {
+            effectiveEffort: "none",
+            wireField: "thinking.type",
+            wireValue: "omitted",
+          };
+        } else if (nativeOpenAI) {
           body.reasoning_effort = "none";
           reasoningLog = {
             effectiveEffort: "none",
@@ -761,7 +771,26 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           };
         }
       } else if (reasoningEffort !== undefined) {
-        if (provider.reasoningWireFormat === "gateway-object") {
+        // Adaptive Claude families reject `thinking.type: "enabled"`. Many
+        // OpenAI-compatible gateways rewrite a bare `reasoning_effort` into that
+        // shape before forwarding to Anthropic, so for those models we emit the
+        // adaptive wire ourselves rather than relying on the gateway to translate
+        // correctly. Older Claude families still accept budget thinking and must
+        // not receive adaptive (they 400 on it).
+        if (usesAdaptiveThinking(parsed.modelId)) {
+          const effort = adaptiveEffort(reasoningEffort);
+          body.thinking = { type: "adaptive" };
+          body.output_config = { effort };
+          // Do not also send reasoning_effort / reasoning.enabled: gateways that
+          // honor the adaptive pair still 400 when a conflicting shape rides along.
+          delete body.reasoning_effort;
+          delete body.reasoning;
+          reasoningLog = {
+            effectiveEffort: effort,
+            wireField: "thinking.type",
+            wireValue: "adaptive",
+          };
+        } else if (provider.reasoningWireFormat === "gateway-object") {
           if (nativeOpenAI) {
             body.reasoning_effort = reasoningEffort;
             reasoningLog = {

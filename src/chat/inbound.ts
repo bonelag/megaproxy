@@ -13,7 +13,16 @@ function isRec(v: unknown): v is Rec {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-const OUTPUT_CONFIG_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+/**
+ * Efforts a Chat Completions caller may name. `none` is included because the
+ * Responses parser accepts it (REASONING_EFFORTS) and adapters act on it —
+ * gateway-object providers send `reasoning_effort: "none"` / `reasoning:
+ * {enabled:false}`, everything else simply omits reasoning. Dropping it here
+ * would silently upgrade a "don't think" request to the provider default.
+ */
+const CHAT_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+/** Responses `reasoning.summary` modes (reasoningConfigSchema). */
+const CHAT_REASONING_SUMMARIES = new Set(["auto", "concise", "detailed", "none"]);
 
 function contentToText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -196,11 +205,28 @@ function responseFormatToText(format: unknown): Rec | undefined {
 }
 
 function resolveReasoningEffort(raw: Rec): string | undefined {
-  if (typeof raw.reasoning_effort === "string" && OUTPUT_CONFIG_EFFORTS.has(raw.reasoning_effort)) {
+  if (typeof raw.reasoning_effort === "string" && CHAT_REASONING_EFFORTS.has(raw.reasoning_effort)) {
     return raw.reasoning_effort;
   }
-  if (isRec(raw.reasoning) && typeof raw.reasoning.effort === "string" && OUTPUT_CONFIG_EFFORTS.has(raw.reasoning.effort)) {
+  if (isRec(raw.reasoning) && typeof raw.reasoning.effort === "string" && CHAT_REASONING_EFFORTS.has(raw.reasoning.effort)) {
     return raw.reasoning.effort;
+  }
+  return undefined;
+}
+
+/**
+ * `reasoning.summary`, forwarded verbatim when the caller names a valid mode.
+ *
+ * This is the switch that decides whether the caller sees the model think at
+ * all: the Responses parser treats an ABSENT summary as `hideThinkingSummary`,
+ * which suppresses every visible reasoning item, so a client that wants the
+ * thinking stream has to ask for it explicitly.
+ */
+function resolveReasoningSummary(raw: Rec): string | undefined {
+  const direct = raw.reasoning_summary;
+  if (typeof direct === "string" && CHAT_REASONING_SUMMARIES.has(direct)) return direct;
+  if (isRec(raw.reasoning) && typeof raw.reasoning.summary === "string" && CHAT_REASONING_SUMMARIES.has(raw.reasoning.summary)) {
+    return raw.reasoning.summary;
   }
   return undefined;
 }
@@ -286,7 +312,13 @@ export function chatCompletionsToResponsesBody(raw: unknown): Rec {
   if (raw.metadata !== undefined) body.metadata = raw.metadata;
 
   const effort = resolveReasoningEffort(raw);
-  if (effort) body.reasoning = { effort };
+  const summary = resolveReasoningSummary(raw);
+  if (effort || summary) {
+    body.reasoning = {
+      ...(effort ? { effort } : {}),
+      ...(summary ? { summary } : {}),
+    };
+  }
 
   const text = responseFormatToText(raw.response_format);
   if (text) body.text = text;

@@ -221,8 +221,45 @@ test("chatCompletionsToResponsesBody maps messages/tools/system", () => {
   expect(input.some(i => i.type === "function_call_output" && i.call_id === "call_1")).toBe(true);
 });
 
-test("chatCompletionsToResponsesBody rejects missing model", () => {
-  expect(() => chatCompletionsToResponsesBody({ messages: [{ role: "user", content: "x" }] }))
+test("reasoning_effort \"none\" survives translation instead of being dropped", () => {
+  // The dashboard Chat tab's "No thinking" rung sends this. Dropping it here
+  // would silently inherit the provider default — the opposite of the request.
+  const body = chatCompletionsToResponsesBody({
+    model: "mock/test-model",
+    messages: [{ role: "user", content: "hi" }],
+    reasoning_effort: "none",
+  });
+  expect(body.reasoning).toEqual({ effort: "none" });
+});
+
+test("reasoning_summary is forwarded so a caller can ask to see the thinking", () => {
+  // Absent summary means hideThinkingSummary downstream (responses/parser.ts), so
+  // a client that wants reasoning deltas has to name a mode explicitly.
+  const withSummary = chatCompletionsToResponsesBody({
+    model: "mock/test-model",
+    messages: [{ role: "user", content: "hi" }],
+    reasoning_effort: "high",
+    reasoning_summary: "auto",
+  });
+  expect(withSummary.reasoning).toEqual({ effort: "high", summary: "auto" });
+
+  // Nested shape works too, and an unknown mode is dropped rather than forwarded.
+  const nested = chatCompletionsToResponsesBody({
+    model: "mock/test-model",
+    messages: [{ role: "user", content: "hi" }],
+    reasoning: { effort: "medium", summary: "detailed" },
+  });
+  expect(nested.reasoning).toEqual({ effort: "medium", summary: "detailed" });
+
+  const bogus = chatCompletionsToResponsesBody({
+    model: "mock/test-model",
+    messages: [{ role: "user", content: "hi" }],
+    reasoning_summary: "loud",
+  });
+  expect(bogus.reasoning).toBeUndefined();
+});
+
+test("chatCompletionsToResponsesBody rejects missing model", () => {  expect(() => chatCompletionsToResponsesBody({ messages: [{ role: "user", content: "x" }] }))
     .toThrow(ChatCompletionsRequestError);
 });
 

@@ -65,3 +65,37 @@ export const IconGrip = (p: P) => (
 );
 export const IconStar = (p: P) => (<svg {...S(p)}><path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>);
 export const IconFilter = (p: P) => (<svg {...S(p)}><path d="M4 5h16l-6 7v5l-4 2v-7L4 5z"/></svg>);
+/** Speech bubble — Chat nav row. */
+export const IconMessage = (p: P) => (<svg {...S(p)}><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z"/></svg>);
+
+/* Chat workspace: composer toolbar, mode switch, and the thinking-effort ladder.
+   The six effort icons read as a rising scale (nothing -> spark -> brain -> star),
+   so the menu is scannable without reading the labels. */
+export const IconPaperclip = (p: P) => (<svg {...S(p)}><path d="M21.4 11.1l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l8.1-8.1a3.7 3.7 0 0 1 5.2 5.2l-8.1 8.1a1.8 1.8 0 0 1-2.6-2.6l7.5-7.4"/></svg>);
+export const IconImage = (p: P) => (<svg {...S(p)}><rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="8.8" cy="8.8" r="1.6"/><path d="m21 15.5-4.6-4.4L5 21"/></svg>);
+export const IconBolt = (p: P) => (<svg {...S(p)}><path d="M13.5 2 4 14h6l-1 8 9.5-12h-6l1-8Z"/></svg>);
+export const IconBan = (p: P) => (<svg {...S(p)}><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></svg>);
+export const IconBrain = (p: P) => (
+  <svg {...S(p)}>
+    <path d="M12 4.5a2.8 2.8 0 0 0-5 1.8 2.6 2.6 0 0 0-1.4 4.4A2.9 2.9 0 0 0 6.8 16 2.7 2.7 0 0 0 12 15.2Z"/>
+    <path d="M12 4.5a2.8 2.8 0 0 1 5 1.8 2.6 2.6 0 0 1 1.4 4.4A2.9 2.9 0 0 1 17.2 16 2.7 2.7 0 0 1 12 15.2Z"/>
+    <path d="M12 15.2V21"/>
+  </svg>
+);
+export const IconBrainCog = (p: P) => (
+  <svg {...S(p)}>
+    <path d="M11 5a2.6 2.6 0 0 0-4.6 1.6A2.4 2.4 0 0 0 5 10.9 2.7 2.7 0 0 0 6.3 16 2.5 2.5 0 0 0 11 15.2Z"/>
+    <path d="M11 5a2.6 2.6 0 0 1 4.4 1.3"/>
+    <circle cx="16.5" cy="14.5" r="2.6"/>
+    <path d="M16.5 10.6v1.3M16.5 17.1v1.3M12.6 14.5h1.3M19.1 14.5h1.3"/>
+  </svg>
+);
+export const IconSparkles = (p: P) => (
+  <svg {...S(p)}>
+    <path d="M10 3.5 11.6 8 16 9.5 11.6 11 10 15.5 8.4 11 4 9.5 8.4 8 10 3.5Z"/>
+    <path d="M17.5 15l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z"/>
+  </svg>
+);
+/** Clock with a counter-clockwise arrow — the History pill. */
+export const IconHistory = (p: P) => (<svg {...S(p)}><path d="M3.5 8.5V4M3.5 8.5H8"/><path d="M3.6 12a8.5 8.5 0 1 0 2.5-5.6L3.5 8.5"/><path d="M12 8v4.3l3.2 1.9"/></svg>);
+

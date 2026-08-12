@@ -392,6 +392,64 @@ describe("openai-chat max output defaults", () => {
     expect(body.max_tokens).toBe(20_000);
     expect(body.thinking_budget).toBe(15_000);
   });
+
+  test("adaptive Claude models emit thinking.type adaptive + output_config.effort", () => {
+    // Gateways that re-emit Claude traffic as Anthropic Messages rewrite a bare
+    // reasoning_effort into thinking.type: "enabled", which adaptive families
+    // reject. Emitting the adaptive pair ourselves is the only portable shape.
+    for (const modelId of ["claude-fable-5", "claude-sonnet-5", "claude-opus-4-8", "provider/claude-fable-5"]) {
+      const body = JSON.parse(createOpenAIChatAdapter(provider()).buildRequest({
+        ...parsed(),
+        modelId,
+        options: { reasoning: "low" },
+      }).body);
+      expect(body.thinking).toEqual({ type: "adaptive" });
+      expect(body.output_config).toEqual({ effort: "low" });
+      expect(body.reasoning_effort).toBeUndefined();
+      expect(body.reasoning).toBeUndefined();
+    }
+  });
+
+  test("older Claude families keep the plain reasoning_effort field", () => {
+    // Haiku 4.5 and Sonnet 4.x reject adaptive; they must not receive it.
+    for (const modelId of ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-6"]) {
+      const body = JSON.parse(createOpenAIChatAdapter(provider()).buildRequest({
+        ...parsed(),
+        modelId,
+        options: { reasoning: "high" },
+      }).body);
+      expect(body.reasoning_effort).toBe("high");
+      expect(body.thinking).toBeUndefined();
+      expect(body.output_config).toBeUndefined();
+    }
+  });
+
+  test("adaptive Claude models map minimal effort to low for output_config", () => {
+    const body = JSON.parse(createOpenAIChatAdapter(provider()).buildRequest({
+      ...parsed(),
+      modelId: "claude-fable-5",
+      options: { reasoning: "minimal" },
+    }).body);
+    expect(body.thinking).toEqual({ type: "adaptive" });
+    // Anthropic rejects output_config.effort: "minimal" with a 400.
+    expect(body.output_config).toEqual({ effort: "low" });
+  });
+
+  test("gateway-object none omits thinking for adaptive Claude models", () => {
+    const body = JSON.parse(createOpenAIChatAdapter(provider({
+      reasoningWireFormat: "gateway-object",
+    })).buildRequest({
+      ...parsed(),
+      modelId: "claude-fable-5",
+      options: { reasoning: "none" },
+    }).body);
+    // Fable always thinks and rejects an explicit disable; omitting the field is
+    // safer than sending a shape the gateway rewrites into a 400.
+    expect(body.thinking).toBeUndefined();
+    expect(body.reasoning).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+  });
 });
 
 describe("openai-chat response_format emission", () => {

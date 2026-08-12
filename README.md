@@ -115,6 +115,9 @@ see the [installation docs](https://opencodex.me/getting-started/installation/).
   through a sidecar over your ChatGPT login.
 - **See what's happening** — the dashboard shows providers, OAuth status, model selection, and a
   live request log with cache token counts.
+- **Chat right in the dashboard** — the **Chat** tab talks to any model you have configured, with
+  markdown, syntax-highlighted code and copy buttons, image/file attachments, and history saved in
+  your browser. No API key needed: the dashboard session authorizes the turn.
 - **Clean exit, zero residue** — `ocx stop` restores Codex to its original configuration.
 
 ## Model routing
