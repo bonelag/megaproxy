@@ -91,6 +91,7 @@ export const INTEGRATION_TAB_HASHES = [
   "integrations/openclaw",
   "integrations/kimi",
   "integrations/gajae",
+  "integrations/dsh",
 ] as const;
 
 export function hashBelongsToPage(rawHash: string, page: Page): boolean {

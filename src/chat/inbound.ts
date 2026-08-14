@@ -21,8 +21,7 @@ function isRec(v: unknown): v is Rec {
  * would silently upgrade a "don't think" request to the provider default.
  */
 const CHAT_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
-/** Responses `reasoning.summary` modes (reasoningConfigSchema). */
-const CHAT_REASONING_SUMMARIES = new Set(["auto", "concise", "detailed", "none"]);
+const OUTPUT_CONFIG_SUMMARIES = new Set(["auto", "concise", "detailed", "none"]);
 
 function contentToText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -215,19 +214,20 @@ function resolveReasoningEffort(raw: Rec): string | undefined {
 }
 
 /**
- * `reasoning.summary`, forwarded verbatim when the caller names a valid mode.
- *
- * This is the switch that decides whether the caller sees the model think at
- * all: the Responses parser treats an ABSENT summary as `hideThinkingSummary`,
- * which suppresses every visible reasoning item, so a client that wants the
- * thinking stream has to ask for it explicitly.
+ * Chat Completions clients (Grok Build, Copilot, OpenAI-compatible SDKs) expect
+ * `delta.reasoning_content` whenever the model thinks. The internal Responses
+ * parser hides thinking unless `reasoning.summary` is set and is not `"none"`.
+ * Map the common Chat Completions knobs onto that field. When the client only
+ * sent an effort, default the summary to `"auto"` so traces are not swallowed.
  */
 function resolveReasoningSummary(raw: Rec): string | undefined {
   const direct = raw.reasoning_summary;
-  if (typeof direct === "string" && CHAT_REASONING_SUMMARIES.has(direct)) return direct;
-  if (isRec(raw.reasoning) && typeof raw.reasoning.summary === "string" && CHAT_REASONING_SUMMARIES.has(raw.reasoning.summary)) {
+  if (typeof direct === "string" && OUTPUT_CONFIG_SUMMARIES.has(direct)) return direct;
+  if (isRec(raw.reasoning) && typeof raw.reasoning.summary === "string" && OUTPUT_CONFIG_SUMMARIES.has(raw.reasoning.summary)) {
     return raw.reasoning.summary;
   }
+  if (raw.include_reasoning === false) return "none";
+  if (raw.include_reasoning === true) return "auto";
   return undefined;
 }
 
@@ -312,11 +312,11 @@ export function chatCompletionsToResponsesBody(raw: unknown): Rec {
   if (raw.metadata !== undefined) body.metadata = raw.metadata;
 
   const effort = resolveReasoningEffort(raw);
-  const summary = resolveReasoningSummary(raw);
-  if (effort || summary) {
+  const summary = resolveReasoningSummary(raw) ?? (effort && effort !== "none" ? "auto" : undefined);
+  if (effort || summary !== undefined) {
     body.reasoning = {
       ...(effort ? { effort } : {}),
-      ...(summary ? { summary } : {}),
+      ...(summary !== undefined ? { summary } : {}),
     };
   }
 

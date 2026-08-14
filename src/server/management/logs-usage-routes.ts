@@ -50,11 +50,12 @@ import {
 import {
   currentUsageLogRevision,
   readUsageSnapshotForManagement,
+  usageLogIdentityKey,
   usageLogRevisionKey,
   type PersistedUsageEntry,
 } from "../../usage/log";
 import { getUsageDebugLogEntries } from "../../usage/debug";
-import { parseRange, parseUsageSurface, summarizeUsage, type UsageRange, type UsageSummary, type UsageSurface } from "../../usage/summary";
+import { parseRange, parseUsageSurface, rangeWindow, summarizeUsage, type UsageRange, type UsageSummary, type UsageSurface } from "../../usage/summary";
 import { stripCodexRuntimeProviderFields } from "../../codex/auth-context";
 import { getProviderRegistryEntry } from "../../providers/registry";
 import { getDebugLogEntries } from "../../lib/debug-log-buffer";
@@ -84,14 +85,7 @@ import {
   getUsageSummaryCacheEntry,
   setUsageSummaryCacheEntry,
 } from "./usage-summary-cache";
-
-const USAGE_DAY_MS = 86_400_000;
-function usageEntryMatchesSurface(entry: PersistedUsageEntry, surface: UsageSurface): boolean {
-  if (surface === "claude") return entry.surface === "claude" || entry.surface === "claude-desktop";
-  if (surface === "grok") return entry.surface === "grok";
-  if (surface === "codex") return entry.surface === undefined;
-  return true;
-}
+import { cacheApiKeyUsageFromSnapshot } from "./api-key-usage";
 
 function nextLocalMidnight(now: number): number {
   const next = new Date(now);
@@ -100,24 +94,16 @@ function nextLocalMidnight(now: number): number {
 }
 
 function usageSummaryExpiresAt(
-  entries: PersistedUsageEntry[],
-  range: UsageRange,
-  surface: UsageSurface,
+  _entries: PersistedUsageEntry[],
+  _range: UsageRange,
+  _surface: UsageSurface,
   now: number,
 ): number {
-  let expiresAt = nextLocalMidnight(now);
-  const windowMs = range === "7d" ? 7 * USAGE_DAY_MS : range === "30d" ? 30 * USAGE_DAY_MS : null;
-  if (windowMs === null) return expiresAt;
-  for (const entry of entries) {
-    if (!usageEntryMatchesSurface(entry, surface)) continue;
-    const expiry = entry.timestamp + windowMs;
-    if (expiry > now && expiry < expiresAt) expiresAt = expiry;
-  }
-  return expiresAt;
+  return nextLocalMidnight(now);
 }
 
 function refreshedUsageSummary<T extends UsageSummary & { historyTruncated: boolean }>(summary: T, range: UsageRange, now: number): T {
-  const since = range === "7d" ? now - 7 * USAGE_DAY_MS : range === "30d" ? now - 30 * USAGE_DAY_MS : null;
+  const { since } = rangeWindow(range, now);
   return { ...summary, since, generatedAt: now };
 }
 
@@ -215,12 +201,17 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
     try {
       const cacheKey = `${range}:${surface}`;
       const effectiveReadLimit = config.managementUsageMaxReadBytes ?? 64 * 1024 * 1024;
-      const observedRevisionKey = `${usageLogRevisionKey(currentUsageLogRevision())}\0${effectiveReadLimit}`;
+      const observed = currentUsageLogRevision();
+      const identityKey = `${usageLogIdentityKey(observed)}\0${effectiveReadLimit}`;
+      const observedSize = observed?.size ?? 0;
       const cached = getUsageSummaryCacheEntry(cacheKey);
       if (cached
-        && cached.revisionKey === observedRevisionKey
+        && cached.identityKey === identityKey
+        && cached.maxReadBytes === effectiveReadLimit
         && cached.overlayVersion === userCostOverlayVersion()
-        && now < cached.expiresAt) {
+        && now < cached.freshUntil
+        && now < cached.expiresAt
+        && observedSize >= cached.lastSeenSize) {
         return jsonResponse(refreshedUsageSummary(cached.summary, range, now));
       }
       if (cached) discardUsageSummaryCacheEntry(cacheKey);
@@ -249,13 +240,45 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
         // mixed-price entry under either version.
         return jsonResponse(summary);
       }
-      setUsageSummaryCacheEntry(cacheKey, {
-        revisionKey: `${usageLogRevisionKey(snapshot.revision)}\0${effectiveReadLimit}`,
-        overlayVersion,
-        expiresAt: usageSummaryExpiresAt(snapshot.entries, range, surface, now),
-        revisionReadAt,
-        summary,
-      });
+      const freshUntil = now + 60_000;
+      const snapshotIdentity = `${usageLogIdentityKey(snapshot.revision)}\0${effectiveReadLimit}`;
+      const revisionKey = `${usageLogRevisionKey(snapshot.revision)}\0${effectiveReadLimit}`;
+      const lastSeenSize = snapshot.revision?.size ?? 0;
+      const ranges: UsageRange[] = ["7d", "30d", "all"];
+      const surfaces: UsageSurface[] = ["all", "codex", "claude", "grok"];
+      for (const nextRange of ranges) {
+        for (const nextSurface of surfaces) {
+          const nextSummary = nextRange === range && nextSurface === surface ? summary : {
+            ...summarizeUsage(snapshot.entries, nextRange, now, nextSurface),
+            historyTruncated: summary.historyTruncated,
+            truncatedPrefixBytes: summary.truncatedPrefixBytes,
+            entriesTruncated: summary.entriesTruncated,
+            entriesDropped: summary.entriesDropped,
+            snapshotWindowStart: summary.snapshotWindowStart,
+            snapshotWindowEnd: summary.snapshotWindowEnd,
+          };
+          setUsageSummaryCacheEntry(`${nextRange}:${nextSurface}`, {
+            revisionKey,
+            identityKey: snapshotIdentity,
+            maxReadBytes: effectiveReadLimit,
+            overlayVersion,
+            expiresAt: usageSummaryExpiresAt(snapshot.entries, nextRange, nextSurface, now),
+            freshUntil,
+            lastSeenSize,
+            revisionReadAt,
+            summary: nextSummary,
+          });
+        }
+      }
+      cacheApiKeyUsageFromSnapshot(
+        snapshot.entries,
+        (config.apiKeys ?? []).map(key => key.id),
+        usageLogIdentityKey(snapshot.revision),
+        snapshot.revision?.size ?? 0,
+        snapshot.truncatedPrefixBytes > 0 || snapshot.entriesTruncated,
+        effectiveReadLimit,
+        now,
+      );
       return jsonResponse(summary);
     } catch {
       return jsonResponse({

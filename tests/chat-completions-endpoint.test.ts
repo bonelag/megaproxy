@@ -1,5 +1,5 @@
 import { waitForNativeMainStartupGate } from "../src/codex/native-profile-startup";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import type { OcxConfig, OcxProviderConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 import { chatCompletionsToResponsesBody, ChatCompletionsRequestError } from "../src/chat/inbound";
 import { chatCompletionsUsage } from "../src/chat/outbound";
+import { parseRequest } from "../src/responses/parser";
 import { createTestTranslatorBudget } from "./helpers/translator-budget";
 import type { TranslatorBudget } from "../src/lib/translator-budget";
 import {
@@ -218,7 +219,7 @@ test("chatCompletionsToResponsesBody maps messages/tools/system", () => {
   expect(body.stream).toBe(true);
   expect(body.instructions).toBe("be brief");
   expect(body.max_output_tokens).toBe(64);
-  expect(body.reasoning).toEqual({ effort: "high" });
+  expect(body.reasoning).toEqual({ effort: "high", summary: "auto" });
   expect(body.tool_choice).toBe("auto");
   expect(Array.isArray(body.tools)).toBe(true);
   expect((body.tools as Array<Record<string, unknown>>)[0]).toMatchObject({ type: "function", name: "lookup" });
@@ -228,45 +229,119 @@ test("chatCompletionsToResponsesBody maps messages/tools/system", () => {
   expect(input.some(i => i.type === "function_call_output" && i.call_id === "call_1")).toBe(true);
 });
 
-test("reasoning_effort \"none\" survives translation instead of being dropped", () => {
-  // The dashboard Chat tab's "No thinking" rung sends this. Dropping it here
-  // would silently inherit the provider default — the opposite of the request.
-  const body = chatCompletionsToResponsesBody({
-    model: "mock/test-model",
-    messages: [{ role: "user", content: "hi" }],
-    reasoning_effort: "none",
+describe("chatCompletionsToResponsesBody reasoning summary", () => {
+  test("reasoning_effort \"none\" survives translation instead of being dropped", () => {
+    // The dashboard Chat tab's "No thinking" rung sends this. Dropping it here
+    // would silently inherit the provider default — the opposite of the request.
+    const body = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "none",
+    });
+    expect(body.reasoning).toEqual({ effort: "none" });
   });
-  expect(body.reasoning).toEqual({ effort: "none" });
+
+  test("reasoning_summary is forwarded so a caller can ask to see the thinking", () => {
+    const withSummary = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "high",
+      reasoning_summary: "auto",
+    });
+    expect(withSummary.reasoning).toEqual({ effort: "high", summary: "auto" });
+
+    // Nested shape works too, and an unknown mode is dropped rather than forwarded.
+    const nested = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning: { effort: "medium", summary: "detailed" },
+    });
+    expect(nested.reasoning).toEqual({ effort: "medium", summary: "detailed" });
+
+    const bogus = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_summary: "loud",
+    });
+    expect(bogus.reasoning).toBeUndefined();
+  });
+
+  test("defaults summary to auto when the client only sent reasoning_effort", () => {
+    const body = chatCompletionsToResponsesBody({
+      model: "opencode-go/deepseek-v4-flash",
+      messages: [{ role: "user", content: "What is 17*19?" }],
+      reasoning_effort: "max",
+    });
+    expect(body.reasoning).toEqual({ effort: "max", summary: "auto" });
+    const parsed = parseRequest(body);
+    expect(parsed.options.hideThinkingSummary).not.toBe(true);
+    expect(parsed.options.reasoning).toBe("max");
+  });
+
+  test("preserves an explicit reasoning.summary", () => {
+    const body = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning: { effort: "high", summary: "concise" },
+    });
+    expect(body.reasoning).toEqual({ effort: "high", summary: "concise" });
+  });
+
+  test("include_reasoning false hides thinking even when effort is set", () => {
+    const body = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "high",
+      include_reasoning: false,
+    });
+    expect(body.reasoning).toEqual({ effort: "high", summary: "none" });
+    expect(parseRequest(body).options.hideThinkingSummary).toBe(true);
+  });
+
+  test("include_reasoning true requests a visible summary without an effort", () => {
+    const body = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      include_reasoning: true,
+    });
+    expect(body.reasoning).toEqual({ summary: "auto" });
+    expect(parseRequest(body).options.hideThinkingSummary).not.toBe(true);
+  });
+
+  test("explicit reasoning.summary wins over include_reasoning true", () => {
+    const body = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      include_reasoning: true,
+      reasoning: { summary: "none" },
+    });
+    expect(body.reasoning).toEqual({ summary: "none" });
+    expect(parseRequest(body).options.hideThinkingSummary).toBe(true);
+  });
+
+  test("explicit reasoning.summary wins over include_reasoning false", () => {
+    const body = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+      include_reasoning: false,
+      reasoning: { effort: "high", summary: "auto" },
+    });
+    expect(body.reasoning).toEqual({ effort: "high", summary: "auto" });
+    expect(parseRequest(body).options.hideThinkingSummary).not.toBe(true);
+  });
+
+  test("omits reasoning when the client sent no reasoning knobs", () => {
+    const body = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(body.reasoning).toBeUndefined();
+    expect(parseRequest(body).options.hideThinkingSummary).toBe(true);
+  });
 });
 
-test("reasoning_summary is forwarded so a caller can ask to see the thinking", () => {
-  // Absent summary means hideThinkingSummary downstream (responses/parser.ts), so
-  // a client that wants reasoning deltas has to name a mode explicitly.
-  const withSummary = chatCompletionsToResponsesBody({
-    model: "mock/test-model",
-    messages: [{ role: "user", content: "hi" }],
-    reasoning_effort: "high",
-    reasoning_summary: "auto",
-  });
-  expect(withSummary.reasoning).toEqual({ effort: "high", summary: "auto" });
-
-  // Nested shape works too, and an unknown mode is dropped rather than forwarded.
-  const nested = chatCompletionsToResponsesBody({
-    model: "mock/test-model",
-    messages: [{ role: "user", content: "hi" }],
-    reasoning: { effort: "medium", summary: "detailed" },
-  });
-  expect(nested.reasoning).toEqual({ effort: "medium", summary: "detailed" });
-
-  const bogus = chatCompletionsToResponsesBody({
-    model: "mock/test-model",
-    messages: [{ role: "user", content: "hi" }],
-    reasoning_summary: "loud",
-  });
-  expect(bogus.reasoning).toBeUndefined();
-});
-
-test("chatCompletionsToResponsesBody rejects missing model", () => {  expect(() => chatCompletionsToResponsesBody({ messages: [{ role: "user", content: "x" }] }))
+test("chatCompletionsToResponsesBody rejects missing model", () => {
+  expect(() => chatCompletionsToResponsesBody({ messages: [{ role: "user", content: "x" }] }))
     .toThrow(ChatCompletionsRequestError);
 });
 
