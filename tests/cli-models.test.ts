@@ -173,4 +173,32 @@ describe("ocx models richer metadata", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("models add supports model IDs with slashes like qwen/qwen3.8-max-free", () => {
+    const { dir } = freshConfig();
+    try {
+      const addResult = runCli(
+        ["models", "add", "test", "qwen/qwen3.8-max-free", "--display-name", "Qwen 3.8 Max Free"],
+        { OPENCODEX_HOME: dir },
+      );
+      expect(addResult.status).toBe(0);
+      expect(addResult.stdout).toContain("Added custom model test/qwen-qwen3.8-max-free");
+
+      const listResult = runCli(["models", "list-custom", "--json"], { OPENCODEX_HOME: dir });
+      expect(listResult.status).toBe(0);
+      const parsed = JSON.parse(listResult.stdout) as Array<{ provider: string; modelId: string; displayName?: string }>;
+      expect(parsed).toBeArray();
+      expect(parsed.some(m => m.provider === "test" && m.modelId === "qwen/qwen3.8-max-free" && m.displayName === "Qwen 3.8 Max Free")).toBe(true);
+
+      // Remove using encoded slug
+      const removeResult = runCli(
+        ["models", "remove", "test/qwen-qwen3.8-max-free", "--yes"],
+        { OPENCODEX_HOME: dir },
+      );
+      expect(removeResult.status).toBe(0);
+      expect(removeResult.stdout).toContain("Removed custom model test/qwen-qwen3.8-max-free");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

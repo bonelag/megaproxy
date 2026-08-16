@@ -811,10 +811,10 @@ export function buildModelsRequest(
     // enough to list everything without a pageToken loop. Vertex/antigravity keep the
     // generic branch (they fall back to their static model lists).
     if (apiKey) headers["x-goog-api-key"] = apiKey;
-    return { url: discoveryUrl(`${effectiveProvider.baseUrl}/v1beta/models?pageSize=1000`), headers };
+    return { url: discoveryUrl(`${effectiveProvider.baseUrl.replace(/\/+$/, "")}/v1beta/models?pageSize=1000`), headers };
   }
   if (effectiveProvider.adapter === "anthropic") {
-    const base = effectiveProvider.baseUrl.replace(/\/v1\/?$/, "");
+    const base = effectiveProvider.baseUrl.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
     headers["anthropic-version"] = "2023-06-01";
     if (effectiveProvider.authMode === "oauth") {
       headers["anthropic-beta"] = ANTHROPIC_OAUTH_BETA;
@@ -826,7 +826,7 @@ export function buildModelsRequest(
     return { url: discoveryUrl(`${base}/v1/models?limit=1000`), headers };
   }
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-  return { url: discoveryUrl(`${effectiveProvider.baseUrl}/models`), headers };
+  return { url: discoveryUrl(`${effectiveProvider.baseUrl.replace(/\/+$/, "")}/models`), headers };
 }
 
 /**

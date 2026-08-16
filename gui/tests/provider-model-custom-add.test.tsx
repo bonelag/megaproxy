@@ -114,20 +114,37 @@ test("quick-add submits the trimmed model id for the current provider", async ()
   await act(async () => { root.unmount(); });
 });
 
-test("quick-add blocks existing and namespaced model ids", async () => {
-  let requests = 0;
-  globalThis.fetch = (async (_input, init) => {
+test("quick-add allows models with slashes like qwen/qwen3.8-max-free and blocks duplicates", async () => {
+  const requests: Array<{ url: string; method: string; body: unknown }> = [];
+  globalThis.fetch = (async (input, init) => {
     if (!init?.method || init.method === "GET") return Response.json([]);
-    requests += 1;
-    return Response.json({ id: "unexpected" }, { status: 201 });
+    requests.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+    });
+    return Response.json({ id: "custom-qwen" }, { status: 201 });
   }) as typeof fetch;
-  const { root, input, addButton } = await mountProviderModels();
+  const { root, container, input, addButton } = await mountProviderModels();
 
+  // Existing model is blocked
   await enterModelId(input, "claude-opus-5");
   expect(addButton.disabled).toBe(true);
-  await enterModelId(input, "vendor/model");
-  expect(addButton.disabled).toBe(true);
-  expect(requests).toBe(0);
+
+  // Model with slashes (e.g. qwen/qwen3.8-max-free) is allowed and submitted
+  await enterModelId(input, "qwen/qwen3.8-max-free");
+  expect(addButton.disabled).toBe(false);
+  await act(async () => {
+    addButton.click();
+    await Promise.resolve();
+  });
+
+  expect(requests).toEqual([{
+    url: "http://localhost:10100/api/custom-models",
+    method: "POST",
+    body: { provider: "AiCodeWith", modelId: "qwen/qwen3.8-max-free" },
+  }]);
+  expect(container.querySelector('[role="status"]')?.textContent).toContain("Custom model added");
 
   await act(async () => { root.unmount(); });
 });

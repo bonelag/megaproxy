@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { syncModelsToCodex } from "../codex/sync";
 import { hasOwnProvider, isValidProviderName, loadConfig, saveConfig } from "../config";
-import { routedSlug } from "../providers/slug-codec";
+import { routedSlug, slugEquals } from "../providers/slug-codec";
 import { findLiveProxy } from "../server/proxy-liveness";
 import type { OcxConfig, OcxCustomModel } from "../types";
 
@@ -122,7 +122,6 @@ async function handleCustomAdd(args: string[]): Promise<void> {
 
   if (!provider || !modelId) fail("provider and modelId are required", ADD_USAGE);
   if (!isValidProviderName(provider)) fail(`invalid provider name "${provider}"`);
-  if (modelId.includes("/")) fail("modelId must not contain /");
 
   const config = loadConfig();
   if (!hasOwnProvider(config.providers, provider)) {
@@ -130,7 +129,6 @@ async function handleCustomAdd(args: string[]): Promise<void> {
   }
 
   const displayName = displayNameValue?.trim() || undefined;
-  if (displayName?.includes("/")) fail("displayName must not contain /");
 
   let contextWindow: number | undefined;
   if (contextWindowValue !== undefined) {
@@ -193,9 +191,9 @@ async function handleCustomRemove(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const existing = config.customModels ?? [];
-  const index = target.includes("/")
-    ? existing.findIndex(model => routedSlug(model.provider, model.modelId) === target)
-    : existing.findIndex(model => model.id === target);
+  const index = existing.findIndex(
+    model => model.id === target || slugEquals(target, model.provider, model.modelId),
+  );
   if (index === -1) fail(`custom model "${target}" not found`);
 
   const model = existing[index];
