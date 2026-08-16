@@ -80,6 +80,11 @@ interface ProviderModelDiscoverySharedSpec {
   maxResponseBytes?: number;
   /** Optional lower raw-row ceiling; the process-wide hard ceiling still wins. */
   maxModels?: number;
+  /**
+   * If a valid extracted id starts with this prefix, strip it and re-validate the remainder.
+   * Empty/invalid remainders skip that row only.
+   */
+  stripIdPrefix?: string;
 }
 
 type ProviderModelDiscoveryLocation =
@@ -200,13 +205,15 @@ export interface ProviderRegistryEntry {
    */
   requiresAdjacentResponsesToolResults?: boolean;
   /**
-   * Registry default for the provider's Responses `service_tier` support; see
+   * Registry default for the provider's `service_tier` support; see
    * `OcxProviderConfig.supportsServiceTier`. Registry-only: backfilled (never
    * overriding) at enrich/route time and deliberately NOT seeded into saved
    * config, so an explicit user value stays distinguishable from the default
    * (and the canonical openai seed comparison keeps its exact key set).
    */
   supportsServiceTier?: boolean;
+  /** Registry default for exact model service-tier capability; explicit config keys win. */
+  modelSupportsServiceTier?: Record<string, boolean>;
   /** Registry default for plaintext reasoning replay; see `OcxProviderConfig.preserveResponsesReasoningContent`. Registry-only like `supportsServiceTier`. */
   preserveResponsesReasoningContent?: boolean;
   /** Registry defaults for per-model Codex reasoning propagation; explicit user keys win during enrichment. */
@@ -903,6 +910,7 @@ const CLINE_PASS_MODELS = [
   "cline-pass/mimo-v2.5",
   "cline-pass/mimo-v2.5-pro",
   "cline-pass/minimax-m3",
+  "cline-pass/qwen3.8-max",
   "cline-pass/qwen3.7-max",
   "cline-pass/qwen3.7-plus",
 ];
@@ -928,9 +936,10 @@ const CLINE_PASS_IMAGE_MODELS = new Set([
   "cline-pass/minimax-m3",
   "cline-pass/qwen3.7-plus",
 ]);
-const CLINE_PASS_TEXT_ONLY_MODELS = CLINE_PASS_MODELS.filter(id => !CLINE_PASS_IMAGE_MODELS.has(id));
+const CLINE_PASS_MODALITY_KNOWN_MODELS = CLINE_PASS_MODELS.filter(id => id !== "cline-pass/qwen3.8-max");
+const CLINE_PASS_TEXT_ONLY_MODELS = CLINE_PASS_MODALITY_KNOWN_MODELS.filter(id => !CLINE_PASS_IMAGE_MODELS.has(id));
 const CLINE_PASS_MODEL_INPUT_MODALITIES: Record<string, string[]> = Object.fromEntries(
-  CLINE_PASS_MODELS.map(id => [id, CLINE_PASS_IMAGE_MODELS.has(id) ? ["text", "image"] : ["text"]]),
+  CLINE_PASS_MODALITY_KNOWN_MODELS.map(id => [id, CLINE_PASS_IMAGE_MODELS.has(id) ? ["text", "image"] : ["text"]]),
 );
 
 export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
@@ -1973,7 +1982,11 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
   // 260710 GLM-5.2 context and path-specific ids: Tier-2 evidence in
   // devlog/_plan/260710_provider_hardening/002_research_cn.md.
   // 260814: glm-5.3 / glm-5.3[1m] added per docs.z.ai/devpack/latest-model, which lists them as
-  // Coding Plan ids on this same endpoint. Capabilities mirror 5.2 until Z.AI publishes tables.
+  // Coding Plan ids on this same endpoint.
+  // 260815: docs.z.ai/guides/llm/glm-5.3 now publishes the capability table (thinking, streaming,
+  // function calling, caching, structured output) and a 128K output budget, recorded here as the
+  // exact 131_072 every other source in this repo uses for that model. Coding Plan pricing stays
+  // unpublished, so no cost entry is asserted.
   {
     id: "zai", label: "Z.AI — GLM Coding Plan", baseUrl: "https://api.z.ai/api/coding/paas/v4", adapter: "openai-chat", authKind: "key",
     dashboardUrl: "https://z.ai/manage-apikey/apikey-list", defaultModel: "glm-5.3",
@@ -1984,6 +1997,8 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     modelSuffixBracketStrip: true,
     noVisionModels: ZAI_GLM_5X_MODELS,
     modelReasoningEfforts: ZAI_GLM_5X_REASONING_EFFORTS,
+    modelDefaultReasoningEfforts: Object.fromEntries(ZAI_GLM_53_MODELS.map(id => [id, "max"])),
+    modelMaxOutputTokens: Object.fromEntries(ZAI_GLM_53_MODELS.map(id => [id, 131_072])),
     modelSupportsReasoningSummaries: Object.fromEntries(ZAI_GLM_5X_MODELS.map(id => [id, true])),
     preserveReasoningContentModels: ZAI_GLM_5X_MODELS,
   },
@@ -2457,6 +2472,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // Cloudflare Workers AI: OpenAI-compatible endpoint. The base URL contains {account_id}
     // which must be resolved by the user at setup time. Model IDs use the @cf/ prefix.
     // Live-verified 2026-07-21 against https://developers.cloudflare.com/workers-ai/models/
+    // Official search is sibling to /ai/v1 (GET .../ai/models/search?format=openrouter).
     id: "cloudflare-workers-ai", label: "Cloudflare Workers AI",
     baseUrl: "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
     adapter: "openai-chat", authKind: "key", freeTier: true,
@@ -2471,6 +2487,13 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
       "@cf/zai-org/glm-5.2",
       "@cf/mistralai/mistral-small-3.1-24b-instruct",
     ],
+    liveModels: true,
+    modelDiscovery: {
+      path: "../models/search",
+      query: { format: "openrouter", per_page: "1000" },
+      stripIdPrefix: "workers-ai/",
+      maxModels: 256,
+    },
     note: "Workers AI · Free tier included · Account ID required in base URL",
   },
   // FREEZE 2026-07-10: /models was auth-gated under key login. OAuth device-flow + copilot_internal

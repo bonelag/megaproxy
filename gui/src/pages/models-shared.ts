@@ -38,7 +38,18 @@ export interface ModelRow {
   contextWindow?: number;
   contextCap?: number;
   contextCapped?: boolean;
+  /** Stored custom-row override (not the inherited ladder); only present on custom rows. */
+  reasoningEfforts?: string[];
 }
+
+/**
+ * Reasoning-effort labels offered in the custom-model dialog. The full set of real
+ * `reasoning_effort` values (none, minimal, low, medium, high, xhigh, max). Deliberately
+ * excludes `ultra`: that is a Codex catalog label for the multi-agent collab surface, not a
+ * real `reasoning_effort` value — codex-rs converts it to `max` before any provider
+ * request, and the catalog writer appends it to every non-empty ladder anyway.
+ */
+export const REASONING_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 export interface ProviderContextCapsResponse {
   cap?: number;
@@ -51,6 +62,7 @@ export interface V2Status {
   agentsMaxThreadsConflict: boolean;
   maxConcurrentThreadsPerSession?: number | null;
   multiAgentMode?: "v1" | "default" | "v2";
+  keepNativeChatGptOnV1?: boolean;
 }
 
 export interface ShadowCallData {
