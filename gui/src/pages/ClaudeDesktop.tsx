@@ -108,14 +108,6 @@ export default function ClaudeDesktop({
     setProfile(normalized);
     setSavedProfile(cloneProfile(normalized));
     setDestinations(Object.fromEntries(payload.models.map(model => [model.route, normalized.assignments[model.route]?.family ?? "opus"])));
-    // Fold empty families on load, but only while the user has no stored preference.
-    // Doing it here rather than per render means a later move or import can never
-    // re-fold a section the user opened.
-    if (FAMILY_COLLAPSE.read() === null) {
-      const counts = Object.fromEntries(FAMILIES.map(family => [family, 0])) as Record<Family, number>;
-      for (const model of payload.models) counts[normalized.assignments[model.route]?.family ?? "opus"] += 1;
-      setCollapsedFamilies(defaultCollapsedFamilies(counts));
-    }
     writeSessionListCacheEntry(cacheKey, next);
     return next;
   }, [apiBase, cacheKey, t, setDestinations, setProfile, setSavedProfile]);
