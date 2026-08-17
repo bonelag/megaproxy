@@ -3,7 +3,7 @@ import { LANE_PAGE } from "./claude-desktop-lane";
 import { EmptyState, Notice } from "../ui";
 import { LOCALES, useI18n } from "../i18n/shared";
 import { readJsonIfOk, readJsonOrThrow } from "../fetch-json";
-import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
+import { readSessionListCacheEntry, writeSessionListCacheEntry } from "../session-list-cache";
 import { useDataSurface } from "../data-surface";
 import { DataSurfaceSkeleton } from "../components/data-surface";
 import {
@@ -30,7 +30,11 @@ import {
 type CachedDesktop = { data: DesktopResponse; profile: DesktopProfile };
 
 function readDesktopCache(cacheKey: string): CachedDesktop | null {
-  return readSessionListCache<CachedDesktop>(cacheKey);
+  return readSessionListCacheEntry<CachedDesktop>(cacheKey)?.data ?? null;
+}
+
+function readDesktopCachedAt(cacheKey: string): number | null {
+  return readSessionListCacheEntry<CachedDesktop>(cacheKey)?.cachedAt ?? null;
 }
 
 function seedDesktop(cacheKey: string) {
@@ -104,7 +108,15 @@ export default function ClaudeDesktop({
     setProfile(normalized);
     setSavedProfile(cloneProfile(normalized));
     setDestinations(Object.fromEntries(payload.models.map(model => [model.route, normalized.assignments[model.route]?.family ?? "opus"])));
-    writeSessionListCache(cacheKey, next);
+    // Fold empty families on load, but only while the user has no stored preference.
+    // Doing it here rather than per render means a later move or import can never
+    // re-fold a section the user opened.
+    if (FAMILY_COLLAPSE.read() === null) {
+      const counts = Object.fromEntries(FAMILIES.map(family => [family, 0])) as Record<Family, number>;
+      for (const model of payload.models) counts[normalized.assignments[model.route]?.family ?? "opus"] += 1;
+      setCollapsedFamilies(defaultCollapsedFamilies(counts));
+    }
+    writeSessionListCacheEntry(cacheKey, next);
     return next;
   }, [apiBase, cacheKey, t, setDestinations, setProfile, setSavedProfile]);
 
@@ -112,7 +124,13 @@ export default function ClaudeDesktop({
     resourceKey,
     [apiBase],
     fetchDesktop,
-    { isEmpty: () => false, enabled: active, initialData: cached.held ?? undefined },
+    {
+      isEmpty: () => false,
+      enabled: active,
+      initialData: cached.held ?? undefined,
+      initialDataCachedAt: readDesktopCachedAt(cacheKey),
+      staleAfterMs: 60_000,
+    },
   );
   const loadState = desktopResource.state;
   const resourceData = loadState.data ?? (cached.data && cached.profile ? { data: cached.data, profile: cached.profile } : null);
@@ -172,7 +190,7 @@ export default function ClaudeDesktop({
   // profile editor, which keeps its drafts intact across Code/Desktop tab switches.
   const statusCacheKey = `ocx.claude-desktop.status.v1:${apiBase}`;
   const statusResourceKey = `claude-desktop-status:${apiBase}`;
-  const cachedStatus = readSessionListCache<DesktopStatus>(statusCacheKey);
+  const cachedStatusEntry = readSessionListCacheEntry<DesktopStatus>(statusCacheKey);
   const statusResource = useDataSurface<DesktopStatus>(
     statusResourceKey,
     [apiBase],
@@ -180,13 +198,14 @@ export default function ClaudeDesktop({
       const response = await fetch(`${apiBase}/api/claude-desktop/status`, { signal });
       const next = await readJsonIfOk<DesktopStatus>(response);
       if (!next) throw new Error("Claude Desktop status unavailable");
-      writeSessionListCache(statusCacheKey, next);
+      writeSessionListCacheEntry(statusCacheKey, next);
       return next;
     },
-    { isEmpty: () => false, pollMs: 5000, enabled: active, initialData: cachedStatus ?? undefined },
+    // Polled, so no staleAfterMs: the cadence already keeps it fresh.
+    { isEmpty: () => false, pollMs: 5000, enabled: active, initialData: cachedStatusEntry?.data ?? undefined },
   );
   const statusState = statusResource.state;
-  const status = statusState.data ?? cachedStatus ?? null;
+  const status = statusState.data ?? cachedStatusEntry?.data ?? null;
   const statusFailed = statusState.showError;
 
   const moveModel = (route: string, family: Family) => {

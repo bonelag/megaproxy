@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
  * job is to know which optional subsystems exist. It is covered by a behavioral assertion
  * instead (see below).
  *
- * Design and rationale: devlog/_plan/260814_lab_core_decoupling/
+ * Design and rationale: devlog/_fin/260814_lab_core_decoupling/
  */
 const PROTECTED = [
   "src/router.ts",
