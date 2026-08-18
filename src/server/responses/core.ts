@@ -1,10 +1,14 @@
 import type { Server } from "bun";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse, type ResponsesTerminalStatus } from "../../bridge";
 import { formatPassthroughUpstreamError } from "./passthrough-error";
+import {
+  createResponsesFieldBackfillBlockRewrite,
+  backfillResponsesFieldsJson,
+} from "./responses-field-backfill";
 import { checkInputAdmission } from "./input-admission";
+import { nativeContextLimits } from "../../codex/catalog";
 import { describeUpstreamConnectFailure } from "./upstream-error";
 import {
-  getConfigPath,
   multiAgentGuidanceEnabled,
   resolveEnvValue,
 } from "../../config";
@@ -13,6 +17,7 @@ import {
   bindReasoningReplayScope,
   reasoningReplayCodexCredentialIdentity,
   reasoningReplayDestinationIdentity,
+  durableReplayDestinationIdentity,
   reasoningReplayKeyCredentialIdentity,
   reasoningReplayOAuthCredentialIdentity,
 } from "../../responses/reasoning-replay-cache";
@@ -55,12 +60,13 @@ import { injectionDebugLog } from "../../lib/injection-debug-log";
 import { resolveClientRetryAfter } from "../../lib/retry-after";
 import { enrichOpenCodeZenRateLimitMessage } from "../../providers/opencode-zen-rate-limit";
 import { modelInList, namespacedToolName } from "../../types";
-import type { AdapterEvent, OcxConfig, OcxParsedRequest, OcxProviderConfig, OcxProviderContinuationState, OcxUsage } from "../../types";
+import type { AdapterEvent, OcxConfig, OcxParsedRequest, OcxProviderConfig, OcxProviderContinuationState, OcxUsage, TierDecision } from "../../types";
 import {
   forceRefreshOAuthAccessSnapshot,
   getOAuthCredentialApiBaseUrl,
   getValidAccessTokenForAccount,
   getValidAccessTokenSnapshot,
+  publicOAuthAuthenticationErrorMessage,
   type OAuthAccessSnapshot,
   UnsupportedOAuthProviderError,
 } from "../../oauth";
@@ -121,7 +127,18 @@ import { createTranslatorBudget, isTranslatorBudgetExceededError, type Translato
 import { listOpenAiForwardSidecarCandidates, resolveFirstUsableOpenAiSidecar, type ResolvedOpenAiForwardSidecar } from "../../providers/openai-sidecar";
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { providerContextCap } from "../../providers/context-cap";
-import { SERVICE_TIER_ADAPTERS, serviceTierSupportForModel } from "../../providers/service-tier";
+import {
+  fastPolicyForModel,
+  serviceTierSupportFromPolicy,
+  SERVICE_TIER_ADAPTERS,
+} from "../../providers/service-tier";
+import {
+  canonicalFastTierMarker,
+  decideTier,
+  tierObservationContext,
+  tierValueAfterDecision,
+  type ResolvedFastPolicy,
+} from "../../providers/fastwire";
 import {
   RequestPacingQueueOverloadError,
   waitForProviderRequestSlot,
@@ -147,7 +164,7 @@ import { shouldAttemptImageTierRetry } from "../image-retry";
 import { resolveProviderTransport } from "../../providers/xai-transport";
 import type { WsData } from "../ws-bridge";
 import { codexAccountSelectionForTurn, registerTurn, trackStreamLifetime, unregisterTurn } from "../lifecycle";
-import { redactSecretString } from "../../lib/redact";
+import { redactSecretString, sanitizeLogMetadataString } from "../../lib/redact";
 import { readBoundedResponseBody } from "../../lib/bounded-body";
 import type { AdmissionLease } from "../../lib/admission";
 import { supportedLadderFor } from "../effort-policy";
@@ -165,6 +182,8 @@ import {
   noteAttemptSend,
   readConfiguredCodexServiceTier,
   recordAdapterReasoning,
+  recordAdapterTier,
+  recordAdapterTierMetadata,
   recordAttemptRequestedEffort,
   requestLogSpeedLabel,
   sealRequestAttemptIdentity,
@@ -206,6 +225,11 @@ import {
   hasResponsesItemIdRepair,
   repairResponsesJsonItemIds,
 } from "../responses-item-id-repair";
+import {
+  createReasoningSummaryChannelPayloadRewrite,
+  rewriteReasoningSummaryInJsonString,
+  routeUsesContentChannelReasoning,
+} from "../responses-reasoning-summary-rewrite";
 import {
   createImageGenCallRestoreRewrite,
   imageGenToolCallAliases,
@@ -335,6 +359,7 @@ function bindRouteReasoningReplayScope(args: {
       ? {
           providerName,
           providerDestinationIdentity,
+          providerDestinationDurableIdentity: durableReplayDestinationIdentity(provider.baseUrl),
           adapterName,
           modelId: parsed.modelId,
           credentialIdentity,
@@ -347,8 +372,6 @@ function isFixedCodexAccount(authCtx: CodexAuthContext): boolean {
   return (authCtx.kind === "pool" || authCtx.kind === "main-pool")
     && authCtx.fixedAccount === true;
 }
-
-
 
 export function usesCodexForwardPoolAuth(
   authCtx: CodexAuthContext,
@@ -597,6 +620,7 @@ async function retryCodexPoolOnAlternateAccount(
     translatorBudget: options.translatorBudget,
   });
   recordAdapterReasoning(logCtx, request);
+  recordAdapterTier(logCtx, request);
 
   await firstResponse.body?.cancel().catch(() => undefined);
   options.onCodexAuthContextResolved?.(retryAuthCtx);
@@ -966,6 +990,23 @@ const UNREADABLE_ENCRYPTED_AGENT_TASK_MESSAGE =
 const MAX_UPSTREAM_JSON_BODY_BYTES = 32 * 1024 * 1024;
 const UPSTREAM_JSON_BODY_TOTAL_TIMEOUT_MS = 180_000;
 const UPSTREAM_JSON_BODY_INACTIVITY_TIMEOUT_MS = 30_000;
+const MAX_FAST_WIRE_CAPABILITY_WARNINGS = 256;
+const warnedFastWireCapabilityGaps = new Set<string>();
+
+function warnFastWireCapabilityGap(providerName: string, modelId: string): void {
+  const safeProvider = sanitizeLogMetadataString(providerName) ?? "unknown";
+  const safeModel = sanitizeLogMetadataString(modelId) ?? "unknown";
+  const key = `${safeProvider}\0${safeModel}`;
+  if (warnedFastWireCapabilityGaps.has(key)) return;
+  if (warnedFastWireCapabilityGaps.size >= MAX_FAST_WIRE_CAPABILITY_WARNINGS) {
+    const oldest = warnedFastWireCapabilityGaps.values().next().value;
+    if (oldest !== undefined) warnedFastWireCapabilityGaps.delete(oldest);
+  }
+  warnedFastWireCapabilityGaps.add(key);
+  console.warn(
+    `[opencodex] Fast policy for ${safeProvider}/${safeModel} has service-tier capability but no Fast wire; preserving only caller-permitted tier behavior`,
+  );
+}
 export const UPSTREAM_JSON_BODY_READ_OPTIONS = {
   maxBytes: MAX_UPSTREAM_JSON_BODY_BYTES,
   totalTimeoutMs: UPSTREAM_JSON_BODY_TOTAL_TIMEOUT_MS,
@@ -1151,23 +1192,21 @@ async function applyFinalRouteRequestNormalization(args: {
     logCtx.preserveResolvedModelFromRoute = true;
   }
 
-  // Fast mode override only where the final provider/model route explicitly documents
-  // service-tier support. The same model-scoped resolver is used by catalog generation.
-  const modelServiceTierSupport = serviceTierSupportForModel(
+  // Resolve Fast policy after the final route/wire settles. A1 records the decision on parsed
+  // options; the Responses adapter owns the final outbound body write.
+  const fastPolicy = fastPolicyForModel(
     route.provider,
     route.modelId,
     route.providerName,
     inboundWire,
   );
-  if (config.fastMode !== undefined
-    && SERVICE_TIER_ADAPTERS.has(route.provider.adapter)
-    && modelServiceTierSupport === true) {
-    const tier = config.fastMode ? "priority" : undefined;
-    if (parsed._rawBody && typeof parsed._rawBody === "object") {
-      if (tier) (parsed._rawBody as Record<string, unknown>).service_tier = tier;
-      else delete (parsed._rawBody as Record<string, unknown>).service_tier;
-    }
-    parsed.options.serviceTier = tier;
+  const modelServiceTierSupport = serviceTierSupportFromPolicy(fastPolicy);
+  const callerTier = parsed.options.serviceTier;
+  parsed.options.tierObservation = tierObservationContext(fastPolicy, config.fastMode, callerTier);
+  parsed.options.tierDecision = decideTier(fastPolicy, config.fastMode, callerTier);
+  parsed.options.serviceTier = tierValueAfterDecision(parsed.options.tierDecision, callerTier);
+  if (fastPolicy.capability === true && fastPolicy.fastWire === null) {
+    warnFastWireCapabilityGap(route.providerName, route.modelId);
   }
   applyServiceTierGate(
     route.provider,
@@ -1176,6 +1215,7 @@ async function applyFinalRouteRequestNormalization(args: {
     route.modelId,
     route.providerName,
     inboundWire,
+    fastPolicy,
   );
   if (modelServiceTierSupport === false) {
     logCtx.requestedServiceTier = undefined;
@@ -1563,29 +1603,43 @@ function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBud
  * Service-tier capability gate, applied after the final route/wire is settled. A
  * provider explicitly documented as NOT supporting `service_tier` must never
  * receive it: strip the field and clear the logging value even when the caller
- * supplied one (fail closed). Tri-state contract: `true` supports (injection
- * allowed, caller values preserved), `false` strips, and an UNCLASSIFIED custom
- * provider (`undefined`) preserves caller-supplied values but never gets an
- * injection — deleting the caller's field there would silently change their
- * request against a gateway we know nothing about.
+ * supplied one (fail closed). A policy-produced canonical Fast decision has
+ * already passed capability validation and cannot be vetoed by Chat's caller
+ * forwarding permission. On unclassified routes every caller tier remains subject
+ * to `forwardCallerTier`.
  */
 export function applyServiceTierGate(
   provider: OcxProviderConfig,
   rawBody: unknown,
-  options: { serviceTier?: string },
+  options: { serviceTier?: string; tierDecision?: TierDecision },
   modelId?: string,
   providerName?: string,
   inbound: InboundWire = "responses",
+  resolvedPolicy?: ResolvedFastPolicy,
 ): void {
   // A direct unit caller without a model id retains the historical tri-state behavior for
   // adapters outside the OpenAI service-tier family. Once a model is known, resolve the final
   // model adapter as well: an explicit override to Anthropic (or another non-OpenAI wire) must
   // not carry a caller-supplied `service_tier` through a route that cannot forward it.
   if (modelId === undefined && !SERVICE_TIER_ADAPTERS.has(provider.adapter)) return;
-  const support = modelId === undefined
-    ? provider.supportsServiceTier
-    : serviceTierSupportForModel(provider, modelId, providerName, inbound);
-  if (support !== false) return;
+  const policy = modelId === undefined
+    ? undefined
+    : resolvedPolicy ?? fastPolicyForModel(provider, modelId, providerName, inbound);
+  const forwardCallerTier = modelId === undefined
+    ? provider.supportsServiceTier !== false
+    : policy!.forwardCallerTier;
+  const rawTier = rawBody && typeof rawBody === "object"
+    ? (rawBody as Record<string, unknown>).service_tier
+    : undefined;
+  const canonicalDecision = options.tierDecision?.kind === "set";
+  const callerTierIsForeign = rawTier !== undefined
+    && (typeof rawTier !== "string" || canonicalFastTierMarker(rawTier) === undefined);
+  const dropForeignCallerTier = policy?.capability === true
+    && policy.fastWire?.kind === "service-tier"
+    && policy.fastWire?.foreignCallerTiers === "drop"
+    && callerTierIsForeign;
+  if (policy && policy.capability !== false && canonicalDecision) return;
+  if (forwardCallerTier && !dropForeignCallerTier) return;
   if (rawBody && typeof rawBody === "object") {
     delete (rawBody as Record<string, unknown>).service_tier;
   }
@@ -1721,6 +1775,7 @@ async function handleResponsesInner(
   }
   logCtx.requestedModel = parsed.modelId;
   logCtx.requestedEffort = parsed.options.reasoning;
+  logCtx.callerServiceTier = sanitizeLogMetadataString(parsed.options.serviceTier);
   logCtx.requestedServiceTier = parsed.options.serviceTier;
   logCtx.requestedSpeedLabel = requestLogSpeedLabel(parsed.options.serviceTier);
   logCtx.configuredServiceTier = readConfiguredCodexServiceTier();
@@ -1994,7 +2049,7 @@ async function handleResponsesInner(
   // refusing the turn that shrinks the context would deadlock the client against the very
   // limit this gate reports — it would be told to compact and then denied the compaction.
   if (parsed._compactionRequest !== true) {
-    const inputAdmission = checkInputAdmission(parsed, route.provider, route.providerName, parsed.modelId, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID));
+    const inputAdmission = checkInputAdmission(parsed, route.provider, route.providerName, parsed.modelId, nativeContextLimits(config));
     if (!inputAdmission.admitted) {
       // #1524: this is a LOCAL preflight refusal, not an upstream verdict. A policy or combo
       // fallback must be able to skip this candidate and try one whose context window fits,
@@ -2104,13 +2159,14 @@ async function handleResponsesInner(
       }
     } catch (err) {
       if (err instanceof UnsupportedOAuthProviderError) {
+        const safeProviderName = redactSecretString(route.providerName);
         return formatErrorResponse(
           400,
           "invalid_request_error",
-          `${err.message}. Remove or reconfigure provider '${route.providerName}' in ${getConfigPath()}.`,
+          `${redactSecretString(err.message)}. Remove or reconfigure provider '${safeProviderName}' in the OpenCodex configuration.`,
         );
       }
-      return formatErrorResponse(401, "authentication_error", err instanceof Error ? err.message : String(err));
+      return formatErrorResponse(401, "authentication_error", publicOAuthAuthenticationErrorMessage(err));
     }
   }
   route.provider = resolveProviderTransport(
@@ -2163,6 +2219,9 @@ async function handleResponsesInner(
     (logCtx.attempts ??= []).push(attempt);
   }
   sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, adapter.name, logCtx.accountLogLabel);
+  if (adapter.runTurn) {
+    recordAdapterTierMetadata(logCtx, adapter.tierLogForRunTurn?.(parsed));
+  }
   // Optional route-identity linkage for attempt correlation (CL-09 consumes it). The slot
   // resolves to null unless an opt-in subsystem registered a linker, so an install without
   // routing profiles does no work here and loads no additional module. The non-throwing
@@ -2397,6 +2456,7 @@ async function handleResponsesInner(
       }
       : undefined;
     recordAdapterReasoning(logCtx, request);
+    recordAdapterTier(logCtx, request);
     const actualHostKey = upstreamHostHealthKey(
       route.providerName,
       safeOriginLabel(request.url),
@@ -2778,6 +2838,10 @@ async function handleResponsesInner(
           ? createResponsesItemIdPayloadRewrite(repairConfig!, translatorBudget)
           : undefined,
         responseModelRewrite,
+        parsed.options.hideThinkingSummary !== true
+          && routeUsesContentChannelReasoning(route.provider, route.modelId)
+          ? createReasoningSummaryChannelPayloadRewrite()
+          : undefined,
       ].filter((rewrite): rewrite is NonNullable<typeof rewrite> => rewrite !== undefined);
       // #893: sparse-snapshot gateways get field backfills AND lifecycle event
       // injection at the block level, after payload rewrites. Defaults come
@@ -2796,6 +2860,7 @@ async function handleResponsesInner(
         snapshotRepairEnabled
           ? createResponsesSnapshotBlockRewrite(outboundRequestBody, translatorBudget)
           : undefined,
+        createResponsesFieldBackfillBlockRewrite(),
         // Last: every rewrite above can still rename or reshape a call item, so the guard must
         // compare the names the client will actually receive against the declared catalog.
         undeclaredToolGuardActive
@@ -2989,9 +3054,16 @@ async function handleResponsesInner(
         const repaired = hasResponsesSnapshotRepair(route.provider.responsesSnapshotRepair)
           ? repairResponsesSnapshotJson(restored, outboundRequestBody)
           : restored;
-        return parsed._responseModelId !== undefined && parsed._responseModelId !== parsed.modelId
-          ? rewriteResponsesModelJson(repaired, parsed._responseModelId)
-          : repaired;
+        const modelRewritten = parsed._responseModelId !== undefined && parsed._responseModelId !== parsed.modelId
+          ? rewriteResponsesModelJson(backfillResponsesFieldsJson(repaired), parsed._responseModelId)
+          : backfillResponsesFieldsJson(repaired);
+        // The bounded-JSON answer bypasses the SSE payload rewrite, so content-
+        // channel reasoning needs the same normalization here for the plain
+        // JSON answer and every reframed-SSE variant built from clientJson.
+        return parsed.options.hideThinkingSummary !== true
+          && routeUsesContentChannelReasoning(route.provider, route.modelId)
+          ? rewriteReasoningSummaryInJsonString(modelRewritten)
+          : modelRewritten;
       })();
       // #1700: same fail-closed policy as the SSE relay above. Both the plain JSON answer and
       // the reframed-SSE branch below are built from this body, so one check covers them. This
@@ -3193,7 +3265,10 @@ async function handleResponsesInner(
       stallTimeoutSec: config.stallTimeoutSec,
       waitForRequestSlot: imageProviderFetch.waitForPacing,
       fetchImpl: imageProviderFetch.unpacedFetch ?? imageProviderFetch,
-      onRequestBuilt: request => recordAdapterReasoning(logCtx, request),
+      onRequestBuilt: request => {
+        recordAdapterReasoning(logCtx, request);
+        recordAdapterTier(logCtx, request);
+      },
       ...(vidPlan?.timeoutMs ? { videoTimeoutMs: vidPlan.timeoutMs } : {}),
       onUsage: usage => {
         // Cursor may assign _cursorConversationId inside the image loop's first runTurn;
@@ -3271,7 +3346,10 @@ async function handleResponsesInner(
       forceEmptyResponseId: true,
       abortSignal: options.abortSignal,
       ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
-      onRequestBuilt: request => recordAdapterReasoning(logCtx, request),
+      onRequestBuilt: request => {
+        recordAdapterReasoning(logCtx, request);
+        recordAdapterTier(logCtx, request);
+      },
       onAttemptSend: (recovery?: AttemptRecoveryKind) =>
         noteAttemptSend(logCtx.activeAttempt, logCtx.usageLogInputTokens, recovery),
       onUsage: usage => {
@@ -3442,6 +3520,9 @@ async function handleResponsesInner(
           toolParameterSchemas,
           ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
           ...(routedCompaction ? { compaction: true } : {}),
+          // grok-build's strict decoder dies on the typed response.heartbeat frame; its
+          // eventsource layer tolerates comment keep-alives. Codex needs the opposite.
+          ...(logCtx.surface === "grok" ? { heartbeatStyle: "comment" as const } : {}),
           onUsage: usage => {
             // Raw adapter usage, pre wire-normalization: the bridged SSE now always carries
             // zero-default detail objects, so provenance must come from here (cache_detail_missing).
@@ -3541,6 +3622,7 @@ async function handleResponsesInner(
   try {
     initialRequest = await activeAdapter.buildRequest(parsed, { headers: selectedForwardHeaders, translatorBudget });
     recordAdapterReasoning(logCtx, initialRequest);
+    recordAdapterTier(logCtx, initialRequest);
     inputTokenEstimate = typeof initialRequest.usageLog?.inputTokens === "number"
       ? initialRequest.usageLog.inputTokens
       : undefined;
@@ -3580,9 +3662,18 @@ async function handleResponsesInner(
         abortSignal: upstream.signal,
         timeoutMs: connectMs,
         stream: parsed.stream,
+        executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+          providerName: route.providerName,
+          modelId: route.modelId,
+        }),
       });
     } else {
-      upstreamResponse = await fetchWithResetRetry(
+      // #1851 scope guard: transient-5xx retry on this generic adapter path is opt-in for
+      // direct Google AI Studio only (Vertex/Antigravity use fetchResponse above). Other
+      // adapters keep reset-only retry so combo failover still hops on the first 5xx
+      // instead of burning ~1.2s of same-target retries per hop.
+      const fetchWithRetryPolicy = route.provider.adapter === "google" ? fetchWithTransientRetry : fetchWithResetRetry;
+      upstreamResponse = await fetchWithRetryPolicy(
         recovery => {
           noteAttemptSend(logCtx.activeAttempt, inputTokenEstimate, recovery);
           return fetchWithHeaderTimeout(builtInitialRequest.url, applyUpstreamRecoveryInit({
@@ -3645,6 +3736,7 @@ async function handleResponsesInner(
             ...(imageTierBias > 0 ? { imageTierBias } : {}),
           });
           recordAdapterReasoning(logCtx, retryRequest);
+          recordAdapterTier(logCtx, retryRequest);
         } catch (err) {
           // A rotated/rebuilt adapter build failure is a request-shaping error, not an
           // upstream connect failure: tear the abort link down and map it as 400 (no 413
@@ -3670,7 +3762,15 @@ async function handleResponsesInner(
         try {
           if (activeAdapter.fetchResponse) {
             await waitForProviderRequestSlot(route.providerName, route.provider, route.modelId, upstream.signal);
-            return await activeAdapter.fetchResponse(retryRequest, { abortSignal: upstream.signal, timeoutMs: connectMs, stream: parsed.stream });
+            return await activeAdapter.fetchResponse(retryRequest, {
+              abortSignal: upstream.signal,
+              timeoutMs: connectMs,
+              stream: parsed.stream,
+              executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+                providerName: route.providerName,
+                modelId: route.modelId,
+              }),
+            });
           }
           return await fetchWithHeaderTimeout(retryRequest.url, {
             method: retryRequest.method, headers: retryRequest.headers, body: retryRequest.body,
@@ -3706,7 +3806,7 @@ async function handleResponsesInner(
           refreshed = await forceRefreshOAuthAccessSnapshot(sentOAuthSnapshot);
         } catch (err) {
           cleanupUpstreamAbort();
-          return formatErrorResponse(401, "authentication_error", err instanceof Error ? err.message : String(err));
+          return formatErrorResponse(401, "authentication_error", publicOAuthAuthenticationErrorMessage(err));
         }
         sentOAuthSnapshot = refreshed;
         replayOAuthCredentialSnapshot = {
@@ -3967,6 +4067,7 @@ async function handleResponsesInner(
             ...(imageTierBias > 0 ? { imageTierBias } : {}),
           });
           recordAdapterReasoning(logCtx, continuationRequest);
+          recordAdapterTier(logCtx, continuationRequest);
         } catch (err) {
           // The main body is already streaming, so there is no HTTP error surface: release
           // any partial body observation and surface the failure as an in-stream error via
@@ -3996,9 +4097,16 @@ async function handleResponsesInner(
             abortSignal: upstream.signal,
             timeoutMs: connectMs,
             stream: nextParsed.stream,
+            executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+              providerName: route.providerName,
+              modelId: nextParsed.modelId,
+            }),
           });
         }
-        return await fetchWithResetRetry(
+        // Same #1851 scope guard as the initial send: transient-5xx retry only for direct
+        // Google AI Studio; every other adapter keeps reset-only semantics here.
+        const fetchContinuationWithRetryPolicy = route.provider.adapter === "google" ? fetchWithTransientRetry : fetchWithResetRetry;
+        return await fetchContinuationWithRetryPolicy(
           recovery => {
             noteAttemptSend(logCtx.activeAttempt, continuationEstimate, recovery ?? replayKind);
             return fetchWithHeaderTimeout(
@@ -4246,6 +4354,8 @@ async function handleResponsesInner(
       toolParameterSchemas,
         ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
         ...(routedCompaction ? { compaction: true } : {}),
+        // Same grok-surface split as the runTurn branch above.
+        ...(logCtx.surface === "grok" ? { heartbeatStyle: "comment" as const } : {}),
         onUsage: usage => {
           // Raw adapter usage, pre wire-normalization (see the runTurn branch above).
           logCtx.usageFromBridge = true;

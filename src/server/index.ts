@@ -50,7 +50,6 @@ import { runOpenAiTierStartupMigration } from "../providers/openai-tier-startup"
 import { runAlibabaRegionStartupMigration } from "../providers/alibaba-region-startup";
 import { runModelRenameStartupMigration } from "../providers/model-rename-startup";
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
-import { providerContextCap } from "../providers/context-cap";
 import { providerCodexAccountMode } from "../providers/registry";
 import type { StorageCleanupPolicy } from "../types";
 import { MAX_DECOMPRESSED_BODY_BYTES } from "./request-decompress";
@@ -913,7 +912,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           }
           throw error;
         }
-        const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
+        const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeContextLimits, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
         const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
         const includeAccountBoundNativeOpenAi = shouldIncludeAccountBoundNativeOpenAi(config);
         const nativeSlugs = includeNativeOpenAi
@@ -965,7 +964,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             : idsParam === "desktop"
               ? "desktop3p" as const
               : (/^claude-code\//i.test(req.headers.get("user-agent") ?? "") ? "readable" as const : "desktop3p" as const);
-          const data = buildAnthropicModelInfos([...desktopVisibleNativeSlugs(config)], goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID));
+          const data = buildAnthropicModelInfos([...desktopVisibleNativeSlugs(config)], goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias, nativeContextLimits(config));
           return jsonResponse({ data }, 200, req, policy);
         }
         if (url.searchParams.has("client_version")) {
@@ -992,7 +991,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             accountSelectors,
             suppressedBareNativeSlugs,
             new Set(),
-            providerContextCap(config, OPENAI_CODEX_PROVIDER_ID),
+            nativeContextLimits(config),
             accountNativeSlugs,
             accountNativeSlugsBySelector,
             config.keepNativeChatGptOnV1 === true,
@@ -1209,6 +1208,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           ...admissionFields(admission),
           inboundProtocol: "responses",
         };
+        if (req.headers.get("x-opencodex-grok") === "1") logCtx.surface = "grok";
         let logged = false;
         const finalizeNativePassthroughLog = (
           status: number,
@@ -1736,7 +1736,15 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     && isCanonicalOpenAiForwardProvider(openAiProvider)
     && providerCodexAccountMode("openai", openAiProvider) === "pool"
   ) {
-    import("../codex/auth-api")
+    import("../codex/plan-from-token")
+      .then(({ reconcileCodexPlansFromTokens }) => {
+        try {
+          reconcileCodexPlansFromTokens(config);
+        } catch {
+          // Derived plan metadata must not block WHAM priming.
+        }
+        return import("../codex/auth-api");
+      })
       .then(({ primeCodexPoolQuotas }) => primeCodexPoolQuotas(config, "startup"))
       .catch(() => {});
   }

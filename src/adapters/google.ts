@@ -49,19 +49,17 @@ const GOOGLE_BREVITY_INSTRUCTION = [
 ].join("\n");
 
 /**
- * Google renamed the current Gemini Flash generations on the Generative Language API,
- * appending a `-tiered` suffix (`gemini-3.7-flash` -> `gemini-3.7-flash-tiered`). The
- * old `gemini-3.7-flash` path 404s, so a saved config or registry entry naming the base
- * id must be resolved here before it reaches the URL. The user-facing id is deliberately
- * left alone: the picker, the catalog, the usage log and the price overlays all stay
- * keyed on the base id, and only the wire path learns the new spelling.
+ * Some Google direct deployments expose current Gemini Flash generations with a `-tiered`
+ * wire suffix (`gemini-3.7-flash` -> `gemini-3.7-flash-tiered`). Keep the picker-visible id
+ * stable and make the mapping configurable for deployments that still serve the bare id.
  */
 const GEMINI_DIRECT_WIRE_RENAMES: Record<string, string> = {
   "gemini-3.7-flash": "gemini-3.7-flash-tiered",
   "gemini-3.6-flash": "gemini-3.6-flash-tiered",
 };
 
-function resolveDirectGeminiWireModelId(modelId: string): string {
+function resolveDirectGeminiWireModelId(modelId: string, applyRenames: boolean): string {
+  if (!applyRenames) return modelId;
   return Object.hasOwn(GEMINI_DIRECT_WIRE_RENAMES, modelId)
     ? GEMINI_DIRECT_WIRE_RENAMES[modelId]!
     : modelId;
@@ -148,7 +146,7 @@ function geminiToolResultText(content: string | OcxContentPart[]): string {
 
 function messagesToGeminiFormat(
   parsed: OcxParsedRequest,
-  routedModelId = parsed.modelId,
+  identityModelId: string,
 ): { systemInstruction?: unknown; contents: unknown[] } {
   // Neutralize Codex's GPT-5 identity line (Gemini/Antigravity share this path) so a routed model
   // never misreports as GPT-5/OpenAI, and never leaks the proxy identity upstream.
@@ -157,7 +155,7 @@ function messagesToGeminiFormat(
     ...(parsed.context.systemPrompt ?? []),
     ...(toolCatalogNudge ? [toolCatalogNudge] : []),
     GOOGLE_BREVITY_INSTRUCTION,
-  ].join("\n\n"), routedModelId);
+  ].join("\n\n"), identityModelId);
   const systemInstruction = { parts: [{ text: systemText }] };
 
   const contents: unknown[] = [];
@@ -380,8 +378,10 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
   return {
     name: "google",
 
-    // Vertex + Antigravity get Kiro-style retry/timeout + classified, redacted errors. AI-Studio
-    // Gemini keeps the default server fetch path (fetchResponse stays undefined so server.ts falls back).
+    // Vertex + Antigravity get Kiro-style retry/timeout + classified, redacted errors.
+    // Direct AI-Studio uses the canonical server transport (fetchWithTransientRetry), which
+    // retries transient 5xx responses through providerFetch while preserving multi-key pool
+    // 429 rotation and raw error formatting.
     ...(provider.googleMode === "vertex" || provider.googleMode === "cloud-code-assist"
       ? {
           fetchResponse: (request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> =>
@@ -396,9 +396,14 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         ? resolveAntigravityEffortWireModel(
             parsed.modelId,
             mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning),
+            provider.baseUrl,
           ).wireModelId
-        : resolveDirectGeminiWireModelId(parsed.modelId);
-      const { systemInstruction, contents } = messagesToGeminiFormat(parsed, routedModelId);
+        : provider.googleMode === "vertex"
+          ? parsed.modelId
+          : resolveDirectGeminiWireModelId(parsed.modelId, provider.directGeminiWireRenames !== false);
+      // AI Studio's `-tiered` spelling is wire-only; CCA aliases may migrate to another generation.
+      const identityModelId = provider.googleMode === "cloud-code-assist" ? routedModelId : parsed.modelId;
+      const { systemInstruction, contents } = messagesToGeminiFormat(parsed, identityModelId);
       const tools = toolsToGeminiFormat(parsed);
 
       const body: Record<string, unknown> = { contents };
@@ -451,7 +456,11 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         if (!project) throw new Error("Antigravity requires a discovered Cloud Code Assist project id (re-run `ocx login google-antigravity`).");
         const sessionId = antigravitySessionId(parsed);
         const mappedEffort = mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning);
-        const { wireModelId, thinkingLevel } = resolveAntigravityEffortWireModel(parsed.modelId, mappedEffort);
+        const { wireModelId, thinkingLevel } = resolveAntigravityEffortWireModel(
+          parsed.modelId,
+          mappedEffort,
+          provider.baseUrl,
+        );
         antigravityModel = wireModelId;
         antigravitySession = sessionId;
         // Effort → thinkingConfig for CCA (CLIProxyAPI proven: request.generationConfig.thinkingConfig).
@@ -942,9 +951,20 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       }
 
       const usage = json.usageMetadata as Record<string, number> | undefined;
+      // Mirror the streaming path: a buffered turn cut off by the token limit or a content filter
+      // must carry its stop reason, or the bridge sees a clean `done` and reports the truncated
+      // turn as completed — and, on a compaction turn, installs the half-written summary as
+      // replacement history (#422).
+      const finishReason = candidates?.[0]?.finishReason as string | undefined;
+      const stopReason = finishReason === "MAX_TOKENS"
+        ? "max_tokens"
+        : ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"].includes(finishReason ?? "")
+          ? "content_filter"
+          : undefined;
       events.push({
         type: "done",
         usage: usageFromGemini(usage),
+        ...(stopReason ? { stopReason } : {}),
       });
       return finish(events);
     },

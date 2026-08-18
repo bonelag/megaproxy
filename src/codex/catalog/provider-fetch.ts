@@ -33,13 +33,13 @@ import { CODEX_REASONING_LEVELS, codexEffortRank, configuredReasoningEfforts, mo
 import { getModelMetadata, getModelMetadataCaseInsensitive, listModelMetadata, resolveMetadataProvider } from "../../generated/model-metadata";
 import { enrichProviderFromRegistry, shouldCaseFoldMetadataModelId } from "../../providers/derive";
 import {
-  captureServiceTierAdapterAuthority,
+  captureFastPolicyAuthority,
   serviceTierSupportForModel,
-  type CapturedServiceTierAdapterAuthority,
 } from "../../providers/service-tier";
+import type { FastPolicyAuthority } from "../../providers/fastwire";
 import { effectiveGoogleMode, getProviderRegistryEntry, providerMatchesRegistryTransport } from "../../providers/registry";
-import { parseAntigravityAvailableModels } from "../../providers/antigravity-models";
-import { applyProviderContextCap, providerContextCap } from "../../providers/context-cap";
+import { parseAntigravityAvailableModels, registerAntigravityDiscoveredWireModels } from "../../providers/antigravity-models";
+import { applyProviderContextCap, providerContextCap, resolveUnknownRoutedContextWindow } from "../../providers/context-cap";
 import { routedSlug, slugEquals, slugsEquivalent } from "../../providers/slug-codec";
 import { CODEX_GPT5_IDENTITY_LINE } from "../../adapters/identity";
 import { filterCursorConfiguredModelsByLiveDiscovery } from "../../adapters/cursor/discovery";
@@ -74,7 +74,7 @@ import { createAdmissionGate, ResourceAdmissionError, type AdmissionMetrics } fr
 
 import { CODEX_CUSTOM_MODEL_CATALOG_KIND, JAWCODE_CATALOG_AUGMENT_PROVIDERS, catalogModelSlug, shouldExposeRoutedModel } from "./parsing";
 import type { CatalogModel } from "./parsing";
-import { disabledNativeSlugs, hasComboTargets, isNativeOpenAiCapabilityAliasModel, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, nativeOpenAiSlugs, nativeParallelToolCalls, nativeReasoningEfforts } from "./metadata";
+import { disabledNativeSlugs, hasComboTargets, isNativeOpenAiCapabilityAliasModel, NATIVE_GPT56_MAX_INPUT_TOKENS, nativeContextLimits, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, nativeOpenAiSlugs, nativeParallelToolCalls, nativeReasoningEfforts } from "./metadata";
 import { deriveComboCatalogModel, normalizedOpenAiApiSignature, openAiApiCollisionWarnings, replaceLastComboCatalogOmissions, warnUncataloguedComboOnce } from "./aggregation";
 import type { ComboCatalogOmission } from "./aggregation";
 import type { CatalogGatherProviderAuthEvidence } from "./filesystem-evidence";
@@ -155,7 +155,7 @@ interface CapturedProviderGather {
   readonly discovery: ResolvedProviderModelDiscovery;
   readonly policy: CatalogProviderDiscoveryPolicySnapshot;
   readonly request: CapturedModelsRequest;
-  readonly serviceTierAdapterAuthority: CapturedServiceTierAdapterAuthority;
+  readonly fastPolicyAuthority: FastPolicyAuthority;
   readonly observedAuth?: ModelsAuthResolution;
   /**
    * Configured model ids this provider must keep even when live discovery omits
@@ -408,12 +408,12 @@ function captureProviderGather(
   const enriched = detachedClone(withCanonicalOpenAiForwardAuthDefault(name, configured));
   enrichProviderFromRegistry(name, enriched);
   const registryTransportMatch = providerMatchesRegistryTransport(name, enriched);
-  const serviceTierAdapterAuthority = captureServiceTierAdapterAuthority(
+  const provider = recursivelyFreeze(enriched);
+  const fastPolicyAuthority = captureFastPolicyAuthority(
     name,
-    enriched,
+    provider,
     registryTransportMatch,
   );
-  const provider = recursivelyFreeze(enriched);
   const observedAuth = authResolver.kind === "observed"
     && provider.authMode !== "forward"
     && provider.liveModels !== false
@@ -449,7 +449,7 @@ function captureProviderGather(
     discovery,
     policy,
     request,
-    serviceTierAdapterAuthority,
+    fastPolicyAuthority,
     ...(observedAuth ? { observedAuth: Object.freeze({ ...observedAuth }) } : {}),
     ...(retainConfiguredModelIds && retainConfiguredModelIds.size > 0
       ? { retainConfiguredModelIds }
@@ -518,7 +518,7 @@ function captureGatherFlight(
         // It is the one member of a provider row that is legitimately a function,
         // so it is dropped here rather than allowed to break every encode.
         provider: omitProviderTransportExecutor(provider.provider),
-        serviceTierAdapterAuthority: provider.serviceTierAdapterAuthority,
+        fastPolicyAuthority: provider.fastPolicyAuthority,
         // Combo retention is capture-time state, not a provider-row field. Two
         // gathers that share providers but differ in combo targets must not join.
         retainConfiguredModelIds: [...(provider.retainConfiguredModelIds ?? [])].sort(),
@@ -648,15 +648,16 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
   const supportsReasoningSummaries = configuredReasoningSummarySupport(prov, model.id);
   const supportsServiceTier = serviceTierSupportForModel(prov, model.id, name);
   const { supportsServiceTier: _staleServiceTier, ...modelWithoutServiceTier } = model;
+  // 已发现窗口只允许被配置值压低；缺窗口时，已开的 Context cap 就是实际窗口。
+  const discoveredWindow = typeof model.contextWindow === "number" && model.contextWindow > 0
+    ? model.contextWindow
+    : undefined;
+  const hintedWindow = discoveredWindow !== undefined
+    ? (configuredCap !== undefined ? Math.min(discoveredWindow, configuredCap) : discoveredWindow)
+    : (configuredCap ?? (providerCap !== undefined ? resolveUnknownRoutedContextWindow(providerCap) : undefined));
   const hinted = {
     ...modelWithoutServiceTier,
-    ...(configuredCap !== undefined
-      ? {
-        contextWindow: typeof model.contextWindow === "number" && model.contextWindow > 0
-          ? Math.min(model.contextWindow, configuredCap)
-          : configuredCap,
-      }
-      : {}),
+    ...(hintedWindow !== undefined ? { contextWindow: hintedWindow } : {}),
     ...(inputModalities ? { inputModalities } : {}),
     ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
     ...(configuredMaxInput !== undefined
@@ -695,9 +696,11 @@ export function applyConfigHintsToCachedModels(name: string, prov: OcxProviderCo
 
 
 /**
- * Last-resort context window for combo member synthesis when discovery and
- * provider config both omit one. Matches the catalog entry default in
- * `normalizeRoutedCatalogEntry` so incomplete live rows still catalog.
+ * Last-resort context window for combo member synthesis when discovery,
+ * provider config, and an enabled Context cap all omit one. Matches the
+ * catalog entry default in `normalizeRoutedCatalogEntry` so incomplete live
+ * rows still catalog. An enabled Context cap is the operator-facing window,
+ * not a clamp on this placeholder.
  */
 const COMBO_MEMBER_CONTEXT_FALLBACK = 128_000;
 
@@ -715,9 +718,9 @@ interface ComboCatalogMemberFallback {
  * lacks a positive contextWindow, synthesize from the (registry-enriched)
  * provider config so combos remain catalogued when targets are configured but
  * discovery metadata is incomplete. Disabled providers stay unresolved.
- * When hints still omit contextWindow, prefer known maxInputTokens, else
- * COMBO_MEMBER_CONTEXT_FALLBACK so a live row without ctx does not drop the
- * whole combo from the public catalog.
+ * When hints still omit contextWindow, prefer known maxInputTokens, else the
+ * enabled Context cap, else COMBO_MEMBER_CONTEXT_FALLBACK so a live row
+ * without ctx does not drop the whole combo from the public catalog.
  */
 export function resolveComboCatalogMember(
   target: { provider: string; model: string },
@@ -806,12 +809,15 @@ export function resolveComboCatalogMember(
   const uncappedContext = hintedContext
     ?? knownMaxInput
     ?? fallbackContext
-    ?? (existing || prov ? COMBO_MEMBER_CONTEXT_FALLBACK : undefined);
+    ?? (existing || prov ? resolveUnknownRoutedContextWindow(contextCap) : undefined);
   if (uncappedContext === undefined) return undefined;
-  const usedFallback = hintedContext === undefined;
-  const cappedContext = applyProviderContextCap(uncappedContext, contextCap);
+  // 真发现值才压低。resolveUnknownRoutedContextWindow 已经把 cap 当成窗口填进去了，不能再 min 一次。
+  const usedDiscoveredWindow = hintedContext !== undefined || knownMaxInput !== undefined || fallbackContext !== undefined;
+  const cappedContext = usedDiscoveredWindow
+    ? applyProviderContextCap(uncappedContext, contextCap)
+    : uncappedContext;
   const contextWindow = cappedContext ?? uncappedContext;
-  const fallbackCapped = usedFallback
+  const fallbackCapped = usedDiscoveredWindow
     && contextCap !== undefined
     && cappedContext !== undefined
     && cappedContext !== uncappedContext;
@@ -1374,6 +1380,10 @@ async function fetchProviderModelsWithAuth(
       if (!setCached(name, forCache, Date.now(), cacheGeneration)) {
         return observed(withConfiguredRetention(configured), "degraded");
       }
+      registerAntigravityDiscoveredWireModels(prov.baseUrl, antigravity, {
+        provider: name,
+        cacheGeneration,
+      });
       markProviderDiscoveryOk(name, live.length);
       return observed(withConfiguredRetention(forCache, { warnDrops: true }), "authoritative");
     }
@@ -1707,7 +1717,7 @@ async function gatherRoutedModelsUncached(
     // configs that will never need it.
   } else {
     const disabled = disabledNativeSlugs(config);
-    const openaiContextCap = providerContextCap(config, OPENAI_CODEX_PROVIDER_ID);
+    const openaiContextCap = nativeContextLimits(config);
     const requiredNativeComboTargets = new Set(listComboIds(config).flatMap(id => {
       const combo = getCombo(config, id);
       return combo?.targets.flatMap(target => (
@@ -1725,8 +1735,10 @@ async function gatherRoutedModelsUncached(
         id: slug,
         owned_by: "openai",
         contextWindow,
-        // Input limit, not the total window: GPT-5.6 advertises 1,050,000 but refuses past
-        // 922,000 (measured). Falls back to the window for slugs with no separate ceiling.
+        // Input limit, not the total window. These coincide for native GPT-5.6 today (the
+        // advertised 922,000 window is already capped at its measured ceiling), but the two
+        // stay separate fields because routed/API rows of the same family run a wider window.
+        // Falls back to the window for slugs with no separate ceiling.
         maxInputTokens: Math.min(nativeOpenAiMaxInputTokens(slug, openaiContextCap) ?? contextWindow, contextWindow),
         inputModalities: nativeInputModalities(slug),
         reasoningEfforts: nativeReasoningEfforts(slug),
@@ -1745,15 +1757,17 @@ async function gatherRoutedModelsUncached(
     const combo = getCombo(config, id);
     if (!combo) continue;
     const nativeContextWindow = combo.nativeAlias && combo.alias
-      ? nativeOpenAiContextWindow(combo.alias, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID))
+      ? nativeOpenAiContextWindow(combo.alias, nativeContextLimits(config))
       : undefined;
     const nativeAliasMaxInput = combo.nativeAlias && combo.alias
-      ? nativeOpenAiMaxInputTokens(combo.alias, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID))
+      ? (combo.alias.startsWith("gpt-5.6-") || combo.alias.includes("daybreak")
+        ? NATIVE_GPT56_MAX_INPUT_TOKENS
+        : nativeOpenAiMaxInputTokens(combo.alias) ?? nativeOpenAiContextWindow(combo.alias))
       : undefined;
     const nativeAliasFallback = combo.nativeAlias && combo.alias && nativeContextWindow !== undefined
       ? {
         contextWindow: nativeContextWindow,
-        ...(nativeAliasMaxInput !== undefined ? { maxInputTokens: Math.min(nativeAliasMaxInput, nativeContextWindow) } : {}),
+        ...(nativeAliasMaxInput !== undefined ? { maxInputTokens: nativeAliasMaxInput } : {}),
         inputModalities: nativeInputModalities(combo.alias),
         reasoningEfforts: nativeReasoningEfforts(combo.alias),
       }
@@ -1799,18 +1813,22 @@ async function gatherRoutedModelsUncached(
       && providerForCanonicalCheck !== undefined
       && isCanonicalOpenAiForwardProvider(providerForCanonicalCheck)
       && isNativeOpenAiCapabilityAliasModel(cm.modelId);
+    const customNativeLimits = {
+      ...nativeContextLimits(config),
+      ...(typeof cm.contextWindow === "number" && cm.contextWindow > 0
+        ? { modelWindows: { ...(nativeContextLimits(config).modelWindows ?? {}), [cm.modelId]: cm.contextWindow } }
+        : {}),
+    };
     const nativeAliasContextWindow = codexForwardNativeCapabilityAlias
-      ? nativeOpenAiContextWindow(cm.modelId, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID))
+      ? nativeOpenAiContextWindow(cm.modelId, customNativeLimits)
       : undefined;
     const customContextWindow = cm.contextWindow
       ? nativeAliasContextWindow !== undefined
-        ? Math.min(cm.contextWindow, nativeAliasContextWindow)
+        ? nativeAliasContextWindow
         : cm.contextWindow
       : nativeAliasContextWindow;
-    // Input ceiling for a native capability alias, clamped to whatever window we settled on
-    // above. A custom row that lowered the window must not keep the full native input budget.
     const nativeAliasMaxInputTokens = codexForwardNativeCapabilityAlias
-      ? nativeOpenAiMaxInputTokens(cm.modelId, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID))
+      ? nativeOpenAiMaxInputTokens(cm.modelId, customNativeLimits)
       : undefined;
     const customMaxInputTokens = nativeAliasMaxInputTokens !== undefined && customContextWindow !== undefined
       ? Math.min(nativeAliasMaxInputTokens, customContextWindow)

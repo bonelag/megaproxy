@@ -69,9 +69,9 @@ differing backup and rewrites known legacy namespaced selected ids to bare ids.
 | `requestPacing?` | `{ enabled, requestsPerMinute?, minIntervalMs?, models? }` | Optional client-side outbound request-start pacing, separate from upstream usage, billing, and rate-limit indicators. RPM is converted to an even interval; `minIntervalMs` may impose a longer interval. Provider limits apply across all models, while `models` entries use exact upstream model IDs (for example `nvidia/llama-3.1-nemotron-ultra-253b-v1`) and can only add delay. Queue waits do not consume the upstream response-header timeout. HTTP, Responses WebSocket, and explicit adapter `fetchResponse`/`runTurn` dispatches are covered. |
 | `upstreamHttpVersion?` | `"auto" \| "http1.1" \| "h1" \| "http2" \| "h2"` | Pin the HTTP version used for upstream requests to this provider. Defaults to `auto`, which lets Bun negotiate. Set `http1.1` when a provider's HTTP/2 SSE stream stalls instead of delivering events — the symptom is a long-running streaming request that produces nothing and eventually times out. Management `POST`/`PATCH` accept `null` to clear it back to `auto`. |
 | `responsesPath?` | `string` | Relative resource path for key-auth `openai-responses` requests. It must start with `/` and contain no scheme, query, or fragment. |
-| `supportsServiceTier?` | `boolean` | Tri-state `service_tier` capability fallback. `true`: fast mode may inject and caller values are preserved. `false`: the field is stripped and never injected, and exact model declarations cannot reopen it. Absent: the provider is unclassified — caller-supplied values are preserved untouched and fast mode never injects unless an exact model is enabled. The registry classifies canonical OpenAI (`true`), DeepSeek, and Volcengine Ark (`false`); set it explicitly only for custom gateways that genuinely support tiers. Chat routes additionally need provider-wide or exact-model Chat authorization. |
-| `modelSupportsServiceTier?` | `Record<string, boolean>` | Exact upstream model capability overrides. Exact `true` authorizes that Chat model even without `chatServiceTier`; exact `false` narrows provider defaults and Chat authorization. An explicit provider-level `supportsServiceTier: false` remains fail-closed and cannot be reopened. Undeclared models fall back to provider-wide behavior. Management `PATCH /api/providers` merges entries and accepts `null` to clear one. |
-| `chatServiceTier?` | `boolean` | Provider-wide wire opt-in for serializing `service_tier` on `/chat/completions`. Exact models may instead opt in through `modelSupportsServiceTier`; undeclared models remain blocked when this flag is absent or false. |
+| `supportsServiceTier?` | `boolean` | Tri-state canonical Fast capability fallback. `true` publishes Fast in the catalog, satisfies service-tier routing requirements, contributes a supported fingerprint, and lets fast mode inject the provider's canonical wire value on a compatible final adapter. `false` strips the field and never injects, and exact model declarations cannot reopen it. Absent leaves the provider unclassified: fast mode does not inject or normalize a canonical caller value, and caller values obey the final wire's forwarding permission (`chatServiceTier` on Chat; passthrough on Responses). The registry classifies canonical OpenAI (`true`), DeepSeek, and Volcengine Ark (`false`); set it explicitly only for custom gateways that genuinely support tiers. |
+| `modelSupportsServiceTier?` | `Record<string, boolean>` | Exact upstream model capability overrides. Exact `true` enables canonical Fast for that model; exact `false` narrows provider defaults. An explicit provider-level `supportsServiceTier: false` remains fail-closed and cannot be reopened. Exact `true` does not authorize foreign caller-tier forwarding on Chat. Undeclared models fall back to provider-wide behavior. Management `PATCH /api/providers` merges entries and accepts `null` to clear one. |
+| `chatServiceTier?` | `boolean` | Provider-wide Chat-wire opt-in for forwarding caller `service_tier` values. On a classified route it governs foreign values such as `flex`, not proxy-owned canonical Fast after capability validation; on an unclassified route it governs every caller value because no Fast capability has been validated. Exact model capability does not authorize foreign forwarding. Responses routes retain their capability-based caller forwarding behavior. |
 | `preserveResponsesReasoningContent?` | `boolean` | Keep plaintext reasoning content on replayed Responses reasoning items instead of blanking it (blanking is the ChatGPT backend's rule). Enable for upstreams whose contract accepts reasoning replay, such as DeepSeek. Proxy-minted `ocxr1` envelopes are always stripped. |
 | `disabled?` | `boolean` | Keep the provider on disk but exclude it from routing and model/catalog listings. |
 | `apiKey?` | `string` | API key, or an `${ENV_VAR}` / `$ENV_VAR` reference resolved at request time. |
@@ -122,12 +122,34 @@ differing backup and rewrites known legacy namespaced selected ids to bare ids.
 | `escapeBuiltinToolNames?` | `boolean` | Escape built-in tool names for Anthropic-compatible gateways and restore them in returned calls. |
 | `anthropicEofTolerance?` | `boolean` | Let an Anthropic-compatible gateway complete a stream that ends before `message_stop`, only when visible text or a complete JSON-object tool input was received. Off by default. |
 | `googleMode?` | `"ai-studio" \| "vertex" \| "cloud-code-assist"` | Google transport/auth mode. Default `ai-studio`. |
+| `directGeminiWireRenames?` | `boolean` | Google only. Applies only to direct AI Studio requests. Omitted or `true` keeps the `-tiered` wire rename for Gemini Flash ids (`gemini-3.7-flash` -> `gemini-3.7-flash-tiered`); `false` sends the requested bare ids to the wire unchanged. Vertex preserves the requested model ID, and Cloud Code Assist routing is unchanged. Set `false` when the configured upstream still serves the bare ids. |
 | `project?` | `string` | Vertex or Antigravity Cloud Code Assist project id. |
 | `location?` | `string` | Vertex location; environment fallback is `GOOGLE_CLOUD_LOCATION`. |
 | `mcpServers?` | `Record<string, CursorMcpServerConfig>` | Cursor only: stdio or Streamable HTTP MCP servers. |
 | `desktopExecutor?` | `DesktopExecutorConfig` | Cursor only: external computer-use and record-screen commands. |
 | `unsafeAllowNativeLocalExec?` | `boolean` | Cursor legacy boolean, equivalent to `nativeLocalExec: "on"` only when the newer field is unset. |
 | `nativeLocalExec?` | `"off" \| "codex-sandbox" \| "on"` | Cursor local-exec policy. `off` is default; `codex-sandbox` currently fails closed like `off`. |
+
+### FastWire B1 capability migration
+
+Fast capability and arbitrary Chat caller-tier forwarding are independent after FastWire B1. The
+[provider-field definitions](#provider-entries-ocxproviderconfig) above remain the authoritative
+contract; existing configurations see these migration deltas:
+
+1. A Chat provider/model declared Fast-capable no longer needs `chatServiceTier: true` for canonical
+   Fast. Publication, routing eligibility, and injection still require an eligible policy and a
+   compatible FastWire mapping on the final adapter. On classified routes, `fastMode: false` still
+   removes canonical Fast. Set `supportsServiceTier: false` or an exact-model `false` when the route
+   is not Fast-capable.
+2. On an eligible classified route, caller spellings `fast` and `FAST` normalize through
+   `fastWire.canonicalToWire.priority`; caller `priority` remains canonical. Configure a verified
+   mapping to `fast` only when that is the upstream's canonical value. Unclassified routes retain
+   their existing forwarding behavior.
+3. Exact-model `true` no longer authorizes foreign Chat tiers such as `flex` or vendor-specific
+   values. Those still require `chatServiceTier: true`; otherwise they are removed and recorded as
+   dropped caller tiers.
+
+Explicit capability `false` and Responses caller-tier forwarding retain their existing contracts.
 
 API-key providers may hold a literal key or an environment reference. OAuth providers use the
 credential store populated by `ocx login`; subscription-backed Claude Code launch behavior is
@@ -373,9 +395,9 @@ Use `selectedModels` when discovery should still run but only selected ids shoul
 `/v1/models`. The dashboard retains the full discovered list for later allowlist changes.
 
 Preview GPT-5.6 fallback entries use the same mechanism. The OpenAI API-key preset seeds base and Pro
-ids with context `1050000` and max input `922000`; OpenRouter seeds `openai/gpt-5.6-sol`,
-`openai/gpt-5.6-terra`, and `openai/gpt-5.6-luna` with context `1050000`. Pool/Direct advertises
-`1050000`; the synced catalog advertises `max` while keeping `xhigh` distinct.
+ids with context `922000` and max input `922000`; OpenRouter seeds `openai/gpt-5.6-sol`,
+`openai/gpt-5.6-terra`, and `openai/gpt-5.6-luna` with context `922000`. Pool/Direct advertises
+`922000`; the synced catalog advertises `max` while keeping `xhigh` distinct.
 
 ```json
 {

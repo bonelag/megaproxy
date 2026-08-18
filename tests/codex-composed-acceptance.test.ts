@@ -32,6 +32,7 @@ import {
   resolveEffectiveUserIdentity,
 } from "../src/codex/user-identity";
 import { claimOwnedServiceHome } from "./helpers/owned-service-home";
+import { SERVER_BUDGET_MS } from "./helpers/test-budget";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const cliPath = resolve(repoRoot, "src/cli/index.ts");
@@ -57,6 +58,13 @@ function manifest(root: string): Record<string, string> {
   };
   walk(root);
   return entries;
+}
+
+/** The catalog/cache artifacts an explicit side-profile sync may legitimately write while OFF. */
+function manifestWithoutCatalogArtifacts(entries: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(entries).filter(([key]) => !key.includes("opencodex-catalog") && key !== "models_cache.json"),
+  );
 }
 
 async function waitFor<T>(read: () => T | null | Promise<T | null>, label: string, timeoutMs = 10_000): Promise<T> {
@@ -107,6 +115,10 @@ class Fixture {
     return {
       HOME: home,
       USERPROFILE: userprofile,
+      // Windows os.homedir() follows USERPROFILE, while POSIX follows HOME.
+      // Pin the client-specific home so this fixture exercises the same Grok
+      // installation on every platform instead of reporting not_installed.
+      GROK_HOME: join(home, ".grok"),
       CODEX_HOME: this.codex,
       OPENCODEX_HOME: this.ocx,
       XDG_RUNTIME_DIR: this.runtime,
@@ -199,7 +211,12 @@ class Fixture {
     expect(exitCode === 0 || (process.platform === "win32" && exitCode === 143)).toBe(true);
   }
 
-  async request(runtime: RuntimeRecord, path: string, init: RequestInit = {}): Promise<{ status: number; body: Record<string, unknown> }> {
+  async request(
+    runtime: RuntimeRecord,
+    path: string,
+    init: RequestInit = {},
+    timeoutMs = 10_000,
+  ): Promise<{ status: number; body: Record<string, unknown> }> {
     const response = await fetch(`http://127.0.0.1:${runtime.port}${path}`, {
       ...init,
       headers: {
@@ -207,7 +224,7 @@ class Fixture {
         ...(init.body ? { "content-type": "application/json" } : {}),
         ...(init.headers ?? {}),
       },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     return { status: response.status, body: await response.json() as Record<string, unknown> };
   }
@@ -279,8 +296,13 @@ describe("WP13 composed toggle acceptance", () => {
     }
   }, 45_000);
 
-  /** RED: remove `shouldSyncCodexOnStart` or the under-lock desired-state read; an OFF row writes native bytes. */
-  test("A-reduced: real CLI and HTTP entry points preserve an OFF Codex home", async () => {
+  /**
+   * RED: remove shouldSyncCodexOnStart or the under-lock desired-state read; an
+   * OFF row writes native config bytes. Explicit CLI sync/sync-cache may still
+   * refresh the catalog/cache for side profiles (catalog-only), so those two
+   * commands are compared without catalog artifacts; config/history must not move.
+   */
+  test("A-reduced: real CLI and HTTP entry points preserve an OFF Codex config/home", async () => {
     const fx = fixture();
     fx.writeConfig({ clientIntegrations: { codex: false, grok: false, "claude-desktop": false } });
     mkdirSync(join(fx.homeA, ".grok"));
@@ -289,10 +311,15 @@ describe("WP13 composed toggle acceptance", () => {
     const server = await fx.start();
     try {
       expect(manifest(fx.codex)).toEqual(before);
-      for (const argv of [["ensure"], ["sync"], ["restore"], ["sync-cache"]]) {
+      for (const argv of [["ensure"], ["restore"]]) {
         const result = await fx.runCli(argv);
         expect(result.exitCode).toBe(0);
         expect(manifest(fx.codex)).toEqual(before);
+      }
+      for (const argv of [["sync"], ["sync-cache"]]) {
+        const result = await fx.runCli(argv);
+        expect(result.exitCode).toBe(0);
+        expect(manifestWithoutCatalogArtifacts(manifest(fx.codex))).toEqual(manifestWithoutCatalogArtifacts(before));
       }
       const sync = await fx.request(server.runtime, "/api/sync", { method: "POST" });
       expect(sync.status).toBe(200);
@@ -304,7 +331,7 @@ describe("WP13 composed toggle acceptance", () => {
         expect([200, 404]).toContain(toggle.status);
         expect(toggle.body).toHaveProperty("desiredEnabled", false);
       }
-      expect(manifest(fx.codex)).toEqual(before);
+      expect(manifestWithoutCatalogArtifacts(manifest(fx.codex))).toEqual(manifestWithoutCatalogArtifacts(before));
       // P08 is intentionally the ON control: it must reach the same running
       // server through the real CLI without passing a port flag.
       const enabled = await fx.request(server.runtime, "/api/native-integrations/codex", {
@@ -358,7 +385,9 @@ describe("WP13 composed toggle acceptance", () => {
           allowPrivateNetwork: true, liveModels: true,
         } }, defaultProvider: "fixture", clientIntegrations: { codex: true } });
         hold = true;
-        const stale = fx.request(server.runtime, "/api/sync", { method: "POST" });
+        // This request is intentionally held open while a second real HTTP
+        // mutation crosses the Windows process-backed identity path.
+        const stale = fx.request(server.runtime, "/api/sync", { method: "POST" }, SERVER_BUDGET_MS);
         await Promise.race([
           enteredGather,
           stale.then(result => Promise.reject(new Error(
@@ -367,7 +396,7 @@ describe("WP13 composed toggle acceptance", () => {
         ]);
         const off = await fx.request(server.runtime, "/api/native-integrations/codex", {
           method: "PUT", body: JSON.stringify({ enabled: false }),
-        });
+        }, SERVER_BUDGET_MS);
         expect(off.status).toBe(200);
         const afterOff = manifest(fx.codex);
         release();
