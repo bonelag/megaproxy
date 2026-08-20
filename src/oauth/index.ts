@@ -17,7 +17,7 @@ import { loginCommandCode, refreshCommandCodeToken } from "./command-code";
 import { ANTIGRAVITY_REQUEST_UA } from "../adapters/google-antigravity-wire";
 import { deriveOAuthDefaultModel, deriveOAuthProviderConfig } from "../providers/derive";
 import { apiKeyPoolEntryId, sanitizeApiKeyValue } from "../providers/api-keys";
-import { effectiveGoogleMode, getProviderRegistryEntry, providerMatchesRegistryTransport } from "../providers/registry";
+import { effectiveGoogleMode, getProviderRegistryEntry, mergeRegistryStaticHeaders, providerMatchesRegistryTransport } from "../providers/registry";
 import { resolveProviderModelDiscoveryUrl } from "../providers/model-discovery";
 import { resolveProviderTransport } from "../providers/xai-transport";
 import { detectClaudeCodeToken, detectGrokCliToken, hasComparableGrokIdentity, isSameGrokIdentity, shouldAdoptGrokGeneration } from "./local-token-detect";
@@ -320,6 +320,13 @@ export class OAuthReauthIdentityUnverifiedError extends Error {
   constructor() {
     super("Could not verify signed-in account identity for reauth.");
     this.name = "OAuthReauthIdentityUnverifiedError";
+  }
+}
+
+class OAuthLoginSupersededError extends Error {
+  constructor() {
+    super("OAuth login was superseded before credential persistence");
+    this.name = "OAuthLoginSupersededError";
   }
 }
 
@@ -829,7 +836,16 @@ export function buildModelsRequest(
     undefined,
     copilotApiBaseUrl,
   );
-  const headers: Record<string, string> = { ...(effectiveProvider.headers ?? {}) };
+  // Model discovery is an upstream request like any other, so it carries the same registry
+  // static headers the inference path does. Without this a provider is identified correctly
+  // when it answers a completion but anonymously when it lists its own models, which is the
+  // kind of split fingerprint an upstream rate limiter reads as two different clients.
+  const registryStaticHeaders = providerMatchesRegistryTransport(providerName, effectiveProvider)
+    ? getProviderRegistryEntry(providerName)?.staticHeaders
+    : undefined;
+  const headers: Record<string, string> = {
+    ...(mergeRegistryStaticHeaders(registryStaticHeaders, effectiveProvider.headers) ?? {}),
+  };
   const discoveryUrl = (defaultUrl: string): string => resolveProviderModelDiscoveryUrl(
     providerName,
     prov,
@@ -1099,6 +1115,7 @@ interface RunLoginDeps {
   settleKiroLoginTransaction?: typeof settleKiroLoginTransaction;
   removeAccount?: typeof removeAccount;
   setActiveAccount?: typeof setActiveAccount;
+  assertCurrentOwner?: () => void;
 }
 
 /** Roll back only accounts created by this forced login, preserving concurrent refreshes of others. */
@@ -1148,6 +1165,7 @@ export async function runLogin(
   const cred: OAuthCredentials = rawCred.source ? rawCred : { ...rawCred, source: "oauth" };
   const settleKiroTransaction = deps.settleKiroLoginTransaction ?? settleKiroLoginTransaction;
   try {
+    deps.assertCurrentOwner?.();
     // Validate the provider row before credential persistence. A namespace claimed during the
     // credential write is handled again below before the latest row is re-upserted.
     if (provider !== "chatgpt") {
@@ -1168,10 +1186,13 @@ export async function runLogin(
       if (!identityMatches) {
         throw new OAuthReauthIdentityMismatchError();
       }
-      await (deps.saveAccountCredential ?? saveAccountCredential)(provider, opts.reauthAccountId, cred);
+      await (deps.saveAccountCredential ?? saveAccountCredential)(provider, opts.reauthAccountId, cred, {
+        assertBeforePersist: deps.assertCurrentOwner,
+      });
     } else {
       await (deps.saveCredential ?? saveCredential)(provider, cred, {
         preserveIdentityless: opts?.forceLogin === true,
+        assertBeforePersist: deps.assertCurrentOwner,
       });
     }
     if (provider !== "chatgpt") {
@@ -1238,6 +1259,7 @@ export async function runLogin(
  */
 const loginState = new Map<string, { error?: string; done: boolean }>();
 const loginAbort = new Map<string, AbortController>();
+const kiroLoginSettling = new Set<string>();
 
 /** Pending paste for a login in progress: either a waiter or a stashed early submission. */
 interface ManualCodeSlot {
@@ -1406,13 +1428,14 @@ export async function startLoginFlow(
   const def = OAUTH_PROVIDERS[provider];
   if (!def) throw new UnsupportedOAuthProviderError(provider);
   const existing = loginState.get(provider);
-  if (existing && !existing.done) {
+  if ((existing && !existing.done) || (provider === "kiro" && kiroLoginSettling.has(provider))) {
     throw new Error(`A login for ${provider} is already in progress`);
   }
   clearManualCodeSlot(provider);
   loginState.set(provider, { done: false });
   const abort = new AbortController();
   loginAbort.set(provider, abort);
+  if (provider === "kiro") kiroLoginSettling.add(provider);
   return new Promise((resolve, reject) => {
     let urlResolved = false;
     const ctrl: OAuthController = {
@@ -1463,7 +1486,10 @@ export async function startLoginFlow(
     };
     // Background: runLogin persists the credential + provider entry to disk. The lifecycle hook
     // lets a long-lived server config adopt that settled state before clients observe done=true.
-    void runLogin(provider, ctrl, opts).then(
+    const assertCurrentOwner = (): void => {
+      if (loginAbort.get(provider) !== abort) throw new OAuthLoginSupersededError();
+    };
+    void runLogin(provider, ctrl, opts, { assertCurrentOwner }).then(
       () => settle(),
       (e: unknown) => settle(e),
     ).catch((e: unknown) => {
@@ -1474,6 +1500,8 @@ export async function startLoginFlow(
       const msg = publicOAuthAuthenticationErrorMessage(e);
       loginState.set(provider, { done: true, error: msg });
       if (!urlResolved) reject(e);
+    }).finally(() => {
+      if (provider === "kiro") kiroLoginSettling.delete(provider);
     });
   });
 }
