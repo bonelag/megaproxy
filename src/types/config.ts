@@ -104,6 +104,8 @@ export interface OcxClaudeCodeConfig {
   autoContext?: boolean;
   /** Compact-window tokens for auto-context. Default 829_800 (AUTO_COMPACT_WINDOW_DEFAULT). */
   autoCompactWindow?: number;
+  /** Models that should advertise a 1M context variant in Claude Code gateway discovery. */
+  discovery1mModels?: string[];
   /**
    * Bundled-skill content elision for ROUTED (non-Anthropic) models (devlog 260712
    * 060): Skill-tool results whose skill name matches an entry here are replaced
@@ -147,12 +149,16 @@ export type OcxClaudeDesktopFamily = "opus" | "fable" | "sonnet" | "haiku";
 export interface OcxClaudeDesktopAssignment {
   family: OcxClaudeDesktopFamily;
   alias: string;
+  supports1m?: boolean;
+  prefer1m?: boolean;
 }
 
 export interface OcxClaudeDesktopProfile {
   version: 1;
   assignments: Record<string, OcxClaudeDesktopAssignment>;
   defaults: Record<OcxClaudeDesktopFamily, string | null>;
+  /** Optional Claude Desktop Chat Tab toggle. */
+  chatTabEnabled?: boolean;
   /** SHA-256 fingerprint of the last successfully applied 3P config content. */
   appliedFingerprint?: string;
   /** ISO timestamp of the last successful apply. */

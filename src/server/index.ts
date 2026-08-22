@@ -631,7 +631,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       return req.method === "POST" || req.headers.get("upgrade")?.toLowerCase() === "websocket";
     }
     if (path === "/v1/responses/compact") return req.method === "POST";
-    if (path === "/v1/models") return req.method === "GET";
+    if (path === "/v1/models" || path === "/v1/v1/models") return req.method === "GET";
     // Standalone realtime voice sessions (codex-rs thread/realtime/start, WebSocket
     // transport) — a directly-spawned `codex app-server` needs these for desktop
     // voice the same way it needs /v1/responses. WebSocket upgrades only; plain
@@ -902,7 +902,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         return withManagementCors(formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${url.pathname}`), req, config);
       }
 
-      if (url.pathname === "/v1/models" && req.method === "GET") {
+      if ((url.pathname === "/v1/models" || url.pathname === "/v1/v1/models") && req.method === "GET") {
         // Model discovery never forwards Authorization upstream, so the broader admission
         // set (Authorization / x-api-key / x-opencodex-api-key) is safe here and required by
         // remote OpenAI-style bearer clients and Claude gateway discovery (anthropic-version).
@@ -1012,7 +1012,49 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             : idsParam === "desktop"
               ? "desktop3p" as const
               : (/^claude-code\//i.test(req.headers.get("user-agent") ?? "") ? "readable" as const : "desktop3p" as const);
-          const data = buildAnthropicModelInfos(desktopNativeSlugs, goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias, nativeContextLimits(config));
+          const rawData = buildAnthropicModelInfos(
+            desktopNativeSlugs,
+            goOrdered,
+            resolveAutoContext(config.claudeCode),
+            idStyle,
+            activeDesktop3pAlias,
+            nativeContextLimits(config),
+            config.claudeCode?.discovery1mModels,
+          );
+          let data = rawData;
+          try {
+            const { readClaudeSettingsJson } = await import("../claude/settings-file");
+            const claudeSettings = readClaudeSettingsJson();
+            if (claudeSettings.exists && claudeSettings.env) {
+              const configuredModelBares = new Set<string>();
+              for (const k of [
+                "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "ANTHROPIC_CUSTOM_MODEL_OPTION",
+              ]) {
+                const val = claudeSettings.env[k];
+                if (val) {
+                  const bare = val.replace(/\[1m\]/gi, "").trim().toLowerCase();
+                  if (bare) configuredModelBares.add(bare);
+                }
+              }
+              if (configuredModelBares.size > 0) {
+                const { resolveAlias } = await import("../claude/alias");
+                data = rawData.filter(item => {
+                  const rawId = item.id.replace(/\[1m\]/gi, "").trim().toLowerCase();
+                  const resolved = (resolveAlias(item.id) ?? "").replace(/\[1m\]/gi, "").trim().toLowerCase();
+                  if (configuredModelBares.has(rawId) || (resolved && configuredModelBares.has(resolved))) {
+                    return false;
+                  }
+                  return true;
+                });
+              }
+            }
+          } catch {
+            // best-effort
+          }
           return jsonResponse({ data }, 200, req, policy);
         }
         if (url.searchParams.has("client_version")) {
@@ -1292,7 +1334,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
 
       // Anthropic Messages inbound (Claude Code). count_tokens FIRST (longer path).
       // Claude Code posts `/v1/messages?beta=true` — pathname match ignores the query (003 G9).
-      if (url.pathname === "/v1/messages/count_tokens" && req.method === "POST") {
+      if ((url.pathname === "/v1/messages/count_tokens" || url.pathname === "/v1/v1/messages/count_tokens") && req.method === "POST") {
         if (isDraining()) {
           return drainingResponse(req, policy);
         }
@@ -1310,7 +1352,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         ));
       }
 
-      if (url.pathname === "/v1/messages" && req.method === "POST") {
+      if ((url.pathname === "/v1/messages" || url.pathname === "/v1/v1/messages") && req.method === "POST") {
         disableResponsesRequestTimeout(req, requestServer);
         if (isDraining()) {
           return drainingResponse(req, policy);
@@ -1342,7 +1384,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
 
 
       // OpenAI Chat Completions inbound (GitHub Copilot App / OpenAI-compatible clients).
-      if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+      if ((url.pathname === "/v1/chat/completions" || url.pathname === "/v1/v1/chat/completions") && req.method === "POST") {
         disableResponsesRequestTimeout(req, requestServer);
         if (isDraining()) {
           return drainingResponse(req, policy);
@@ -1812,6 +1854,11 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   if (labActivationRequired(config, labConfigDir)) {
     activateLab(config, labConfigDir);
   }
+
+  // Pre-write ~/.claude/cache/gateway-models.json for Claude Code discovery
+  import("../claude/gateway-cache")
+    .then(({ refreshGatewayModelCacheFromProxy }) => refreshGatewayModelCacheFromProxy(boundPort, { admissionConfig: config }))
+    .catch(() => {});
 
   return server;
 }

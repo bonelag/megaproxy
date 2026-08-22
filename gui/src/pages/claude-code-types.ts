@@ -53,6 +53,7 @@ export interface ClaudeCodeState {
   effectiveModelEnv: Record<string, string>;
   available: string[];
   aliases: { id: string; display_name: string }[];
+  discovery1mModels?: string[];
   webSearchSidecar?: SidecarOverride;
   visionSidecar?: SidecarOverride;
   port: number;

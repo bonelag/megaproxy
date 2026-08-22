@@ -1,3 +1,4 @@
+import { useMemo, useState } from "react";
 import { IconPlus, IconX } from "../icons";
 import { useT } from "../i18n/shared";
 import { Trans } from "../i18n/provider";
@@ -11,6 +12,7 @@ import {
 import { AutoConnectSetting, SettingToggle } from "./claude-code-settings";
 import type { ClaudeCodeState, MapRow } from "./claude-code-types";
 import { newClientId } from "./claude-code-types";
+import { is1mModelActive, toCanonicalModelKey } from "./ClaudeCodeCustomModelSection";
 import type { TFn, TKey } from "../i18n/shared";
 
 /**
@@ -293,31 +295,129 @@ function groupAliasesByProvider(aliases: AliasRow[]): Array<[string, AliasRow[]]
   return Array.from(groups);
 }
 
-export function ClaudeCodeAliasesSection({ aliases }: { aliases: AliasRow[] }) {
+export function ClaudeCodeAliasesSection({
+  aliases,
+  discovery1mModels = [],
+  onChangeDiscovery1m,
+}: {
+  aliases: AliasRow[];
+  discovery1mModels?: string[];
+  onChangeDiscovery1m?: (models: string[]) => void;
+}) {
   const t = useT();
-  // Title + count live in ClaudeCode's shared ccw-main-head (stable across rail panes).
+  const [search, setSearch] = useState("");
+
+  const is1mActive = (id: string, dn?: string) => {
+    return is1mModelActive(id, discovery1mModels) || (dn ? is1mModelActive(dn, discovery1mModels) : false);
+  };
+
+  const toggle1m = (id: string, dn?: string) => {
+    const key = toCanonicalModelKey(id) || (dn ? toCanonicalModelKey(dn) : "");
+    const active = is1mActive(id, dn);
+    let nextModels: string[];
+    if (active) {
+      nextModels = discovery1mModels.filter(m => toCanonicalModelKey(m) !== key);
+    } else {
+      nextModels = [...discovery1mModels.filter(m => toCanonicalModelKey(m) !== key), id];
+    }
+    if (onChangeDiscovery1m) {
+      onChangeDiscovery1m(nextModels);
+    }
+  };
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return aliases;
+    const q = search.trim().toLowerCase();
+    return aliases.filter(a => a.id.toLowerCase().includes(q) || a.display_name.toLowerCase().includes(q));
+  }, [aliases, search]);
+
+  const groups = useMemo(() => groupAliasesByProvider(filtered), [filtered]);
+
   return (
-    <div className="claude-aliases">
-      <p className="muted text-label claude-aliases-hint">{t("claude.aliasesHint")}</p>
+    <div className="claude-aliases" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+        <p className="muted text-label" style={{ margin: 0 }}>
+          {t("claude.aliasesHint")}
+        </p>
+        <input
+          type="search"
+          className="input"
+          placeholder={t("claude.customModel.searchPlaceholder") || "Search models..."}
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          style={{ width: "240px", height: "32px", fontSize: "12px" }}
+        />
+      </div>
+
       {aliases.length === 0 ? (
         <div className="muted text-label">{t("claude.none")}</div>
+      ) : groups.length === 0 ? (
+        <div className="muted text-label" style={{ padding: "16px 0" }}>No models matching "{search}"</div>
       ) : (
-        <div className="claude-aliases-scroll">
-          {groupAliasesByProvider(aliases).map(([provider, aliasRows]) => (
-            <div key={provider} className="claude-aliases-group">
-              <div className="claude-aliases-group-label">
-                {provider === ALIAS_PROVIDER_OTHER ? t("claude.aliasProviderOther") : provider}
-                <span className="claude-aliases-group-count">{aliasRows.length}</span>
+        <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+          {groups.map(([provider, aliasRows]) => (
+            <div key={provider} style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", fontWeight: "700", fontSize: "12px", letterSpacing: "0.5px", color: "var(--muted)", textTransform: "uppercase" }}>
+                <span>{provider === ALIAS_PROVIDER_OTHER ? t("claude.aliasProviderOther") : provider}</span>
+                <span className="badge" style={{ fontSize: "10px", padding: "1px 6px" }}>{aliasRows.length}</span>
               </div>
-              <div className="claude-aliases-chips">
-                {aliasRows.map(a => (
-                  <span key={a.id} className="claude-aliases-chip">
-                    <code className="claude-aliases-chip-id">{a.id}</code>
-                    {a.display_name ? (
-                      <span className="claude-aliases-chip-name">{a.display_name}</span>
-                    ) : null}
-                  </span>
-                ))}
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                {aliasRows.map(a => {
+                  const on = is1mActive(a.id, a.display_name);
+                  return (
+                    <div
+                      key={a.id}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        padding: "8px 12px",
+                        backgroundColor: "var(--raised)",
+                        borderRadius: "var(--radius-sm)",
+                        border: "1px solid var(--border-soft)",
+                        gap: "12px",
+                      }}
+                    >
+                      <div style={{ display: "flex", flexDirection: "column", gap: "2px", minWidth: 0 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                          <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--fg)" }}>
+                            {a.display_name || a.id}
+                          </span>
+                        </div>
+                        {a.display_name ? (
+                          <code className="mono" style={{ fontSize: "11px", color: "var(--muted)" }}>
+                            {a.id}
+                          </code>
+                        ) : null}
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => toggle1m(a.id, a.display_name)}
+                        title={on ? "1M Context: ON (appends [1m] in discovery)" : "1M Context: OFF"}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          padding: "3px 10px",
+                          borderRadius: "9999px",
+                          fontSize: "11px",
+                          fontWeight: "700",
+                          cursor: "pointer",
+                          border: on ? "1px solid var(--green, #22c55e)" : "1px solid rgba(255, 255, 255, 0.25)",
+                          backgroundColor: on ? "var(--green-soft, rgba(34, 197, 94, 0.18))" : "rgba(255, 255, 255, 0.08)",
+                          color: on ? "var(--green, #22c55e)" : "#d4d4d4",
+                          boxShadow: on ? "0 0 8px rgba(34, 197, 94, 0.35)" : "none",
+                          transition: "all 0.15s ease-in-out",
+                          userSelect: "none",
+                          flexShrink: 0,
+                        }}
+                      >
+                        1M
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           ))}

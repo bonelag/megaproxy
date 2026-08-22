@@ -14,6 +14,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadServiceTokenFromFile, serviceApiTokenFilePath } from "../lib/service-secrets";
+import { readClaudeSettingsJson } from "./settings-file";
 import type { OcxConfig } from "../types";
 
 export interface GatewayModelRow {
@@ -37,17 +38,35 @@ export function claudeConfigDir(): string {
 /** Write the cache file; returns its path or null (best-effort, never throws). */
 export function writeGatewayModelCache(baseUrl: string, models: readonly GatewayModelRow[], configDir = claudeConfigDir()): string | null {
   try {
+    let effectiveBaseUrl = baseUrl;
+    let isDiscoveryEnabled = true;
+
+    try {
+      const claudeSettings = readClaudeSettingsJson();
+      if (claudeSettings.exists && claudeSettings.env) {
+        if (typeof claudeSettings.env.ANTHROPIC_BASE_URL === "string" && claudeSettings.env.ANTHROPIC_BASE_URL.trim()) {
+          effectiveBaseUrl = claudeSettings.env.ANTHROPIC_BASE_URL.trim();
+        }
+        if (claudeSettings.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY === "0") {
+          isDiscoveryEnabled = false;
+        }
+      }
+    } catch {
+      // best-effort
+    }
+
     // Mirror the CLI's usable-id filter so our file matches what it would cache.
-    const usable = models.filter(m => /^(claude|anthropic)/i.test(m.id));
+    const usable = isDiscoveryEnabled ? models.filter(m => /^(claude|anthropic)/i.test(m.id)) : [];
+
     const cacheDir = join(configDir, "cache");
     mkdirSync(cacheDir, { recursive: true });
     const path = join(cacheDir, "gateway-models.json");
     const payload = {
-      baseUrl,
+      baseUrl: effectiveBaseUrl,
       fetchedAt: Date.now(),
       models: usable.map(m => (m.display_name === undefined ? { id: m.id } : { id: m.id, display_name: m.display_name })),
     };
-    writeFileSync(path, JSON.stringify(payload), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(path, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
     return path;
   } catch {
     return null;

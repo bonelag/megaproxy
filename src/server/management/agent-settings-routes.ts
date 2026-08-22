@@ -1064,6 +1064,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       effectiveModelEnv: effectiveModelEnv(config.claudeCode, contextWindows),
       available,
       aliases,
+      discovery1mModels: config.claudeCode?.discovery1mModels ?? [],
       port: config.port,
     });
   }
@@ -1082,7 +1083,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       return prototype === Object.prototype || prototype === null;
     };
     if (!isPlainObject(parsedBody)) return jsonResponse({ error: "body must be an object" }, 400);
-    const body = parsedBody as { enabled?: unknown; authMode?: unknown; model?: unknown; smallFastModel?: unknown; modelMap?: unknown; classifierModel?: unknown; classifierFallbacks?: unknown; systemEnv?: unknown; fastMode?: unknown; maxContextTokens?: unknown; alwaysEnableEffort?: unknown; tierModels?: unknown; autoContext?: unknown; autoCompactWindow?: unknown; blockedSkills?: unknown; injectAgents?: unknown; webSearchSidecar?: unknown; visionSidecar?: unknown };
+    const body = parsedBody as { enabled?: unknown; authMode?: unknown; model?: unknown; smallFastModel?: unknown; modelMap?: unknown; classifierModel?: unknown; classifierFallbacks?: unknown; systemEnv?: unknown; fastMode?: unknown; maxContextTokens?: unknown; alwaysEnableEffort?: unknown; tierModels?: unknown; autoContext?: unknown; autoCompactWindow?: unknown; blockedSkills?: unknown; injectAgents?: unknown; discovery1mModels?: unknown; webSearchSidecar?: unknown; visionSidecar?: unknown };
     for (const field of ["webSearchSidecar", "visionSidecar"] as const) {
       const section = body[field];
       if (section === undefined || section === null) continue;
@@ -1246,6 +1247,15 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         next.blockedSkills = (body.blockedSkills as string[]).map(s => s.trim());
       }
     }
+    if (body.discovery1mModels !== undefined) {
+      if (body.discovery1mModels === null) {
+        delete next.discovery1mModels;
+      } else if (!Array.isArray(body.discovery1mModels) || body.discovery1mModels.some(s => typeof s !== "string")) {
+        return jsonResponse({ error: "discovery1mModels must be an array of strings, or null" }, 400);
+      } else {
+        next.discovery1mModels = (body.discovery1mModels as string[]).map(s => s.trim()).filter(s => s.length > 0);
+      }
+    }
     if (body.tierModels !== undefined) {
       // CONFIG-ONLY back-compat (GUI pickers removed — roster agents supersede tiers).
       if (body.tierModels === null) {
@@ -1268,8 +1278,8 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     }
     let nextFastMode = config.fastMode;
     if (body.fastMode !== undefined) {
-      if (body.fastMode !== true && body.fastMode !== false && body.fastMode !== null) {
-        return jsonResponse({ error: "fastMode must be true, false, or null" }, 400);
+      if (body.fastMode !== null && typeof body.fastMode !== "boolean") {
+        return jsonResponse({ error: "fastMode must be a boolean or null" }, 400);
       }
       nextFastMode = body.fastMode === null ? undefined : body.fastMode;
     }
@@ -1301,12 +1311,12 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     if (body.modelMap !== undefined) {
       if (body.modelMap === null) {
         delete next.modelMap;
+      } else if (!isPlainObject(body.modelMap)) {
+        return jsonResponse({ error: "modelMap must be an object or null" }, 400);
       } else {
-        if (!isPlainObject(body.modelMap)) {
-          return jsonResponse({ error: "modelMap must be an object of string->string, or null" }, 400);
-        }
+        const modelMap = body.modelMap as Record<string, unknown>;
         const map: Record<string, string> = {};
-        for (const [k, v] of Object.entries(body.modelMap)) {
+        for (const [k, v] of Object.entries(modelMap)) {
           if (typeof v !== "string" || k.trim() === "" || v.trim() === "") {
             return jsonResponse({ error: "modelMap entries must be non-empty strings" }, 400);
           }
@@ -1342,7 +1352,69 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     // Keep the file-backed live registry symmetric: OFF prunes immediately, while
     // ON and config changes restore definitions without requiring a restart.
     await syncClaudeAgentDefsBestEffort();
+
+    if (body.discovery1mModels !== undefined) {
+      try {
+        const { refreshGatewayModelCacheFromProxy } = await import("../../claude/gateway-cache");
+        void refreshGatewayModelCacheFromProxy(config.port, { admissionConfig: config });
+      } catch {}
+    }
+
     return jsonResponse({ ok: true, enabled: next.enabled !== false, warnings });
   }
+
+  // Claude Code settings.json custom model direct config (WP: custom models in ~/.claude/settings.json)
+  if (url.pathname === "/api/claude-code/settings-json" && req.method === "GET") {
+    const { readClaudeSettingsJson } = await import("../../claude/settings-file");
+    const settings = readClaudeSettingsJson();
+    const models = await fetchAllModels(config);
+    const { listCatalogNativeSlugs } = await import("../../codex/catalog");
+    const disabled = new Set(config.disabledModels ?? []);
+    const isDisabled = (provider: string, id: string) =>
+      [...disabled].some(stored => slugEquals(stored, provider, id));
+    const available = [
+      ...listCatalogNativeSlugs().filter(ns => !disabled.has(ns)),
+      ...models.filter(m => !isDisabled(m.provider, m.id)).map(m => `${m.provider}/${m.id}`),
+    ];
+    const apiKeys = (config.apiKeys ?? []).map(k => ({
+      id: k.id,
+      label: k.name,
+      key: k.key,
+    }));
+    const defaultEndpoint = `http://127.0.0.1:${config.port}/v1`;
+    return jsonResponse({
+      path: settings.path,
+      exists: settings.exists,
+      env: settings.env,
+      model: settings.model ?? "",
+      apiKeys,
+      availableModels: available,
+      defaultEndpoint,
+    });
+  }
+
+  if (url.pathname === "/api/claude-code/settings-json" && (req.method === "PUT" || req.method === "POST")) {
+    let parsedBody: unknown;
+    try {
+      parsedBody = await readManagementJsonBody(req);
+    } catch (error) {
+      rethrowManagementBodyTooLarge(error);
+      return jsonResponse({ error: "invalid JSON body" }, 400);
+    }
+    if (parsedBody === null || typeof parsedBody !== "object" || Array.isArray(parsedBody)) {
+      return jsonResponse({ error: "body must be an object" }, 400);
+    }
+    const body = parsedBody as { env?: unknown; model?: unknown };
+    if (body.env !== undefined && (body.env === null || typeof body.env !== "object" || Array.isArray(body.env))) {
+      return jsonResponse({ error: "env must be an object" }, 400);
+    }
+    const envUpdates = (body.env as Record<string, string | null | undefined>) ?? {};
+    const { updateClaudeSettingsJson } = await import("../../claude/settings-file");
+    const result = updateClaudeSettingsJson(envUpdates, {
+      model: typeof body.model === "string" ? body.model : undefined,
+    });
+    return jsonResponse({ ok: true, path: result.path, env: result.env, model: result.model });
+  }
+
   return null;
 }

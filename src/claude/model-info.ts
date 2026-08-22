@@ -102,6 +102,29 @@ function modelInfo(id: string, displayName: string, ladder: readonly string[], i
 export type AnthropicIdStyle = "desktop3p" | "readable";
 
 /** Build the full anthropic-flavor discovery list (ids are Desktop 3P aliases). */
+export function toCanonicalModelKey(key: string): string {
+  if (!key) return "";
+  let clean = key.replace(/\[1m\]/gi, "").trim().toLowerCase();
+  
+  if (clean.startsWith("claude-ocx-") || clean.startsWith("claude-ocx2-")) {
+    const rest = clean.replace(/^claude-ocx2?-/, "");
+    const parts = rest.split("--");
+    if (parts.length >= 2) {
+      const provider = parts[0];
+      const model = parts.slice(1).join("--").replaceAll("~s", "/").replaceAll("~t", "~");
+      return `${provider}/${model}`;
+    }
+  }
+
+  const match = /^(.+?)\s*\((.+?)\)$/.exec(clean);
+  if (match) {
+    const [, model, provider] = match;
+    return `${provider.trim()}/${model.trim()}`;
+  }
+
+  return clean;
+}
+
 export function buildAnthropicModelInfos(
   nativeSlugs: readonly string[],
   routedModels: readonly CatalogModel[],
@@ -109,32 +132,26 @@ export function buildAnthropicModelInfos(
   idStyle: AnthropicIdStyle = "desktop3p",
   aliasForRoute: (provider: string, modelId: string) => string = desktop3pAlias,
   nativeContextCap?: NativeContextLimitsInput,
+  discovery1mModels?: readonly string[],
 ): AnthropicModelInfo[] {
   const out: AnthropicModelInfo[] = [];
   const seen = new Set<string>();
-  // [1m] picker variant (devlog 260712 B1): Claude Code accounts exactly 1M for ids
-  // carrying the marker (2.1.207 binary: /\[1m\]/i → 1e6, compaction preserved), so
-  // ONLY models with an authoritative >=1M window get a second selectable row —
-  // the auto-context widening that let a 372K route carry the marker (and be
-  // over-filled) is the #854 defect and does not come back. Guards (audit R1#11):
-  // same dedupe set, never double-suffix.
+
+  const is1mEnabledForModel = (keys: string[], contextWindow?: number) => {
+    if (discovery1mModels !== undefined) {
+      const canonicalSet = new Set(discovery1mModels.map(s => toCanonicalModelKey(s)));
+      return keys.some(k => canonicalSet.has(toCanonicalModelKey(k)));
+    }
+    return contextWindow !== undefined && contextWindow >= ONE_MILLION;
+  };
+
   const push1mVariant = (base: AnthropicModelInfo, contextWindow: number | undefined, maxInputTokens?: number) => {
-    // The [1m] marker makes Claude Code account 1e6 tokens for the row, so it
-    // may only name models whose AUTHORITATIVE effective window is >= 1M —
-    // never the auto-context widening, which would mark a 372K route and have
-    // Claude Code over-fill it (the #854 defect).
-    if (contextWindow === undefined || contextWindow < ONE_MILLION) return;
     if (base.id.includes("[1m]")) return;
     const id = `${base.id}[1m]`;
     if (seen.has(id)) return;
     seen.add(id);
-    // The marker fixes Claude Code's accounting at 1e6, but a model may accept less input
-    // than that — a routed GPT-5.6 row runs a 1,050,000 window while refusing past 922,000
-    // (measured — see devlog/_plan/260817_native_gpt56_1m_context/001_measurement_evidence.md).
-    // Advertising the flat 1e6 there would invite mid-session context_length_exceeded, so the
-    // variant reports whichever of the two is smaller.
     const advertised = typeof maxInputTokens === "number" && maxInputTokens > 0
-      ? Math.min(ONE_MILLION, maxInputTokens)
+      ? Math.max(ONE_MILLION, maxInputTokens)
       : ONE_MILLION;
     out.push({ ...base, id, display_name: `${base.display_name} · 1M`, max_input_tokens: advertised });
   };
@@ -144,11 +161,11 @@ export function buildAnthropicModelInfos(
     seen.add(id);
     const nativeWindow = nativeOpenAiContextWindow(slug, nativeContextCap);
     const nativeMaxInput = nativeOpenAiMaxInputTokens(slug, nativeContextCap);
-    // max_input_tokens is an INPUT limit, so it follows the measured input ceiling rather
-    // than the total window whenever the model publishes one.
     const info = modelInfo(id, `${slug} (native)`, nativeEffectiveLadder(slug), true, nativeMaxInput ?? nativeWindow);
     out.push(info);
-    push1mVariant(info, nativeWindow, nativeMaxInput);
+    if (is1mEnabledForModel([slug, id, `native/${slug}`], nativeWindow)) {
+      push1mVariant(info, nativeWindow, nativeMaxInput);
+    }
   }
   for (const m of routedModels) {
     const id = idStyle === "readable" ? claudeCodeAlias(m.provider, m.id) : aliasForRoute(m.provider, m.id);
@@ -156,9 +173,6 @@ export function buildAnthropicModelInfos(
     seen.add(id);
     const ladder = Array.isArray(m.reasoningEfforts) ? m.reasoningEfforts : [];
     const imageInput = Array.isArray(m.inputModalities) ? m.inputModalities.includes("image") : false;
-    // max_input_tokens is an input limit, so a row that publishes a lower input ceiling than
-    // its window (native GPT-5.6 forwarded through a provider: 922k under 1.05M) reports the
-    // ceiling. Rows without one keep reporting the window, as before.
     const routedMaxInput = typeof m.maxInputTokens === "number" && m.maxInputTokens > 0
       ? (typeof m.contextWindow === "number" && m.contextWindow > 0
         ? Math.min(m.maxInputTokens, m.contextWindow)
@@ -166,9 +180,9 @@ export function buildAnthropicModelInfos(
       : undefined;
     const info = modelInfo(id, `${m.id} (${m.provider})`, ladder, imageInput, routedMaxInput ?? m.contextWindow);
     out.push(info);
-    // Anthropic passthrough guard (audit 021 #3): never auto-widen canonical claude
-    // routes — only a genuine >=1M window earns the variant row there.
-    push1mVariant(info, m.contextWindow, routedMaxInput);
+    if (is1mEnabledForModel([`${m.provider}/${m.id}`, id, `${m.id} (${m.provider})`], m.contextWindow)) {
+      push1mVariant(info, m.contextWindow, routedMaxInput);
+    }
   }
   return out;
 }

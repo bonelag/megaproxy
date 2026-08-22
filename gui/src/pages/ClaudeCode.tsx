@@ -17,6 +17,7 @@ import {
 import { serializeSidecarOverride } from "./claude-code-sidecar";
 import { AUTO_COMPACT_WINDOW_DEFAULT, formatCompactWindow, newClientId, type ClaudeCodeState, type MapRow } from "./claude-code-types";
 import { SmallFastModelSetting } from "./claude-code-settings";
+import { ClaudeCodeCustomModelSection } from "./ClaudeCodeCustomModelSection";
 
 export { AutoConnectSetting, SmallFastModelSetting } from "./claude-code-settings";
 
@@ -35,7 +36,7 @@ export default function ClaudeCode({ apiBase, active = true }: { apiBase: string
   const [hasDraftRows, setHasDraftRows] = useState(Boolean(cached));
   const [status, setStatus] = useState("");
   const [ok, setOk] = useState(false);
-  const [selectedSection, setSelectedSection] = useState("settings");
+  const [selectedSection, setSelectedSection] = useState("model");
   /*
    * The connection switch moved here from the sidebar's Claude nav row, which
    * had made a navigation entry the owner of a mutation — and left it homeless
@@ -172,6 +173,7 @@ export default function ClaudeCode({ apiBase, active = true }: { apiBase: string
           autoCompactWindow: state.autoCompactWindow,
           injectAgents: state.injectAgents,
           smallFastModel: state.smallFastModel,
+          discovery1mModels: state.discovery1mModels,
           modelMap,
           webSearchSidecar: serializeSidecarOverride(state.webSearchSidecar),
           visionSidecar: serializeSidecarOverride(state.visionSidecar),
@@ -204,7 +206,48 @@ export default function ClaudeCode({ apiBase, active = true }: { apiBase: string
   }
   if (!state) return null;
 
+  const handleDiscovery1mChange = async (nextDiscovery1m: string[]) => {
+    if (!state) return;
+    const nextState = { ...state, discovery1mModels: nextDiscovery1m };
+    setState(nextState);
+    writeSessionListCacheEntry(cacheKey, { state: nextState, rows });
+    try {
+      const response = await fetch(`${apiBase}/api/claude-code`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ discovery1mModels: nextDiscovery1m }),
+      });
+      await readJsonOrThrow(response, t("claude.saveFailed"));
+      codeResource.refresh();
+    } catch (err) {
+      console.error("Auto-save discovery1mModels failed:", err);
+    }
+  };
+
   const sections: Array<{ id: string; label: string; meta?: string; body: ReactNode }> = [
+    {
+      id: "model",
+      label: t("claude.workspace.models"),
+      body: (
+        <ClaudeCodeCustomModelSection
+          apiBase={apiBase}
+          availableModels={state.available ?? []}
+          port={state.port}
+        />
+      ),
+    },
+    {
+      id: "aliases",
+      label: t("claude.aliases"),
+      meta: String(state.aliases.length),
+      body: (
+        <ClaudeCodeAliasesSection
+          aliases={state.aliases}
+          discovery1mModels={state.discovery1mModels ?? []}
+          onChangeDiscovery1m={handleDiscovery1mChange}
+        />
+      ),
+    },
     {
       id: "settings",
       label: t("claude.workspace.settings"),
@@ -216,11 +259,6 @@ export default function ClaudeCode({ apiBase, active = true }: { apiBase: string
           onStateChange={setState}
         />
       ),
-    },
-    {
-      id: "quickstart",
-      label: t("claude.quickstart"),
-      body: <ClaudeCodeQuickstartSection manualEnv={buildManualEnv(state)} />,
     },
     {
       id: "smallFast",
@@ -244,10 +282,9 @@ export default function ClaudeCode({ apiBase, active = true }: { apiBase: string
       }} />,
     },
     {
-      id: "aliases",
-      label: t("claude.aliases"),
-      meta: String(state.aliases.length),
-      body: <ClaudeCodeAliasesSection aliases={state.aliases} />,
+      id: "quickstart",
+      label: t("claude.quickstart"),
+      body: <ClaudeCodeQuickstartSection manualEnv={buildManualEnv(state)} />,
     },
   ];
   const selected = sections.find(s => s.id === selectedSection) ?? sections[0]!;
@@ -262,7 +299,7 @@ export default function ClaudeCode({ apiBase, active = true }: { apiBase: string
       {loadState.showError && <Notice tone="err">{t("claude.loadFail")}</Notice>}
       {state && (
         <div className="claudecode-connection-head">
-          <span id="claudecode-connection-label">{t("claude.enabledLabel")}</span>
+          <span id="claudecode-connection-label" style={{ fontWeight: 700, fontSize: "16px", color: "var(--fg)" }}>{t("claude.enabledLabel")}</span>
           <Switch
             on={state.enabled}
             onClick={() => void toggleConnection()}
