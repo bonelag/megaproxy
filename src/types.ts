@@ -5,6 +5,7 @@ export type { OcxTool, OcxToolChoice } from "./types/tools";
 export {
   namespacedToolName,
   toolChoiceAliases,
+  createToolChoiceResolver,
   toolChoiceCandidates,
   toolAllowedByChoice,
   resolveToolChoiceWireName,
@@ -43,6 +44,7 @@ export type {
   OcxAssistantContentPart,
   OcxRequestOptions,
   OcxMessagePhase,
+  OcxProviderContinuationOwner,
   OcxProviderContinuationState,
   AdapterEvent,
   OcxUrlCitation,

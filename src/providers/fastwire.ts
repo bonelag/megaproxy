@@ -33,6 +33,7 @@ export interface FastPolicyAuthority {
   readonly providerAdapter: string;
   readonly providerAuthMode?: ProviderAuthKind;
   readonly fastWireDeclaration: FastWire | null | undefined;
+  readonly fastTierDescription?: string;
   readonly modelWireOverrideAllowed: boolean;
   readonly authTransport: FastPolicyAuthTransport;
   readonly capability: {
@@ -55,6 +56,7 @@ export interface ResolvedFastPolicy {
     | "pin-unavailable";
   readonly adapter: string;
   readonly fastWire: FastWire | null;
+  readonly fastTierDescription?: string;
   readonly forwardCallerTier: boolean;
 }
 
@@ -143,34 +145,40 @@ function resolvePolicyAdapter(
   inbound: InboundWire,
 ): { adapter: string; hardPinned: boolean; forwardCallerServiceTier?: boolean } {
   // Hard pins and configured overrides deliberately use the same exact-key semantics as
-  // resolveWireProtocolOverride(). Registry defaults alone normalize ids at their boundary.
+  // resolveWireProtocolOverride(). Registry route policy normalizes ids at its boundary.
   const hardPin = Object.hasOwn(authority.hardPins, modelId)
     ? authority.hardPins[modelId]
     : undefined;
   if (typeof hardPin === "string") return { adapter: hardPin, hardPinned: true };
   if (authority.modelWireOverrideAllowed) {
+    const registryDefault = MODEL_ADAPTER_OVERRIDE_ALLOWED.has(authority.providerAdapter)
+      ? registryDefaultForModel(
+          authority.registryWireDefaults,
+          modelId,
+          inbound,
+          authority.providerAuthMode,
+        )
+      : undefined;
     const configured = Object.hasOwn(authority.modelAdapters, modelId)
       ? authority.modelAdapters[modelId]
       : undefined;
     if (typeof configured === "string" && MODEL_ADAPTER_OVERRIDE_ALLOWED.has(configured)) {
-      return { adapter: configured, hardPinned: false };
+      return {
+        adapter: configured,
+        hardPinned: false,
+        ...(registryDefault?.forwardCallerServiceTier === false
+          ? { forwardCallerServiceTier: false }
+          : {}),
+      };
     }
-    if (MODEL_ADAPTER_OVERRIDE_ALLOWED.has(authority.providerAdapter)) {
-      const registryDefault = registryDefaultForModel(
-        authority.registryWireDefaults,
-        modelId,
-        inbound,
-        authority.providerAuthMode,
-      );
-      if (registryDefault !== undefined) {
-        return {
-          adapter: registryDefault.adapter,
-          hardPinned: false,
-          ...(registryDefault.forwardCallerServiceTier !== undefined
-            ? { forwardCallerServiceTier: registryDefault.forwardCallerServiceTier }
-            : {}),
-        };
-      }
+    if (registryDefault !== undefined) {
+      return {
+        adapter: registryDefault.adapter,
+        hardPinned: false,
+        ...(registryDefault.forwardCallerServiceTier !== undefined
+          ? { forwardCallerServiceTier: registryDefault.forwardCallerServiceTier }
+          : {}),
+      };
     }
   }
   return { adapter: authority.providerAdapter, hardPinned: false };
@@ -216,7 +224,16 @@ export function resolveFastPolicy(
   else if (capability === undefined) eligibility = "unclassified";
   else eligibility = "eligible";
 
-  return { capability, eligibility, adapter, fastWire, forwardCallerTier };
+  return {
+    capability,
+    eligibility,
+    adapter,
+    fastWire,
+    ...(authority.fastTierDescription !== undefined
+      ? { fastTierDescription: authority.fastTierDescription }
+      : {}),
+    forwardCallerTier,
+  };
 }
 
 export function canonicalFastTierMarker(callerTier: string | undefined): "priority" | undefined {

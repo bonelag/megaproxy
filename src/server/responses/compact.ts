@@ -465,7 +465,6 @@ export async function handleResponsesCompact(
       }
       compactHostAdmissionLease = null;
     };
-    const compactThreadId = req.headers.get("x-codex-parent-thread-id");
     const connectMs = config.connectTimeoutMs ?? 200_000;
     // Takes its context explicitly: the alternate-account flow below records a rejection
     // against A while promoting B, then records B's own outcome. A closure over a single
@@ -482,7 +481,7 @@ export async function handleResponsesCompact(
       if (!usesCodexForwardPoolAuth(ctx, route.provider)) return;
       recordCodexUpstreamOutcome(config, ctx.accountId, outcome, {
         ...meta,
-        threadId: compactThreadId,
+        threadId: ctx.kind === "pool" || ctx.kind === "main-pool" ? ctx.affinityKey : undefined,
         fixedAccount: ctx.fixedAccount,
         modelId: selectedModelId,
         probeLeaseId: codexProbeLeaseId(ctx),

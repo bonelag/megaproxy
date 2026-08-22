@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGoogleAdapter as createGoogleAdapterProduction } from "../src/adapters/google";
-import { __resetAntigravityReplayCache } from "../src/adapters/google-antigravity-replay";
+import { __resetAntigravityReplayCache, observeAntigravityReplay } from "../src/adapters/google-antigravity-replay";
 import { parseRequest } from "../src/responses/parser";
 import {
   flushThoughtSignatureReplayForTests,
@@ -31,6 +31,13 @@ const provider = {
   googleMode: "vertex",
   baseUrl: "https://aiplatform.googleapis.com",
   apiKey: "vertex-test-key",
+} as OcxProviderConfig;
+
+const aiStudioProvider = {
+  adapter: "google",
+  googleMode: "ai-studio",
+  baseUrl: "https://generativelanguage.googleapis.com",
+  apiKey: "ai-studio-test-key",
 } as OcxProviderConfig;
 
 
@@ -89,6 +96,18 @@ function modelParts(body: string): Record<string, unknown>[] {
   return parsed.contents.find(content => content.role === "model")?.parts ?? [];
 }
 
+/** Build a streaming response whose SSE frames remain distinct transport chunks. */
+function sseResponse(frames: string[]): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      for (const frame of frames) controller.enqueue(encoder.encode(frame));
+      controller.close();
+    },
+  });
+  return new Response(stream);
+}
+
 describe("#1735 thought signature survives history replay", () => {
   let previousHome: string | undefined;
   let testDir: string;
@@ -112,6 +131,20 @@ describe("#1735 thought signature survives history replay", () => {
     await adapter.buildRequest(firstTurn());
     const events = await adapter.parseResponse!(new Response(JSON.stringify(googleBody([
       { functionCall: { name: "shell_command", args: { command: "pwd" } }, thoughtSignature: SIGNATURE },
+    ]))));
+    const start = events.find((e: AdapterEvent) => e.type === "tool_call_start");
+    expect(start && "providerMetadata" in start ? start.providerMetadata?.google?.thoughtSignature : undefined)
+      .toBe(SIGNATURE);
+  });
+
+  test("a functionCall part with nested extra_content.google.thought_signature is read", async () => {
+    const adapter = createGoogleAdapter(provider);
+    await adapter.buildRequest(firstTurn());
+    const events = await adapter.parseResponse!(new Response(JSON.stringify(googleBody([
+      {
+        functionCall: { name: "shell_command", args: { command: "pwd" } },
+        extra_content: { google: { thought_signature: SIGNATURE } },
+      },
     ]))));
     const start = events.find((e: AdapterEvent) => e.type === "tool_call_start");
     expect(start && "providerMetadata" in start ? start.providerMetadata?.google?.thoughtSignature : undefined)
@@ -161,16 +194,8 @@ describe("#1735 thought signature survives history replay", () => {
       `data: ${JSON.stringify({ usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2 } })}\n\n`,
     ];
 
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const encoder = new TextEncoder();
-        for (const frame of frames) controller.enqueue(encoder.encode(frame));
-        controller.close();
-      },
-    });
-
     const events: AdapterEvent[] = [];
-    for await (const event of adapter.parseStream(new Response(stream))) {
+    for await (const event of adapter.parseStream(sseResponse(frames))) {
       events.push(event);
     }
 
@@ -183,6 +208,52 @@ describe("#1735 thought signature survives history replay", () => {
       .toBe(SIGNATURE);
     expect("providerMetadata" in starts[1] ? starts[1].providerMetadata?.google?.thoughtSignature : undefined)
       .toBe(SIGNATURE);
+  });
+
+  test("streaming signatures only attach to function calls that follow them in the same frame", async () => {
+    const adapter = createGoogleAdapter(provider);
+    await adapter.buildRequest(firstTurn());
+    const frames = [
+      `data: ${JSON.stringify(googleBody([
+        { functionCall: { name: "shell_command", args: { command: "pwd" } } },
+        { text: "thinking...", thought: true, thought_signature: SIGNATURE },
+        { functionCall: { name: "shell_command", args: { command: "ls" } } },
+      ]))}\n\n`,
+    ];
+
+    const events: AdapterEvent[] = [];
+    for await (const event of adapter.parseStream(sseResponse(frames))) events.push(event);
+
+    const signatures = events
+      .filter((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> =>
+        event.type === "tool_call_start")
+      .map(event => event.providerMetadata?.google?.thoughtSignature);
+    expect(signatures).toEqual([undefined, SIGNATURE]);
+  });
+
+  test("AI Studio keeps source-order thought signature carry across stream frames", async () => {
+    const adapter = createGoogleAdapter(aiStudioProvider);
+    await adapter.buildRequest(firstTurn());
+    const frames = [
+      `data: ${JSON.stringify({
+        candidates: [{
+          content: {
+            role: "model",
+            parts: [{ text: "thinking...", thought: true, thought_signature: SIGNATURE }],
+          },
+        }],
+      })}\n\n`,
+      `data: ${JSON.stringify(googleBody([
+        { functionCall: { name: "shell_command", args: { command: "pwd" } } },
+      ]))}\n\n`,
+    ];
+
+    const events: AdapterEvent[] = [];
+    for await (const event of adapter.parseStream(sseResponse(frames))) events.push(event);
+
+    const start = events.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> =>
+      event.type === "tool_call_start");
+    expect(start?.providerMetadata?.google?.thoughtSignature).toBe(SIGNATURE);
   });
 
   test("a signature replayed through Responses history reaches the rebuilt Google part", async () => {
@@ -255,6 +326,44 @@ describe("#1735 thought signature survives history replay", () => {
     const request = await createGoogleAdapter(provider).buildRequest(parsed);
     const part = modelParts(request.body as string).find(candidate => "functionCall" in candidate);
     expect(part?.thoughtSignature).toBe(SIGNATURE_B);
+  });
+
+  test("a custom_tool_call without call_id store entry falls back to in-memory replay cache by unwrapped args", async () => {
+    const adapter = createGoogleAdapter({
+      ...provider,
+      googleMode: "cloud-code-assist",
+      baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+      project: "test-proj",
+      apiKey: "test-token",
+    });
+    const parsedDummy = parseRequestScoped({
+      model: MODEL,
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "test-session-freeform" }] }],
+      tools: [{ type: "function", name: "default_api:exec", description: "run", parameters: { type: "object" } }],
+    }, undefined);
+    const dummyReq = await adapter.buildRequest(parsedDummy);
+    const wireModel = JSON.parse(dummyReq.body as string).model;
+    const wireSession = JSON.parse(dummyReq.body as string).request.sessionId;
+    const wireToolName = JSON.parse(dummyReq.body as string).request.tools[0].functionDeclarations[0].name;
+
+    // Warm up the Antigravity replay cache with parsed function args:
+    observeAntigravityReplay(wireModel, wireSession, [
+      { functionCall: { name: wireToolName, args: { cmd: "whoami" } }, thoughtSignature: SIGNATURE },
+    ]);
+    const parsed = parseRequestScoped({
+      model: MODEL,
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "test-session-freeform" }] },
+        { type: "custom_tool_call", call_id: "call_custom_unscoped", name: "default_api:exec", input: JSON.stringify({ cmd: "whoami" }) },
+        { type: "custom_tool_call_output", call_id: "call_custom_unscoped", output: "agent" },
+      ],
+      tools: [{ type: "function", name: "default_api:exec", description: "run", parameters: { type: "object" } }],
+    }, undefined); // unscoped so durable store cannot hit
+    const request = await adapter.buildRequest(parsed);
+    const reqObj = JSON.parse(request.body as string);
+    const contents = reqObj.request.contents;
+    const modelTurn = contents.find((c: { role: string }) => c.role === "model");
+    expect(modelTurn.parts[0].thoughtSignature).toBe(SIGNATURE);
   });
 
   test("a tool_search_call replay is re-signed from the proxy-side store", async () => {

@@ -109,4 +109,12 @@ export type ProviderUpdatePatch = {
   headers?: Record<string, string> | null;
   /** When true with headers, replace the full user-managed map instead of merging. */
   headersReplace?: boolean;
+  /** Management-only write that atomically owns the two supported xAI Grok adapter rows. */
+  xaiResponsesOptIn?: boolean;
+};
+
+export type ProviderUpdateResult = {
+  ok: boolean;
+  error?: string;
+  xaiResponsesOptInState?: WorkspaceItem["xaiResponsesOptInState"];
 };
