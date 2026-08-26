@@ -115,16 +115,12 @@ import {
   applyCodexAuthContextToProvider,
   codexPoolAffinityKey,
   CodexAccountCooldownError,
-  codexMainProfileDrainingResponse,
-  cooldownErrorResponse,
   CodexAuthContextError,
-  CodexDirectAuthenticationError,
   CodexMainProfileDrainingError,
   CodexPoolAuthenticationError,
   CodexThreadAffinityExpiredError,
   headersForCodexAuthContext,
   materializeCodexUpstreamAuth,
-  CodexMainSubstitutionUnavailableError,
   isCodexAuthContextUsable,
   resolveCodexAuthContext,
   codexProbeLeaseId,
@@ -195,7 +191,7 @@ import {
   rotateProviderTransportOn429,
 } from "../../providers/key-failover";
 import { shouldAttemptImageTierRetry } from "../image-retry";
-import { resolveProviderTransport } from "../../providers/xai-transport";
+import { isXaiResponsesDestination, resolveProviderTransport } from "../../providers/xai-transport";
 import type { WsData } from "../ws-bridge";
 import { codexAccountSelectionForTurn, registerTurn, trackStreamLifetime, unregisterTurn } from "../lifecycle";
 import { redactSecretString, sanitizeLogMetadataString } from "../../lib/redact";
@@ -274,6 +270,7 @@ import { createResponsesModelPayloadRewrite, rewriteResponsesModelJson } from ".
 import type { EffectiveSubagentRoster, SpawnAgentSurface } from "../../codex/catalog";
 
 import { buildToolBridgeMaps, collabSurface, injectDeveloperMessage, multiAgentGuidanceText } from "./collaboration";
+import { mapCodexAuthContextErrorToResponse } from "./codex-auth-error";
 import { hasUnreadableEncryptedAgentTask, looksLikeBackendCiphertext, sanitizeEncryptedContentInPlace } from "./encrypted-payload";
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel } from "./fetch-helpers";
 import { classifyTransportFailureKind, transportErrorCode } from "../../lib/upstream-reachability";
@@ -309,11 +306,16 @@ import {
   type RoutedNamespaceToolAliases,
 } from "../../responses/namespace-tool-compat";
 import {
+  collectDeclaredNamelessClientCallTypes,
   collectDeclaredWireToolNames,
+  collectProviderExecutedCallTypes,
   createUndeclaredToolCallGuardBlockRewrite,
+  currentTurnWireToolCatalogBody,
+  hasExplicitWireToolCatalog,
   undeclaredToolCallMessage,
   undeclaredToolCallName,
   undeclaredToolCallNameInResponse,
+  type ProviderExecutedCallType,
 } from "../responses-undeclared-tool-guard";
 import { createGithubCopilotResponsesBlockRewrite } from "../github-copilot-responses-repair";
 import { responsesJsonToSseStream } from "../responses-json-events";
@@ -322,6 +324,12 @@ import {
   emptyCompletionRetryEnabled,
   guardEmptyCompletionEventStream,
 } from "./empty-completion-guard";
+import { preflightComboStreamResponse } from "./combo-stream-preflight";
+
+// runTurn adapters own an event queue and perform their combo preflight before
+// bridging. A second byte-stream reader would reinterpret that transport's
+// already-committed event boundary and can replay custom adapter work.
+const runTurnAdapterSseResponses = new WeakSet<Response>();
 
 /**
  * Adapters whose continuation state must survive Codex's store:false requests.
@@ -631,6 +639,26 @@ async function opaqueBlobRejectionBodyForRecovery(
     return body.displaySafe && !body.truncated ? body.text : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Materialize an upstream error body only when the bounded reader observed a complete,
+ * display-safe payload. Partial timeout and over-limit prefixes are attacker-controlled,
+ * so callers keep their existing status-only fallback instead.
+ */
+export async function readDisplaySafeErrorText(
+  response: Response,
+  signal: AbortSignal,
+  fallback: string,
+): Promise<string> {
+  try {
+    const body = await readBoundedResponseBody(response, { signal });
+    return body.displaySafe ? body.text : fallback;
+  } catch {
+    // Preserve the former Response.text().catch(fallback) contract. Request-abort
+    // classification remains owned by the surrounding response pipeline.
+    return fallback;
   }
 }
 
@@ -1512,44 +1540,20 @@ async function resolveResponsesCodexAuth(
       substituteMainCredential,
     };
   } catch (err) {
-    if (err instanceof CodexAccountCooldownError) {
-      return { ok: false, response: cooldownErrorResponse(err, Date.now(), route.codexAccountNamespace) };
-    }
-    if (err instanceof CodexMainProfileDrainingError) {
-      return { ok: false, response: codexMainProfileDrainingResponse() };
-    }
-    if (err instanceof CodexThreadAffinityExpiredError) {
-      return {
-        ok: false,
-        response: formatErrorResponse(409, "invalid_request_error", "Codex thread account affinity expired; start a new session"),
-      };
-    }
     if (err instanceof CodexAuthContextError) {
       const safeAccountLabel = route.codexAccountNamespace
         ? `${route.providerName}-${route.codexAccountNamespace}`
         : formatCodexProviderForLog(route.providerName, err.accountId, config);
       console.error(`[codex-auth] Pool account ${safeAccountLabel} token failed; reauthentication required`);
-      return {
-        ok: false,
-        response: formatErrorResponse(401, "authentication_error", "Selected Codex account needs reauthentication"),
-      };
-    }
-    if (err instanceof CodexPoolAuthenticationError) {
-      return { ok: false, response: formatErrorResponse(401, "authentication_error", err.message) };
-    }
-    if (err instanceof CodexDirectAuthenticationError) {
-      return { ok: false, response: formatErrorResponse(401, "authentication_error", err.message) };
     }
     if (err instanceof ForwardAdmissionCredentialError) {
       return { ok: false, response: formatErrorResponse(401, "authentication_error", err.message) };
     }
-    if (err instanceof CodexMainSubstitutionUnavailableError) {
-      // Fail BEFORE any upstream I/O. The alternative is forwarding the admission secret.
-      return {
-        ok: false,
-        response: formatErrorResponse(401, "authentication_error", "No usable Codex main credential to serve this request"),
-      };
-    }
+    const response = mapCodexAuthContextErrorToResponse(err, {
+      accountSelector: route.codexAccountNamespace,
+      now: Date.now(),
+    });
+    if (response) return { ok: false, response };
     throw err;
   }
 }
@@ -1917,6 +1921,31 @@ export async function handleComboResponses(
       return clientCancelledResponse();
     }
 
+    if (response.ok && !runTurnAdapterSseResponses.has(response)) {
+      const nativePassthrough = isNativePassthroughSseResponse(response);
+      const eagerRelay = isEagerRelaySseResponse(response);
+      let preflight;
+      try {
+        preflight = await preflightComboStreamResponse(response, childLog);
+      } catch (error) {
+        callbackGate.discard();
+        if (options.abortSignal?.aborted) {
+          retainCancelledAttempt();
+          return clientCancelledResponse();
+        }
+        throw error;
+      }
+      if (preflight.kind === "failed") {
+        callbackGate.discard();
+        terminalRecorder?.("failed", preflight.response.status);
+        response = preflight.response;
+      } else {
+        response = preflight.response;
+        if (nativePassthrough) markNativePassthroughSseResponse(response);
+        if (eagerRelay) markEagerRelaySseResponse(response);
+      }
+    }
+
     if (response.ok) {
       sealRequestAttemptIdentity(
         attempt,
@@ -1972,7 +2001,7 @@ export async function handleComboResponses(
     );
     finishRequestAttempt(
       attempt,
-      response.status,
+      failure.response.status,
       Date.now() - started,
       failure.usage,
     );
@@ -1986,7 +2015,7 @@ export async function handleComboResponses(
       return lastFailure;
     }
     console.warn(
-      `[combo] ${comboId}: ${targetKey(pick.target)} failed with ${response.status} after ${Date.now() - started}ms`,
+      `[combo] ${comboId}: ${targetKey(pick.target)} failed with ${failure.response.status} after ${Date.now() - started}ms`,
     );
     const nextPick = advanceComboAfterFailure(config, pick, {
       retryAfter: failure.retryAfter,
@@ -2903,6 +2932,23 @@ async function handleResponsesInner(
         + `(model ${parsed.modelId}); forwarding without it — earlier turns may be missing from this request`,
       );
     }
+    // Preserve the caller's readable catalog boundary before provider-specific normalization can
+    // remove an unsupported final entry (for example xAI cached-only web search).
+    const replayedInputPrefixLength = parsed._replayPrefixLen ?? 0;
+    const clientToolAuthorizationBody = currentTurnWireToolCatalogBody(
+      parsed._rawBody,
+      replayedInputPrefixLength,
+    );
+    const clientExplicitWireToolCatalog = hasExplicitWireToolCatalog(clientToolAuthorizationBody);
+    const clientDeclaredWireToolNames = collectDeclaredWireToolNames(clientToolAuthorizationBody);
+    const clientDeclaredNamelessCallTypes = collectDeclaredNamelessClientCallTypes(
+      clientToolAuthorizationBody,
+    );
+    // Hosted calls the PROVIDER runs itself. Gated on the destination actually being xAI, so a
+    // declaration alone cannot buy the exemption on some other upstream that never serves it.
+    const providerExecutedCallTypes = isXaiResponsesDestination(route.provider)
+      ? collectProviderExecutedCallTypes(clientToolAuthorizationBody)
+      : new Set<ProviderExecutedCallType>();
     let request: Awaited<ReturnType<typeof adapter.buildRequest>>;
     try {
       request = await adapter.buildRequest(parsed, { headers: selectedForwardHeaders, translatorBudget });
@@ -2945,13 +2991,13 @@ async function handleResponsesInner(
     // call it cannot execute, and the turn showed a bare `aborted` with the file untouched.
     // Forward auth is the canonical ChatGPT backend speaking Codex's own protocol rather than a
     // routed provider, so it keeps passing through unguarded, as it does for the rewrites above.
-    // The guard needs a catalog to compare against, so it stands down when the request carries
-    // none. That is not the same claim as "no tools means no tool may be called": a passthrough
-    // request can legitimately omit `tools` entirely and still receive a tool call the client
-    // understands — `tests/github-copilot-stream-contract.test.ts` sends `{model, input, stream}`
-    // with no tools and Copilot answers with a `custom_tool_call` for `apply_patch`. Policing an
-    // empty catalog truncates that turn. An unreadable body lands here too, since it yields no
-    // names either.
+    // The guard needs a catalog to compare against, so it stands down when the request omits one.
+    // An explicit empty catalog is still authoritative: it declares that no client tools may be
+    // called. A passthrough request can legitimately omit `tools` entirely and still receive a call
+    // the client understands — `tests/github-copilot-stream-contract.test.ts` sends
+    // `{model, input, stream}` with no tools and Copilot answers with a `custom_tool_call` for
+    // `apply_patch`. Policing an absent catalog truncates that turn. An unreadable body lands there
+    // too because the proxy cannot establish the caller's declared authorization boundary.
     const parseOutboundRequestBody = (bodyText: string): Record<string, unknown> | undefined => {
       try {
         const body = JSON.parse(bodyText) as unknown;
@@ -2962,16 +3008,46 @@ async function handleResponsesInner(
         return undefined;
       }
     };
-    let outboundRequestBody = parseOutboundRequestBody(request.body);
-    const declaredWireToolNames = collectDeclaredWireToolNames(outboundRequestBody);
-    // Union with the caller's own catalog, because the outbound body is not always a complete
-    // record of it: hosted-tool preference REPLACES a client tool with its hosted form, so a
-    // request declaring `image_gen.generate` ships `{type:"image_generation"}` upstream and gets
-    // the client's name back. Widening only ever makes the guard fire less; a name declared in
-    // neither place — #1700's `apply_patch` — is still refused.
-    for (const name of toolBridgeMaps.declaredToolNames) declaredWireToolNames.add(name);
-    const undeclaredToolGuardActive = declaredWireToolNames.size > 0
-      && route.provider.authMode !== "forward";
+    let outboundRequestBody: Record<string, unknown> | undefined;
+    const declaredWireToolNames = new Set<string>();
+    const declaredNamelessClientCallTypes = new Set<string>();
+    let undeclaredToolGuardActive = false;
+    const refreshUndeclaredToolGuard = (builtRequest: AdapterRequest): void => {
+      outboundRequestBody = parseOutboundRequestBody(builtRequest.body);
+      declaredWireToolNames.clear();
+      // With no replay prefix the full outbound body belongs to this turn and its normalized
+      // aliases are authoritative. A continuation's outbound body still contains historical
+      // catalogs (and may promote historical tool-search definitions), so it can never widen the
+      // current caller snapshot captured above.
+      if (replayedInputPrefixLength === 0) {
+        for (const name of collectDeclaredWireToolNames(outboundRequestBody)) {
+          declaredWireToolNames.add(name);
+        }
+      }
+      for (const name of clientDeclaredWireToolNames) declaredWireToolNames.add(name);
+      declaredNamelessClientCallTypes.clear();
+      if (replayedInputPrefixLength === 0) {
+        for (const callType of collectDeclaredNamelessClientCallTypes(outboundRequestBody)) {
+          declaredNamelessClientCallTypes.add(callType);
+        }
+      }
+      for (const callType of clientDeclaredNamelessCallTypes) {
+        declaredNamelessClientCallTypes.add(callType);
+      }
+      // On an ordinary request these maps capture caller-catalog identities that normalization may
+      // replace on the outbound wire (for example a client image tool becoming hosted). On replay,
+      // however, the parsed maps also contain historical catalog entries, so only the bounded
+      // current-turn wire snapshot above may authorize a call.
+      if (replayedInputPrefixLength === 0) {
+        for (const name of toolBridgeMaps.declaredToolNames) declaredWireToolNames.add(name);
+      }
+      undeclaredToolGuardActive = (
+        declaredWireToolNames.size > 0
+        || clientDeclaredNamelessCallTypes.size > 0
+        || clientExplicitWireToolCatalog
+      ) && route.provider.authMode !== "forward";
+    };
+    refreshUndeclaredToolGuard(request);
     // A refused turn must not seed `previous_response_id` replay. The inspection branch reads the
     // untouched upstream stream, so it can still observe a `response.completed` the client never
     // received; checking the payload itself rather than a flag shared with the client relay keeps
@@ -2988,7 +3064,12 @@ async function handleResponsesInner(
       // provider) every name looks undeclared, and flipping this would stop recording continuation
       // state for exactly the passthrough traffic the guard deliberately stands down for.
       if (!undeclaredToolGuardActive || inspectionSawUndeclaredTool) return;
-      if (undeclaredToolCallName(payload, declaredWireToolNames) !== undefined) {
+      if (undeclaredToolCallName(
+        payload,
+        declaredWireToolNames,
+        declaredNamelessClientCallTypes,
+        providerExecutedCallTypes,
+      ) !== undefined) {
         inspectionSawUndeclaredTool = true;
       }
     };
@@ -2997,7 +3078,12 @@ async function handleResponsesInner(
         if (inspectionSawUndeclaredTool) return;
         if (
           undeclaredToolGuardActive
-          && undeclaredToolCallNameInResponse(response, declaredWireToolNames) !== undefined
+          && undeclaredToolCallNameInResponse(
+            response,
+            declaredWireToolNames,
+            declaredNamelessClientCallTypes,
+            providerExecutedCallTypes,
+          ) !== undefined
         ) {
           return;
         }
@@ -3164,7 +3250,7 @@ async function handleResponsesInner(
         ? request.usageLog.inputTokens
         : undefined;
       if (passthroughEstimate !== undefined) logCtx.usageLogInputTokens = passthroughEstimate;
-      outboundRequestBody = parseOutboundRequestBody(request.body);
+      refreshUndeclaredToolGuard(request);
       logCtx.providerAdapter = retryAdapter.name;
       sealRequestAttemptIdentity(
         logCtx.activeAttempt,
@@ -3274,6 +3360,7 @@ async function handleResponsesInner(
         const msg = err instanceof Error ? err.message : String(err);
         return formatErrorResponse(400, "invalid_request_error", redactSecretString(msg));
       }
+      refreshUndeclaredToolGuard(request);
       try {
         upstreamResponse = await fetchWithTransientRetry(
           recovery => {
@@ -3425,6 +3512,7 @@ async function handleResponsesInner(
           authCtx = retry.authCtx;
           request = retry.request;
           refreshRoutedNamespaceToolAliases(request);
+          refreshUndeclaredToolGuard(request);
           upstreamResponse = retry.upstreamResponse;
           selectedForwardHeaders = retry.selectedForwardHeaders;
           // Keep subagent quota-failure health keyed to the account that actually served.
@@ -3463,13 +3551,21 @@ async function handleResponsesInner(
     const passthroughCt = headers.get("content-type")?.toLowerCase();
     const isEventStream = passthroughCt?.includes("text/event-stream")
       || (upstreamResponse.ok && !!upstreamResponse.body && !passthroughCt && parsed.stream);
-    const terminalRecorder = codexForwardTerminalOutcomeRecorder(
+    const recordTerminalOutcome = codexForwardTerminalOutcomeRecorder(
       config,
       authCtx,
       route.provider,
       route.modelId,
       logCtx,
     );
+    let terminalOutcomeRecorded = false;
+    const terminalRecorder = recordTerminalOutcome
+      ? (status: ResponsesTerminalStatus, httpStatusOverride?: number): void => {
+        if (terminalOutcomeRecorded) return;
+        terminalOutcomeRecorded = true;
+        recordTerminalOutcome(status, httpStatusOverride);
+      }
+      : undefined;
     const terminalBodyWillRecord = !!terminalRecorder && upstreamResponse.ok && isEventStream;
     // Capture quota from upstream response for multi-account tracking
    if (usesCodexForwardPoolAuth(authCtx, route.provider)) {
@@ -3546,19 +3642,13 @@ async function handleResponsesInner(
         options.onConsumedComboFailure?.(failure);
         return failure.response;
       }
-      // The plain passthrough error path has no bounded reader of its own: `.text()` attaches
-      // the reader only when it runs, so an abort landing between fetch resolution and that
-      // call orphans Bun's internal read rejection (src/lib/abort.ts).
-      const detachPassthroughErrorGuard = cancelBodyOnAbort(upstreamResponse.body, upstream.signal);
-      try {
-        const errorText = await upstreamResponse.text().catch(() => "");
-        return formatPassthroughUpstreamError(upstreamResponse.status, errorText, {
-          statusText: upstreamResponse.statusText,
-          headers,
-        });
-      } finally {
-        detachPassthroughErrorGuard();
-      }
+      // The bounded reader owns the original body, deadline, abort settlement, and lock.
+      // Unsafe partial data falls back to #452's non-empty status-only JSON.
+      const errorText = await readDisplaySafeErrorText(upstreamResponse, upstream.signal, "");
+      return formatPassthroughUpstreamError(upstreamResponse.status, errorText, {
+        statusText: upstreamResponse.statusText,
+        headers,
+      });
     }
 
     // Bun#32111 workaround: passthrough SSE uses tee()+native relay to avoid the
@@ -3641,7 +3731,11 @@ async function handleResponsesInner(
         // Last: every rewrite above can still rename or reshape a call item, so the guard must
         // compare the names the client will actually receive against the declared catalog.
         undeclaredToolGuardActive
-          ? createUndeclaredToolCallGuardBlockRewrite(declaredWireToolNames)
+          ? createUndeclaredToolCallGuardBlockRewrite(
+            declaredWireToolNames,
+            declaredNamelessClientCallTypes,
+            providerExecutedCallTypes,
+          )
           : undefined,
       ].filter((rewrite): rewrite is NonNullable<typeof rewrite> => rewrite !== undefined);
       const clientBlockRewrite = blockRewrites.length > 0
@@ -3858,7 +3952,12 @@ async function handleResponsesInner(
       if (undeclaredToolGuardActive) {
         const undeclared = (() => {
           try {
-            return undeclaredToolCallNameInResponse(JSON.parse(clientJson), declaredWireToolNames);
+            return undeclaredToolCallNameInResponse(
+              JSON.parse(clientJson),
+              declaredWireToolNames,
+              declaredNamelessClientCallTypes,
+              providerExecutedCallTypes,
+            );
           } catch {
             return undefined;
           }
@@ -4362,9 +4461,11 @@ async function handleResponsesInner(
       );
       const bridgeTurnAc = new AbortController();
       const trackedSse = trackStreamLifetime(sseStream, bridgeTurnAc, undefined, options.turnAdmissionLease);
-      return new Response(trackedSse, {
+      const response = new Response(trackedSse, {
         headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" },
       });
+      runTurnAdapterSseResponses.add(response);
+      return response;
     }
 
     await runTurn();
@@ -4827,14 +4928,16 @@ async function handleResponsesInner(
         options.onConsumedComboFailure?.(failure);
         return failure.response;
       }
-      // The plain error path has no bounded reader of its own: `.text()` attaches the reader
-      // only when it runs, so an abort landing between fetch resolution and that call orphans
-      // Bun's internal read rejection — the uncatchable teardown `cancelBodyOnAbort` absorbs
-      // (src/lib/abort.ts). Found while investigating #1419; not a fix for the native trap.
-      const detachErrorBodyGuard = cancelBodyOnAbort(upstreamResponse.body, upstream.signal);
-      const errorText = await upstreamResponse.text().catch(() => "unknown error");
-      detachErrorBodyGuard();
-      cleanupUpstreamAbort();
+      let errorText: string;
+      try {
+        errorText = await readDisplaySafeErrorText(
+          upstreamResponse,
+          upstream.signal,
+          "unknown error",
+        );
+      } finally {
+        cleanupUpstreamAbort();
+      }
       if (!isFixedCodexAccount(authCtx)) {
         recordSubagentQuotaFailureForThreadSpawn(
           req.headers,
@@ -5125,12 +5228,7 @@ async function handleResponsesInner(
     }
 
     if (!response.ok) {
-      // Same pre-read guard as the initial response's error branch: a non-2xx continuation body
-      // is still a Bun fetch body, and an abort landing before `.text()` attaches its reader
-      // orphans the internal rejection.
-      const detachContinuationErrorGuard = cancelBodyOnAbort(response.body, upstream.signal);
-      const errorText = await response.text().catch(() => "unknown error");
-      detachContinuationErrorGuard();
+      const errorText = await readDisplaySafeErrorText(response, upstream.signal, "unknown error");
       yield {
         type: "error",
         status: response.status,

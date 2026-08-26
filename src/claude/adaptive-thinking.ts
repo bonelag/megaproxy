@@ -39,10 +39,10 @@ const ADAPTIVE_THINKING_FAMILY_MINIMUMS: Record<string, readonly [major: number,
  * suffixed ids ("claude-opus-4-8[1m]") still match.
  */
 export function claudeFamilyVersion(modelId: string): { family: string; major: number; minor: number } | undefined {
-  const match = /(?:^|\/)claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?!\d)/.exec(modelId);
+  const match = /(?:^|\/)claude-([a-z]+)-(\d+)(?:[.-](\d{1,2}))?(?!\d)/i.exec(modelId);
   if (!match) return undefined;
   return {
-    family: match[1]!,
+    family: match[1]!.toLowerCase(),
     major: Number(match[2]),
     minor: match[3] === undefined ? 0 : Number(match[3]),
   };

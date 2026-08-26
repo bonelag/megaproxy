@@ -39,6 +39,22 @@ executor contract. Main-request migration must not treat that branch as fixed-tr
 provider, lets the selected adapter speak the upstream protocol, then bridges adapter events back to
 Responses-compatible streaming output.
 
+### Fetch-helper import boundary
+
+`src/server/responses/fetch-helpers.ts` is a transport leaf shared by Responses, compact, and native
+Chat. Its runtime imports are limited to the Codex WebSocket transport, provider request pacing, and
+the upstream HTTP-version helper. Server, provider, and WebSocket data types remain type-only edges.
+It must not import routing, combos, OAuth, adapters, sidecars, response parsing, logging, or relay
+modules merely because those imports existed in the pre-split `responses.ts` monolith.
+
+[Decision Log]
+- 목적과 의도: Keep transport helpers reusable without making every consumer evaluate the full routed Responses and sidecar graph at module load.
+- 기존 구현 및 제약 조건: The original `responses.ts` split copied the monolith import header into `fetch-helpers.ts`; seven helper exports therefore retained 39 distinct runtime import specifiers and reached 326 modules even though the implementations used only three runtime dependencies.
+- 검토한 주요 대안: Leave the imports because current modules have limited top-level side effects; move the helpers again; prune the copied imports and lock the direct runtime boundary.
+- 선택한 방식: Preserve the file and all public exports, remove unused runtime edges, and enforce an explicit three-specifier allowlist with a source-level regression that also proves type-only imports are ignored.
+- 다른 대안 대신 이 방식을 선택한 이유: Relying on unrelated modules to remain side-effect-free makes startup ownership accidental, while another move adds churn without changing the responsibility boundary.
+- 장점, 단점 및 영향: Ordinary native Chat and compact consumers no longer load unrelated routing, combo, OAuth, web-search, vision, and relay modules through this leaf. The allowlist is intentionally strict, so a future helper that needs a new runtime dependency must make that ownership decision explicit in code, tests, and this document.
+
 [Decision Log]
 - 목적과 의도: Prevent routed models from turning invented or neighboring-agent tool names into client-executable Responses calls.
 - 기존 구현 및 제약 조건: The request catalog already controlled custom-tool restoration and the non-OpenAI prompt nudge, but an undeclared upstream name still fell through as an ordinary `function_call`; Codex then reduced the mismatch to a bare `aborted` result.
@@ -475,14 +491,16 @@ configurable via `stallTimeoutSec`, checked on the 2 s heartbeat tick) closes th
 `response.incomplete` / `upstream_stall_timeout` and cancels the upstream request if no real
 adapter events arrive. Adapter-yielded `{ type: "heartbeat" }` events DO reset the watchdog.
 
-Top-level `emptyCompletionRetry: true` opts Responses turns into one identical replay when a
-successful upstream completion contains neither output text nor a tool call. The default is off
-because the replay may be billable; `OCX_EMPTY_COMPLETION_RETRY=0` is a disable-only emergency
-override. Streaming and buffered HTTP adapters plus `runTurn` transports share the same guard,
-while combo attempts and routed compaction stay excluded. Pre-content reasoning is retained under
-named event-count and byte caps and emits liveness heartbeats while held. A second empty result or
-retry failure becomes typed 502 `empty_completion_retry_failed`; usage is merged across sends, and
-the Logs attempt records recovery kind `empty-completion`.
+Top-level `emptyCompletionRetry: true` opts Responses turns into one identical replay when an
+upstream turn produces neither output text nor a tool call, including a stream that ends before a
+terminal event. A terminal-less stream is replayed only before actionable output; post-output EOF
+remains incomplete so text or tool calls cannot be duplicated. The default is off because the replay
+may be billable; `OCX_EMPTY_COMPLETION_RETRY=0` is a disable-only emergency override. Streaming and
+buffered HTTP adapters plus `runTurn` transports share the same guard, while combo attempts and
+routed compaction stay excluded. Pre-content reasoning is retained under named event-count and byte
+caps and emits liveness heartbeats while held. A second empty result or retry failure becomes typed
+502 `empty_completion_retry_failed`; usage is merged across sends, and the Logs attempt records
+recovery kind `empty-completion`.
 
 The web-search loop requests `stream: true` for every routed-model iteration, but buffers the events
 needed to decide whether to intercept a synthetic search call. Text explicitly phased as
@@ -1140,6 +1158,39 @@ combo whose remaining eligible targets use other providers.
 - 선택한 방식: Use the narrow request-scoped deferral while retaining target cooldown and all explicit Retry-After/default account cooldown behavior.
 - 다른 대안 대신 이 방식을 선택한 이유: Reset timestamps identify quota windows rather than a literal account-wide retry instruction, but widening the exception would risk hot retries and provider abuse.
 - 장점, 단점 및 영향: Same-account model fallback works without weakening explicit upstream backoff; the account health map intentionally does not remember that one deferred reset-derived failure, while the combo target map does.
+```
+
+## Combo streaming commit boundary
+
+An HTTP 200 does not by itself commit a streaming combo child. The combo parent runs the child's
+downstream Responses SSE through `src/server/responses/combo-stream-preflight.ts`, which owns one
+reader and buffers only until one of these boundaries:
+
+- a non-control Responses event begins client-visible output or a tool/action item, after which the
+  target is committed and cross-target replay is forbidden;
+- a `response.failed` terminal arrives first, in which case the terminal is converted back through
+  the ordinary bounded combo-failure classifier and may advance to the next declared target;
+- a completed/incomplete terminal or the aggregate preflight byte cap is reached, in which case the
+  current target is committed conservatively.
+
+The buffered bytes are replayed unchanged before the reader continues. Native passthrough and eager
+relay identity markers are restored on the wrapped response so Windows/Bun stream paths and deferred
+logging retain their existing owners. A failed child keeps its physical attempt receipt and usage,
+while the successful child remains the logical request result.
+
+HTTP 410 remains terminal by default. It advances and cools only the exact combo target when the
+structured code or message explicitly identifies a model lifecycle event (end-of-life, retired,
+deprecated, sunset, decommissioned, or no longer available). An unrelated application-level 410 is
+not retried.
+
+```text
+[Decision Log]
+- 목적과 의도: Recover a failover combo from a provider-local SSE or model-lifecycle failure only while replay is provably free of duplicate client output and tool calls.
+- 기존 구현 및 제약 조건: The parent committed every HTTP-200 child before reading its SSE body, while terminal stream errors were classified only later by logging; generic 410 responses stopped the chain.
+- 검토한 주요 대안: Retry every failed stream, buffer the complete turn, inspect only HTTP status, or preflight a bounded prefix until an explicit output/terminal boundary.
+- 선택한 방식: Put the one-reader bounded preflight in a dedicated module, commit on any non-control event, and treat only explicit model-lifecycle 410 evidence as target-local.
+- 다른 대안 대신 이 방식을 선택한 이유: Replaying after output can duplicate text or tools, full-turn buffering destroys streaming and grows memory, and making every 410 retryable hides caller/application errors.
+- 장점, 단점 및 영향: Zero-output provider failures can reach a healthy target with ordered receipts and cooldown; ambiguous or oversized pre-output streams keep the current fail-closed behavior instead of consuming unbounded memory.
 ```
 
 ## Transport inventory

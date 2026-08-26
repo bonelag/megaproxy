@@ -19,6 +19,7 @@ import {
   awaitThoughtSignatureDurability,
 } from "./responses/thought-signature-replay";
 import { resolveStallTimeoutSec } from "./stall-timeout";
+import { normalizeDeclaredToolName } from "./types";
 import { usageDisplayTotalTokens } from "./usage/totals";
 import { appendSafeWebSearchSource, safeWebSearchSources } from "./web-search/sources";
 import {
@@ -627,6 +628,7 @@ export function bridgeToResponsesSSE(
         const argsStr = coerceIntegerToolArguments(
           currentToolCall.args || "{}",
           options?.toolParameterSchemas?.get(currentToolCall.name),
+          currentToolCall.namespace === undefined ? currentToolCall.name : undefined,
         );
         // Finalize streamed function-call arguments so Codex commits the call (incl. MCP / computer_use).
         if (!currentToolCall.freeform && !currentToolCall.toolSearch) {
@@ -1040,13 +1042,14 @@ export function bridgeToResponsesSSE(
                 rememberReasoningForCall(event.id, rawReasoningForNextToolCall, replayCacheScope);
               }
               if (currentToolCall) closeCurrentToolCall();
-              const mapped = toolNsMap?.get(event.name);
-              const realName = mapped?.name ?? event.name;
-              if (options?.declaredToolNames && !options.declaredToolNames.has(event.name)) {
+              const effectiveName = normalizeDeclaredToolName(event.name, options?.declaredToolNames);
+              const mapped = toolNsMap?.get(effectiveName);
+              const realName = mapped?.name ?? effectiveName;
+              if (options?.declaredToolNames && !options.declaredToolNames.has(effectiveName)) {
                 const failure = responseError(
                   502,
                   "upstream_error",
-                  `routed provider emitted undeclared client tool "${event.name}"; only request-declared tools may be called`,
+                  `routed provider emitted undeclared client tool "${effectiveName}"; only request-declared tools may be called`,
                 );
                 emit("response.failed", {
                   response: {
@@ -1659,6 +1662,7 @@ function buildResponseJSONWithBudget(
     const coercedArgs = coerceIntegerToolArguments(
       currentToolCallArgs,
       options?.toolParameterSchemas?.get(currentToolCallName),
+      ns === undefined ? realName : undefined,
     );
     // Freeform tools serialize as custom_tool_call without extra_content; remember the
     // signature server-side regardless so the replayed call can be re-signed (#1735).
@@ -1781,7 +1785,7 @@ function buildResponseJSONWithBudget(
           ));
         }
         break;
-      case "tool_call_start":
+      case "tool_call_start": {
         if (currentText) flushText("commentary");
         if (currentSummaryReasoning) flushSummaryReasoning();
         if (currentRawReasoning) flushRawReasoning();
@@ -1789,10 +1793,11 @@ function buildResponseJSONWithBudget(
           rememberReasoningForCall(e.id, rawReasoningForNextToolCall, replayCacheScope);
         }
         flushToolCall();
-        if (options?.declaredToolNames && !options.declaredToolNames.has(e.name)) {
+        const effectiveName = normalizeDeclaredToolName(e.name, options?.declaredToolNames);
+        if (options?.declaredToolNames && !options.declaredToolNames.has(effectiveName)) {
           errorEvent = {
             type: "error",
-            message: `routed provider emitted undeclared client tool "${e.name}"; only request-declared tools may be called`,
+            message: `routed provider emitted undeclared client tool "${effectiveName}"; only request-declared tools may be called`,
             status: 502,
             errorType: "upstream_error",
           };
@@ -1800,11 +1805,12 @@ function buildResponseJSONWithBudget(
         }
         currentToolCallId = e.id;
         budget?.openCall(e.id);
-        currentToolCallName = e.name;
+        currentToolCallName = effectiveName;
         currentToolCallArgs = "";
         currentToolCallArgsBytes = 0;
         currentToolCallProviderMetadata = e.providerMetadata;
         break;
+      }
       case "tool_call_delta":
         {
           ({ value: currentToolCallArgs, bytes: currentToolCallArgsBytes } = appendBatchString(
