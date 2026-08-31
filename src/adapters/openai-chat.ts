@@ -8,10 +8,12 @@ import { isDebugEnabled } from "../lib/debug-settings";
 import { isCyberPolicyCode } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
 import { contentPartsToText } from "./image";
+import { EMPTY_TOOL_OUTPUT_ANNOTATION, isWhitespaceOnlyTextPartArray } from "./empty-tool-output-annotation";
 import { identifyRoutedModel } from "./identity";
 import { peekReasoningForCall } from "../responses/reasoning-replay-cache";
 import { buildNonOpenAIToolCatalogNudgeForTools, shouldInjectNonOpenAIToolCatalogNudge } from "./tool-catalog-nudge";
 import { openRouterProviderPayload, resolveOpenRouterRouting } from "../providers/openrouter-routing";
+import { resolveVercelGatewayRouting, vercelGatewayProviderPayload } from "../providers/vercel-gateway-routing";
 import {
   canForwardForeignServiceTierForChatModel,
   fastPolicyForModel,
@@ -26,6 +28,7 @@ import {
 } from "../providers/fastwire";
 import { openaiChatCompletionsUrl } from "./openai-chat-url";
 import { stripResponsesOnlyEncryptedMarker } from "./responses-tool-schema";
+import { agentRouterDefaultHeaders, frameAgentRouterMessages } from "./agentrouter";
 import {
   isXaiSchemaTarget,
   lookupLocalJsonPointer,
@@ -89,7 +92,10 @@ function openAIChatTransport(provider: OcxProviderConfig): {
   if ((provider.authMode === "key" || provider.authMode === "oauth") && !provider.keyOptional && !hasCredential) {
     throw new Error(`${provider.adapter} requires a non-empty credential (authMode: ${provider.authMode})`);
   }
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...agentRouterDefaultHeaders(provider.baseUrl, provider.headers),
+  };
   if (hasCredential) headers.Authorization = `Bearer ${provider.apiKey}`;
   applyProviderHeaders(headers, provider);
   return { url: openaiChatCompletionsUrl(provider.baseUrl), headers, hasCredential };
@@ -113,7 +119,7 @@ export function buildOpenAIChatPassthroughRequest(
 
   const body: Record<string, unknown> = {
     model: provider.modelSuffixBracketStrip ? stripBracketedModelSuffix(modelId) : modelId,
-    messages: rawBody.messages,
+    messages: frameAgentRouterMessages(provider.baseUrl, rawBody.messages),
     stream,
   };
   for (const field of CHAT_PASSTHROUGH_FIELDS) {
@@ -122,6 +128,8 @@ export function buildOpenAIChatPassthroughRequest(
 
   const openRouterRouting = resolveOpenRouterRouting(provider, modelId);
   if (openRouterRouting) body.provider = openRouterProviderPayload(openRouterRouting);
+  const vercelRouting = resolveVercelGatewayRouting(provider, modelId);
+  if (vercelRouting) body.provider = vercelGatewayProviderPayload(vercelRouting);
 
   if (modelInList(provider.noTemperatureModels, modelId)) delete body.temperature;
   if (modelInList(provider.noTopPModels, modelId)) delete body.top_p;
@@ -590,9 +598,22 @@ function isNativeOpenAIChatTarget(provider: OcxProviderConfig): boolean {
  * being flattened to the "[image]" marker the model can't actually see. Data URLs and remote https
  * URLs are both valid in image_url.url, unlike Gemini inline_data which needs base64.
  */
-function toolResultTextForWire(content: string | OcxContentPart[]): string {
-  if (typeof content === "string") return content;
+function toolResultTextForWire(content: string | OcxContentPart[], annotateEmpty = false): string {
+  // An empty content array is a present-but-empty result; `contentPartsToText` would
+  // otherwise fall back to the "[image]" marker and hide the emptiness from the model.
+  if (annotateEmpty && Array.isArray(content) && content.length === 0) return EMPTY_TOOL_OUTPUT_ANNOTATION;
+  if (typeof content === "string") {
+    if (annotateEmpty && content.trim() === "") return EMPTY_TOOL_OUTPUT_ANNOTATION;
+    return content;
+  }
   const text = content.filter((p) => p.type === "text").map((p) => (p as OcxTextContent).text).join("");
+  // A whitespace-only text-part array is the array twin of a blank string; the
+  // shared emptiness contract (same module as the Responses adapter) annotates it
+  // instead of forwarding whitespace the model silently accepts. Image parts and
+  // any other non-text part keep the array non-empty.
+  if (annotateEmpty && isWhitespaceOnlyTextPartArray(content)) {
+    return EMPTY_TOOL_OUTPUT_ANNOTATION;
+  }
   if (text) {
     const untransportableImages = content.filter((p) => p.type === "image" && !p.imageUrl).length;
     return `${text}${"[image]".repeat(untransportableImages)}`;
@@ -779,7 +800,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           out.push({
             role: "tool",
             tool_call_id: toolCallId,
-            content: toolResultTextForWire(msg.content),
+            content: toolResultTextForWire(msg.content, provider.annotateEmptyToolOutputs === true),
           });
           pendingToolResultImageParts.push(...toolResultImageChatParts(msg.content));
           pendingToolCalls.splice(matchIdx, 1);
@@ -824,7 +845,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           out.push({
             role: "tool",
             tool_call_id: toolCallId,
-            content: toolResultTextForWire(msg.content),
+            content: toolResultTextForWire(msg.content, provider.annotateEmptyToolOutputs === true),
           });
           pendingToolResultImageParts.push(...toolResultImageChatParts(msg.content));
           flushToolResultImages();
@@ -1115,7 +1136,8 @@ function intersectBound(target: unknown, sibling: unknown, direction: "max" | "m
  * Compose two `properties` maps. A property named in BOTH the referenced target and the
  * node is the same conjunction problem `required` had: letting the sibling win discards
  * the target's constraints for that member. Merge the two member schemas so neither side
- * loses its keywords, and let the node narrow on a genuine conflict.
+ * loses its keywords. Shared member bounds are the same conjunction one level down,
+ * and nested object members recurse through this helper instead of replacing the target.
  */
 function composeProperties(
   target: Record<string, unknown>,
@@ -1129,7 +1151,20 @@ function composeProperties(
       const member: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
       for (const [k, v] of Object.entries(existing)) member[k] = v;
       for (const [k, v] of Object.entries(sub)) {
-        member[k] = k === "required" ? unionRequired(member[k], v) : v;
+        if (k === "required") {
+          member[k] = unionRequired(member[k], v);
+          continue;
+        }
+        if (k === "properties" && isXaiObjectSchema(member[k]) && isXaiObjectSchema(v)) {
+          member[k] = composeProperties(member[k] as Record<string, unknown>, v);
+          continue;
+        }
+        const boundDirection = MOONSHOT_BOUND_KEYWORDS[k];
+        if (boundDirection && k in member) {
+          member[k] = intersectBound(member[k], v, boundDirection);
+          continue;
+        }
+        member[k] = v;
       }
       combined[name] = member;
       continue;
@@ -1367,7 +1402,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
 
     buildRequest(parsed: OcxParsedRequest) {
       const { url, headers, hasCredential } = openAIChatTransport(provider);
-      const messages = messagesToChatFormat(parsed, provider);
+      const messages = frameAgentRouterMessages(provider.baseUrl, messagesToChatFormat(parsed, provider));
       const tools = toolsToChatFormatForProvider(parsed, provider);
       const toolChoice = toolChoiceToChatFormat(parsed.options.toolChoice, parsed.context.tools, provider);
 
@@ -1394,6 +1429,8 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const maxTokens = resolveMaxTokens(provider, parsed);
       const openRouterRouting = resolveOpenRouterRouting(provider, parsed.modelId);
       if (openRouterRouting) body.provider = openRouterProviderPayload(openRouterRouting);
+      const vercelRouting = resolveVercelGatewayRouting(provider, parsed.modelId);
+      if (vercelRouting) body.provider = vercelGatewayProviderPayload(vercelRouting);
       if (tools) body.tools = tools;
       if (tools && toolChoice !== undefined) {
         body.tool_choice = modelInList(provider.autoToolChoiceOnlyModels, parsed.modelId)

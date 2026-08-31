@@ -2,7 +2,20 @@
 import { loadConfig } from "../config";
 import { providerCodexAccountMode } from "../providers/registry";
 import type { OcxConfig } from "../types";
-import { cmdAddKey, cmdAlias, cmdAutoSwitch, cmdClearCooldown, cmdImport, cmdPriority, cmdRefresh, cmdRemove } from "./account-extended";
+import {
+  cmdAddKey,
+  cmdAlias,
+  cmdAutoSwitch,
+  cmdClearCooldown,
+  cmdImport,
+  cmdPause,
+  cmdPauseExhausted,
+  cmdPriority,
+  cmdRefresh,
+  cmdRemove,
+  cmdSticky,
+  cmdStrategy,
+} from "./account-extended";
 import { apiError, apiJson, classifyAccount, fetchRows, proxyUnreachable, resolveBaseUrl, type AccountDeps, type AccountRow, type AccountType, type ApiResult }
   from "./account-api";
 
@@ -12,8 +25,19 @@ type TargetProvenance = "live-oauth-list" | "config" | "codex";
 
 const MAIN_ALIAS = "main";
 const MAIN_CODEX_ID = "__main__";
-/** Replacement-style single-slot OAuth (no stable identity; not HTTP-derivable). */
-const REPLACEMENT_STYLE_OAUTH = new Set(["kiro"]);
+/**
+ * Replacement-style single-slot OAuth (no stable identity; not HTTP-derivable).
+ *
+ * Empty since `d82b3049d` gave Kiro a quota-aware account pool: multiple Kiro accounts are
+ * stored under multiauth, ranked by remaining headroom in `rankAccountsByHeadroom`, and
+ * rotated on 429 by the generic OAuth failover path, which does not exclude Kiro. Printing a
+ * "single login slot" note alongside a list of several pooled accounts told operators the
+ * opposite of what the runtime does.
+ *
+ * Kept as a named seam rather than deleted: the replacement-style shape is a real category,
+ * and a future provider without stable per-account identity belongs here.
+ */
+const REPLACEMENT_STYLE_OAUTH = new Set<string>();
 
 const ACCOUNT_USAGE = `Usage:
   ocx account list [provider] [--json] [--all] [--quota [--refresh]]
@@ -23,6 +47,11 @@ const ACCOUNT_USAGE = `Usage:
   ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]
   ocx account alias <provider> <account-or-key-id> <display-name|-> [--json]
   ocx account priority <provider> <account-id|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
+  ocx account pause <provider> <account-id|main> [--json]
+  ocx account resume <provider> <account-id|main> [--json]
+  ocx account pause-exhausted <provider> [--json]
+  ocx account strategy <provider> [<quota|round-robin|fill-first>] [--json]
+  ocx account sticky <provider> [<1-100>] [--json]
   ocx account remove <provider> <account-or-key-id|main> --yes [--json]
   ocx account clear-cooldown <provider> <account-id|main> [--json]
   ocx account add-key <provider> [--label <label>] [--json]
@@ -64,6 +93,10 @@ function displayId(id: string): string {
 
 function statusText(row: AccountRow): string {
   const parts: string[] = [];
+  // `paused` leads, and does NOT replace `selected`. A paused-but-selected account is the
+  // state an operator most needs named -- requests route to it while the pool believes it is
+  // held out -- so printing only one of the two would hide exactly the confusing case (#2703).
+  if (row.paused) parts.push("paused");
   if (row.active) parts.push(row.type === "codex" ? "selected" : "active");
   if (row.needsReauth) parts.push("needs-reauth");
   return parts.join(" ");
@@ -89,6 +122,9 @@ function quotaText(row: AccountRow): string {
   const short = quota.fiveHourPercent ?? quota.shortPercent;
   if (typeof short === "number") parts.push(`5h ${short}%`);
   if (typeof quota.weeklyPercent === "number") parts.push(`wk ${quota.weeklyPercent}%`);
+  // Kiro bills a monthly allowance and reports no shorter window, so without this arm a
+  // perfectly healthy Kiro account prints "-" and reads as broken.
+  if (typeof quota.monthlyPercent === "number") parts.push(`mo ${Math.round(quota.monthlyPercent)}%`);
   return parts.length > 0 ? parts.join(" ") : "-";
 }
 
@@ -150,8 +186,8 @@ async function cmdList(rest: string[], deps: AccountDeps): Promise<number> {
     };
     push("openai", "codex");
     const providersRes = await apiJson(deps, baseUrl, "GET", "/api/oauth/providers");
-    if (providersRes.status === 0) return proxyUnreachable();
-    if (providersRes.status !== 200) return apiError(providersRes.json, "failed to list OAuth providers");
+    if (providersRes.status === 0) return proxyUnreachable(providersRes.transportError);
+    if (providersRes.status !== 200) return apiError(providersRes.json, "failed to list OAuth providers", providersRes.status);
     if (Array.isArray(providersRes.json.providers)) {
       for (const p of providersRes.json.providers) {
         if (typeof p === "string") push(p, "live-oauth-list");
@@ -164,9 +200,10 @@ async function cmdList(rest: string[], deps: AccountDeps): Promise<number> {
   const notes: string[] = [];
   for (const t of targets) {
     const r = await fetchRows(deps, baseUrl, t.name, t.type, wantsQuota ? { refresh: refreshQuota } : undefined);
-    if (r.networkDown) return proxyUnreachable();
+    if (r.networkDown) return proxyUnreachable(r.transportError);
     if (r.errorJson) {
-      if (name) return apiError(r.errorJson, `failed to list ${t.name}`);
+      if (name) return apiError(r.errorJson, `failed to list ${t.name}`, r.status);
+
       const errorText = typeof r.errorJson.error === "string" ? r.errorJson.error : "";
       const skipUnknownKey = t.type === "api-key"
         && r.status === 404
@@ -176,7 +213,7 @@ async function cmdList(rest: string[], deps: AccountDeps): Promise<number> {
         && r.status === 400
         && errorText.includes("unknown oauth provider");
       if (skipUnknownKey || skipConfigOAuth) continue;
-      return apiError(r.errorJson, `failed to list ${t.name}`);
+      return apiError(r.errorJson, `failed to list ${t.name}`, r.status);
     }
     if (r.rows.length === 0) {
       if (showAll) notes.push(`${t.name}: no stored accounts or keys`);
@@ -222,8 +259,8 @@ async function cmdCurrent(rest: string[], deps: AccountDeps): Promise<number> {
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
   const r = await fetchRows(deps, baseUrl, name, c.type);
-  if (r.networkDown) return proxyUnreachable();
-  if (r.errorJson) return apiError(r.errorJson, `failed to read ${name}`);
+  if (r.networkDown) return proxyUnreachable(r.transportError);
+  if (r.errorJson) return apiError(r.errorJson, `failed to read ${name}`, r.status);
 
   const activeRow = r.rows.find(row => row.active) ?? null;
   if (wantsJson) {
@@ -277,8 +314,8 @@ async function cmdUse(rest: string[], deps: AccountDeps): Promise<number> {
     activeId = id;
     res = await apiJson(deps, baseUrl, "PUT", "/api/providers/keys/active", { name, id });
   }
-  if (res.status === 0) return proxyUnreachable();
-  if (res.status !== 200) return apiError(res.json, `failed to switch ${name}`);
+  if (res.status === 0) return proxyUnreachable(res.transportError);
+  if (res.status !== 200) return apiError(res.json, `failed to switch ${name}`, res.status);
 
   if (wantsJson) console.log(JSON.stringify({ ok: true, provider: name, type: c.type, activeId }, null, 2));
   else console.log(`${name}: active ${c.type === "api-key" ? "key" : "account"} is now ${displayId(activeId)}`);
@@ -302,6 +339,13 @@ export async function cmdAccount(args: string[], deps: AccountDeps = {}): Promis
     if (sub === "auto-switch") return await cmdAutoSwitch(rest, deps);
     if (sub === "alias" || sub === "rename") return await cmdAlias(rest, deps);
     if (sub === "priority") return await cmdPriority(rest, deps);
+    // #2702: the server routes existed and only the CLI caller was missing, so these were
+    // dashboard-only capabilities.
+    if (sub === "pause") return await cmdPause(rest, deps, true);
+    if (sub === "resume") return await cmdPause(rest, deps, false);
+    if (sub === "pause-exhausted") return await cmdPauseExhausted(rest, deps);
+    if (sub === "strategy") return await cmdStrategy(rest, deps);
+    if (sub === "sticky") return await cmdSticky(rest, deps);
     if (sub === "remove") return await cmdRemove(rest, deps);
     if (sub === "clear-cooldown") return await cmdClearCooldown(rest, deps);
     if (sub === "add-key") return await cmdAddKey(rest, deps);

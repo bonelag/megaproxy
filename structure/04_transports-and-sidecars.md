@@ -17,6 +17,44 @@ existing task. Explicit `ocx service install` remains the operator-owned registr
 - 다른 대안 대신 이 방식을 선택한 이유: Saved state can be stale and unconditional repair breaks first install, while a boolean cannot represent the exact uncertainty that must fail closed.
 - 장점, 단점 및 영향: Existing services avoid UAC and registration churn, invalid input performs no status I/O, and uncertain Windows hosts require one explicit status/installation decision instead of risking a destructive guess.
 
+## Windows startup ownership listing reuse
+
+One proxy startup asks service-home ownership twice before listen: once before cache invalidation and
+again immediately before native-main lifecycle preparation. The second targeted Task Scheduler query
+is a deliberate race check and remains mandatory. On a localized host, however, the same nonzero
+targeted answer can require a full task listing with a 20-second ceiling; running that identical
+enumeration twice made a measured 12.3-second fallback cost roughly 25 seconds before listen.
+
+[Decision Log]
+- 목적과 의도: Preserve the race-sensitive Windows ownership recheck while paying for an unchanged locale-neutral full task listing only once during synchronous startup.
+- 기존 구현 및 제약 조건: Localized `schtasks /query /tn ... /xml` failures need a full listing to prove absence, the listing may legitimately take more than two seconds, and `unknown` must never become `absent` merely to reduce latency.
+- 검토한 주요 대안: Delete the second ownership check; lower the listing timeout; keep a process-wide or TTL cache; reuse an earlier absence regardless of the fresh targeted result; or scope a memo to the two pre-listen checks and key it to the complete targeted result.
+- 선택한 방식: Create one cache inside `startServer`, run every targeted query, and reuse its listing result only when status, timeout/spawn flags, stdout, and stderr are byte-identical. Runtime ownership retries do not receive the startup cache.
+- 다른 대안 대신 이 방식을 선택한 이유: Removing or weakening revalidation widens the install race, while a global/TTL cache can outlive startup and stale absence can authorize the wrong home. Exact targeted-result identity lets the ordinary no-task locale fallback coalesce without hiding changed evidence.
+- 장점, 단점 및 영향: The reported stable zh-CN absence path performs two cheap targeted queries and one full listing. A task that appears is detected by the second targeted query; changed or failed evidence triggers a fresh fail-closed decision, so unusual churn may still pay for two listings rather than guess.
+
+## Linux stable service launcher
+
+Systemd installation resolves the first absolute `ocx` PATH candidate that is both a regular file
+and executable, keeps that path lexical so a version-manager shim remains an indirection, and
+records the same single resolution in the unit and service state. Unit construction never performs
+PATH discovery itself: callers provide either the resolved launcher or an explicit direct Bun/CLI
+fallback, keeping diagnostics and tests independent of the host PATH.
+
+Launcher mode omits the package-local Bun provenance pair because an upgrade may delete that
+versioned tree. The only runtime path carried through the launcher is a pre-Bun, proof-bound
+`OPENCODEX_BUN_PATH` whose durable runtime source is `override`; bundled and process fallbacks are
+rediscovered by the current launcher. The API-auth token remains file-backed and is loaded only by
+the service shell at start.
+
+[Decision Log]
+- 목적과 의도: Keep systemd services upgrade-stable without losing an explicitly trusted Bun override or accepting a non-executable PATH placeholder.
+- 기존 구현 및 제약 조건: Version managers replace package trees but retain lexical shims; Bun dotenv makes ambient override values untrustworthy unless the Node launcher already stamped matching runtime provenance.
+- 검토한 주요 대안: Bake the package Bun and CLI forever; resolve the shim target; accept the first existing PATH entry; drop every runtime override in launcher mode; or preserve only a proof-bound override.
+- 선택한 방식: Require a regular executable lexical launcher, resolve it once during installation, preserve only `durableBunRuntime().source === "override"`, and keep token loading in the existing file-backed shell preamble.
+- 다른 대안 대신 이 방식을 선택한 이유: Resolving or pinning package paths recreates upgrade restart loops, existence-only selection can name a directory or non-executable file, and dropping a trusted override silently changes an operator's runtime.
+- 장점, 단점 및 영향: Mise/asdf-style upgrades keep working and explicit Bun selection survives; source installs still use the direct pair, while a removed or non-executable launcher requires `ocx service repair`.
+
 ## Provider diagnostic outbound safety
 
 Provider connection tests and live model discovery share the GET-only provider outbound wrapper.
@@ -1092,6 +1130,21 @@ the shared Ark hostname is too broad because the two endpoint families reject op
 - 장점, 단점 및 영향: Coding Plan regains its accepted continuation shape without changing generic providers; any future Ark endpoint family must provide evidence before inheriting the pay-as-you-go quirk.
 
 ## Chat structured-output compatibility
+
+First-party Kimi and Moonshot Chat destinations normalize a `$ref` with sibling keywords because
+their wire rejects that valid JSON Schema 2020-12 shape. Inlining preserves conjunction semantics:
+`required` members are unioned, lower numeric bounds take the maximum, upper numeric bounds take the
+minimum, and overlapping `properties` recurse with the same rules. The walk remains depth-, node-,
+and expansion-bounded. Unresolvable or cyclic references keep the existing bare-`$ref` fallback,
+and unrelated OpenAI-compatible providers retain the caller's schema unchanged.
+
+[Decision Log]
+- 목적과 의도: Make Moonshot's compatibility rewrite remove rejected sibling `$ref` shapes without silently weakening a tool schema.
+- 기존 구현 및 제약 조건: The target and sibling both apply under JSON Schema 2020-12, but a shallow shared-property merge let sibling bounds replace stricter target bounds; Moonshot still requires the local bounded rewrite.
+- 검토한 주요 대안: Keep shallow sibling precedence; emit `allOf`; intersect only top-level bounds; recursively compose the supported set-valued and ordered assertions.
+- 선택한 방식: Reuse the existing bound and required intersection rules recursively for overlapping object properties inside the first-party destination gate.
+- 다른 대안 대신 이 방식을 선택한 이유: Shallow precedence weakens constraints, while a new `allOf` wire shape needs separate provider evidence; recursive composition fixes the demonstrated loss without broadening normalization to custom providers.
+- 장점, 단점 및 영향: Looser siblings cannot relax nested constraints and tighter siblings still narrow them; non-ordered conflicting keywords retain the existing sibling precedence and are not treated as a complete JSON Schema algebra.
 
 The `openai-chat` adapter translates Responses `text.format` and Chat Completions
 `response_format` through one internal format, then emits `response_format` on the upstream chat

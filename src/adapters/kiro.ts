@@ -36,15 +36,18 @@ import type {
   OcxTool,
   OcxUsage,
 } from "../types";
+import { hasRecordedTrailingDeliveredFinalAnswer } from "../responses/turn-termination";
 import type { ProviderAdapter } from "./base";
 import type { AdapterFetchContext, AdapterRequest } from "./base";
 import { extractKiroImages, normalizeKiroImages, type KiroImage } from "./kiro-images";
 import { sniffImageDimensions } from "./anthropic-image-guard";
 import { fetchKiroWithRetry, noteKiroTransientThrottle } from "./kiro-retry";
 import { convertKiroToolContext } from "./kiro-tools";
+import { normalizeEmptyExecToolResultText } from "./exec-tool-result-normalize";
 import { identifyRoutedModel } from "./identity";
 import { buildNonOpenAIToolCatalogNudgeFromNames, isBareShellBridgeTool, isCodexCodeModeExecTool } from "./tool-catalog-nudge";
 import {
+  KIRO_ANSWER_DELIVERED_MESSAGE,
   KIRO_COMPLETION_INSTRUCTIONS,
   KIRO_COMPLETION_RETRY_MESSAGE,
   KIRO_COMPLETION_TOOL_NAME,
@@ -343,8 +346,54 @@ function validateKiroCapabilities(parsed: OcxParsedRequest): void {
 }
 
 type KiroTurn =
-  | { kind: "user"; content: string; images: KiroImage[]; toolResults: KiroToolResult[] }
-  | { kind: "assistant"; content: string; toolUses: KiroToolUse[]; redactedReasoning?: string };
+  | {
+      kind: "user";
+      content: string;
+      images: KiroImage[];
+      toolResults: KiroToolResult[];
+      /**
+       * True only for the proxy-generated acknowledgement that follows a delivered final answer.
+       * A flag rather than a content comparison: a real user message may legitimately quote the
+       * same sentence, and treating that as internal state would strip its thinking tags and
+       * completion retry.
+       */
+       answerDeliveredAck?: boolean;
+    }
+  | {
+      kind: "assistant";
+      content: string;
+      toolUses: KiroToolUse[];
+      redactedReasoning?: string;
+      /**
+       * True when this assistant turn was the DELIVERED final answer (Responses
+       * `phase: "final_answer"`). A trailing assistant turn normally means the model stopped
+       * mid-task and needs a continuation prompt, but a delivered final answer already ended its
+       * turn — prompting it again restarts finished work as if a goal were still open.
+       */
+      finalAnswer?: boolean;
+    };
+
+/**
+ * True when the LAST content-bearing message is an assistant final answer that closed its turn.
+ *
+ * Mirrors the turn-merge rule: a tool call in that message, or any later user/tool-result message,
+ * means work continued, so the turn is no longer terminal. Empty assistant messages are skipped
+ * rather than treated as continuation, since they carry no visible turn.
+ */
+function hasTrailingDeliveredFinalAnswer(messages: readonly OcxMessage[], parsed?: OcxParsedRequest): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== "assistant") return false;
+    const aMsg = msg as OcxAssistantMessage;
+    const hasToolCall = (aMsg.content ?? []).some(part => part.type === "toolCall");
+    if (hasToolCall) return false;
+    const hasText = (aMsg.content ?? []).some(part => part.type === "text" && part.text.trim());
+    if (!hasText) continue;
+    return aMsg.phase === "final_answer"
+      || (parsed !== undefined && hasRecordedTrailingDeliveredFinalAnswer(parsed, messages));
+  }
+  return false;
+}
 
 function appendTurnText(target: string, next: string): string {
   if (!next) return target;
@@ -420,14 +469,25 @@ function kiroCompletionTool(): Record<string, unknown> {
   return {
     toolSpecification: {
       name: KIRO_COMPLETION_TOOL_NAME,
-      description: "Finish the task and return the complete user-facing final answer. Call only when no more work or tool calls are needed.",
+      // The shared tool-catalog nudge enumerates this name next to ordinary tools and tells every
+      // listed name to count a call only after its tool result returns. Nothing returns a result
+      // here: a valid call becomes the turn's terminal. Left undescribed, the model reads one more
+      // deferrable work tool and keeps calling tools with a finished answer already written as
+      // commentary. So the description states the distinction, the obligation, and the terminality
+      // where the model is actually choosing between tools.
+      //
+      // It also has to name the blocked-on-user state, for the same reason the prose contract does.
+      // This is the surface the model reads while CHOOSING; if it admits only "fully complete", a
+      // model holding a question that blocks progress reads this tool as unavailable and keeps
+      // working instead, which is the measured defect. The two surfaces must not disagree.
+      description: "Terminal completion channel, not an ordinary work tool. When the task is fully complete and no more work or tool calls are needed, you must call this tool exactly once instead of providing the final answer as ordinary assistant text. Call it the same way when you cannot continue until the user supplies a decision, information, or a clarification that only they can give: the question itself is the answer. Put the complete user-facing final answer in `answer`. The call is complete when issued: it ends the turn, returns no tool result, and no text or tool call may follow it.",
       inputSchema: {
         json: {
           type: "object",
           properties: {
             answer: {
               type: "string",
-              description: "The complete final answer to show the user.",
+              description: "The complete final answer to show the user, or the blocking question you need the user to answer before you can continue.",
             },
           },
           required: ["answer"],
@@ -453,8 +513,19 @@ export function buildKiroPayload(
   const registry = createKiroToolNameRegistry();
   const toolContext = convertKiroToolContext(parsed, registry);
   const ordinaryTools = toolContext.tools;
+  // A turn whose history already ENDS with a delivered final answer has nothing to complete.
+  // Leaving completion "required" here would keep advertising codex_kiro_final_answer with its
+  // instructions, so the model answers again, or replies with ordinary text and trips the
+  // `needsFallback` retry, which ends its payload with KIRO_COMPLETION_RETRY_MESSAGE and reopens
+  // the finished task. Suppressing the mode is what actually closes that loop; the neutral
+  // acknowledgement below only stops the resume wording.
+  //
+  // Read from parsed messages because `completionMode` is needed to build the tool catalog, which
+  // happens before the turn list exists. `forcedCompletionMode` still wins: the fallback retry
+  // passes "text_fallback" explicitly and must not be silently downgraded.
+  const trailingDeliveredAnswer = hasTrailingDeliveredFinalAnswer(kiroPayloadMessages(parsed), parsed);
   const completionMode: KiroCompletionMode = forcedCompletionMode
-    ?? (ordinaryTools.length > 0 ? "required" : "disabled");
+    ?? (ordinaryTools.length > 0 && !trailingDeliveredAnswer ? "required" : "disabled");
   const kiroTools = completionMode === "disabled"
     ? ordinaryTools
     : [...ordinaryTools, kiroCompletionTool()];
@@ -521,15 +592,24 @@ export function buildKiroPayload(
       turns.push({ kind: "user", content, images: [...images], toolResults: [...toolResults] });
     }
   };
-  const pushAssistant = (content: string, toolUses: KiroToolUse[], redactedReasoning?: string): void => {
+  const pushAssistant = (content: string, toolUses: KiroToolUse[], redactedReasoning?: string, finalAnswer?: boolean): void => {
     const last = turns.at(-1);
     if (last?.kind === "assistant") {
       last.content = appendTurnText(last.content, content);
       last.toolUses.push(...toolUses);
       // Merged turns keep the newest blob: it covers the reasoning up to the merged turn's end.
       if (redactedReasoning) last.redactedReasoning = redactedReasoning;
+      // A merged turn is final only if its LAST component was: commentary appended after a final
+      // answer means the model kept working, so the turn is no longer terminal.
+      last.finalAnswer = finalAnswer === true;
     } else {
-      turns.push({ kind: "assistant", content, toolUses: [...toolUses], ...(redactedReasoning ? { redactedReasoning } : {}) });
+      turns.push({
+        kind: "assistant",
+        content,
+        toolUses: [...toolUses],
+        ...(redactedReasoning ? { redactedReasoning } : {}),
+        ...(finalAnswer ? { finalAnswer: true } : {}),
+      });
     }
   };
 
@@ -559,14 +639,24 @@ export function buildKiroPayload(
         const hasReasoning = aMsg.content.some(part => part.type === "thinking" && part.thinking.trim());
         if (hasReasoning) continue;
       }
-      pushAssistant(text, toolUses, aMsg.kiroRedactedReasoning);
+      // `phase` survives the Responses round trip (parser.ts assistant branch), so a replayed
+      // final answer is identifiable here rather than guessed from turn position.
+      pushAssistant(text, toolUses, aMsg.kiroRedactedReasoning, aMsg.phase === "final_answer" && toolUses.length === 0);
     } else if (msg.role === "toolResult") {
       const tr = msg as OcxToolResultMessage;
       if (tr.containsEncryptedContent) {
         throw new Error(`Kiro cannot translate encrypted output for tool call ${JSON.stringify(tr.toolCallId)}`);
       }
       const text = userContentText(tr.content);
-      const resultText = text.trim() ? text : KIRO_EMPTY_TOOL_RESULT_MESSAGE;
+      // An empty code-mode exec result needs the SPECIFIC reason, not the generic fallback: the
+      // model otherwise reads a blank result, concludes its earlier context was lost, and restarts
+      // the task instead of calling text()/notify(). Checked before `text.trim()` because the
+      // wrapper form ("Script completed\nWall time ...\nOutput:\n") is non-blank and would
+      // otherwise pass through as if it were real output.
+      const resultText = normalizeEmptyExecToolResultText(text, {
+        toolName: tr.toolName,
+        toolNamespace: tr.toolNamespace,
+      }) ?? (text.trim() ? text : KIRO_EMPTY_TOOL_RESULT_MESSAGE);
       const images = extractKiroImages(tr.content);
       const toolUseId = normalizeToolId(tr.toolCallId);
       if (!priorCalls.has(toolUseId)) {
@@ -587,12 +677,23 @@ export function buildKiroPayload(
   if (turns.length === 0 || turns[0].kind === "assistant") {
     turns.unshift({ kind: "user", content: KIRO_CONTINUATION_MESSAGE, images: [], toolResults: [] });
   }
-  if (turns.at(-1)?.kind === "assistant") {
+  // Kiro requires the request to end with a user turn, so a trailing assistant turn always gets
+  // one appended (the pop below throws otherwise). What that turn SAYS is the load-bearing part.
+  //
+  // Normally a trailing assistant turn means the model stopped mid-task, and a continuation/retry
+  // prompt is correct. A DELIVERED final answer is the exception: the turn already ended, and
+  // telling that model to "continue" or to call the completion tool again reopens finished work —
+  // the completed-task-behaves-like-an-open-goal loop. It gets a neutral acknowledgement instead:
+  // structurally valid, but carrying no instruction to resume.
+  const trailing = turns.at(-1);
+  if (trailing?.kind === "assistant") {
+    const resumeText = completionMode === "text_fallback" ? KIRO_COMPLETION_RETRY_MESSAGE : KIRO_CONTINUATION_MESSAGE;
     turns.push({
       kind: "user",
-      content: completionMode === "text_fallback" ? KIRO_COMPLETION_RETRY_MESSAGE : KIRO_CONTINUATION_MESSAGE,
+      content: trailing.finalAnswer ? KIRO_ANSWER_DELIVERED_MESSAGE : resumeText,
       images: [],
       toolResults: [],
+      ...(trailing.finalAnswer ? { answerDeliveredAck: true } : {}),
     });
   }
 
@@ -608,6 +709,8 @@ export function buildKiroPayload(
 
   const currentTurn = turns.pop();
   if (!currentTurn || currentTurn.kind !== "user") throw new Error("Kiro request must end with a user turn");
+  // Survives the pop as state, so the checks below never infer intent from user-supplied text.
+  const answerDeliveredAck = currentTurn.answerDeliveredAck === true;
   const toEntry = (turn: KiroTurn): KiroHistoryEntry => turn.kind === "assistant"
     ? {
         assistantResponseMessage: {
@@ -638,10 +741,17 @@ export function buildKiroPayload(
     currentUim.userInputMessageContext = { ...(currentUim.userInputMessageContext ?? {}), tools: kiroTools };
   }
   if (completionMode === "text_fallback") {
-    if (currentUim.content !== KIRO_COMPLETION_RETRY_MESSAGE) {
+    // Never append the retry instruction onto the answer-delivered acknowledgement: it exists
+    // precisely to avoid asking a finished turn for another completion call, and appending here
+    // would reinstate the loop it prevents.
+    if (currentUim.content !== KIRO_COMPLETION_RETRY_MESSAGE && !answerDeliveredAck) {
       currentUim.content = appendTurnText(currentUim.content, KIRO_COMPLETION_RETRY_MESSAGE);
     }
-  } else if (!currentUim.userInputMessageContext?.toolResults && currentUim.content !== KIRO_CONTINUATION_MESSAGE) {
+  } else if (
+    !currentUim.userInputMessageContext?.toolResults
+    && currentUim.content !== KIRO_CONTINUATION_MESSAGE
+    && !answerDeliveredAck
+  ) {
     currentUim.content = injectKiroThinkingTags(currentUim.content, parsed);
   }
 
@@ -961,6 +1071,27 @@ async function* parseKiroAttemptEvents(
   const emitRetained = async function* (events: Iterable<AdapterEvent>): AsyncGenerator<AdapterEvent> {
     for (const event of events) {
       try { yield event; } finally { retention.releaseEvent(event); }
+    }
+  };
+  // A valid private completion answer supersedes the progress prose staged during the SAME
+  // inference: Kiro emits answer-like text and then calls the completion tool, so releasing both
+  // makes the bridge close the commentary message and open a second one with near-identical text
+  // (#2819 follow-up). Consume the collection instead — drop the redundant text, keep every
+  // non-text event, and release retention either way.
+  //
+  // This is deliberately the ONLY suppression site. The outer drain in `parseKiroAttempt` is also
+  // the leftover flush for early terminal returns (stream, protocol, and provider failures), so
+  // teaching it to discard text would hide the only commentary a failed turn ever produced.
+  // Splicing here leaves that drain empty on the completion path and untouched everywhere else.
+  const consumeSupersededByCompletion = async function* (
+    events: AdapterEvent[],
+  ): AsyncGenerator<AdapterEvent> {
+    for (const event of events.splice(0)) {
+      try {
+        if (event.type !== "text_delta") yield event;
+      } finally {
+        retention.releaseEvent(event);
+      }
     }
   };
 
@@ -1367,12 +1498,15 @@ async function* parseKiroAttemptEvents(
     });
 
     if (mode === "required") {
-      yield* emitRetained(deferred.splice(0));
+      // A valid completion answer makes this inference's staged prose redundant; anything else
+      // still flushes exactly as before (bounded fallback, explicit stops, real tool calls).
+      if (completionAnswer !== undefined) yield* consumeSupersededByCompletion(deferred);
+      else yield* emitRetained(deferred.splice(0));
     }
 
     if (mode === "text_fallback") {
       if (completionAnswer !== undefined) {
-        yield* emitRetained(fallbackEvents);
+        yield* consumeSupersededByCompletion(fallbackEvents);
         yield { type: "text_delta", text: completionAnswer, phase: "final_answer" };
         return {
           assistantText,
@@ -1905,6 +2039,24 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
 
   return {
     name: "kiro",
+    // A replayed history that already ENDS with a delivered final answer has nothing to ask Kiro.
+    // Before this hook the adapter still appended a trailing user turn — a neutral acknowledgement,
+    // but structurally still a prompt — and performed a real inference, so the model answered the
+    // closed task again and the finished turn behaved like a still-open goal.
+    //
+    // Suppressing the completion contract (above) removed the instruction to complete; it could not
+    // remove the inference. This is the boundary: no request is built, nothing is sent, and no token
+    // estimate is recorded.
+    //
+    // The forced-fallback build is deliberately NOT consulted here: this hook runs on the inbound
+    // turn only, and the adapter-owned bounded retry passes "text_fallback" through `build`
+    // directly, never through this path.
+    localTerminal(parsed: OcxParsedRequest) {
+      return hasTrailingDeliveredFinalAnswer(kiroPayloadMessages(parsed), parsed)
+        ? { reason: "kiro_final_answer_already_delivered" }
+        : undefined;
+    },
+
     async buildRequest(parsed: OcxParsedRequest, incoming) {
       const built = await build(parsed);
       modelId = parsed.modelId;

@@ -23,7 +23,13 @@ import { isVertexTruncatedTurn, vertexTruncationErrorMessage } from "./google-tr
 import { ANTIGRAVITY_REQUEST_UA, antigravitySessionId, isLikelyRealThoughtSignature, sanitizeAntigravityClaudeSignatures } from "./google-antigravity-wire";
 import { compileGoogleWireBody } from "./google-wire-compiler";
 import { identifyRoutedModel } from "./identity";
-import { antigravityUsesReplayCache, applyAntigravityReplay, clearAntigravityReplay, observeAntigravityReplay } from "./google-antigravity-replay";
+import {
+  antigravityUsesReplayCache,
+  applyAntigravityReplay,
+  applyAntigravityThoughtSignatureFallback,
+  clearAntigravityReplay,
+  observeAntigravityReplay,
+} from "./google-antigravity-replay";
 import { resolveAntigravityEffortWireModel } from "../providers/antigravity-models";
 import { googleVertexLocationConfigError } from "../providers/google-vertex-location";
 import { forgetThoughtSignatureForReplay, lookupReplayThoughtSignature } from "../responses/thought-signature-replay";
@@ -48,6 +54,16 @@ const GOOGLE_BREVITY_INSTRUCTION = [
   "- Prefer taking the next tool action over explaining; keep calling tools until the task is complete.",
   "- This applies only to intermediate progress text. Your final answer after the work is done is exempt: write it in full and at whatever length the task requires.",
 ].join("\n");
+
+const ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH =
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+function stripAntigravityRejectedClaudeSdkParagraph(systemText: string): string {
+  return systemText
+    .split("\n\n")
+    .filter(paragraph => paragraph !== ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH)
+    .join("\n\n");
+}
 
 /**
  * Documented output ceiling for a Google-surface model, or `undefined` when the id is not
@@ -222,15 +238,19 @@ function geminiOrphanToolResultParts(msg: OcxToolResultMessage): unknown[] {
 function messagesToGeminiFormat(
   parsed: OcxParsedRequest,
   identityModelId: string,
+  stripRejectedClaudeSdkParagraph = false,
 ): { systemInstruction?: unknown; contents: unknown[]; replayedCallIds: string[] } {
   // Neutralize Codex's GPT-5 identity line (Gemini/Antigravity share this path) so a routed model
   // never misreports as GPT-5/OpenAI, and never leaks the proxy identity upstream.
   const toolCatalogNudge = buildNonOpenAIToolCatalogNudgeForTools(parsed.context.tools, parsed.options.toolChoice);
-  const systemText = identifyRoutedModel([
+  const identifiedSystemText = identifyRoutedModel([
     ...(parsed.context.systemPrompt ?? []),
     ...(toolCatalogNudge ? [toolCatalogNudge] : []),
     GOOGLE_BREVITY_INSTRUCTION,
   ].join("\n\n"), identityModelId);
+  const systemText = stripRejectedClaudeSdkParagraph
+    ? stripAntigravityRejectedClaudeSdkParagraph(identifiedSystemText)
+    : identifiedSystemText;
   const systemInstruction = { parts: [{ text: systemText }] };
 
   const contents: unknown[] = [];
@@ -728,7 +748,13 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           : resolveDirectGeminiWireModelId(parsed.modelId, provider.directGeminiWireRenames !== false);
       // AI Studio's `-tiered` spelling is wire-only; CCA aliases may migrate to another generation.
       const identityModelId = provider.googleMode === "cloud-code-assist" ? routedModelId : parsed.modelId;
-      const { systemInstruction, contents, replayedCallIds } = messagesToGeminiFormat(parsed, identityModelId);
+      const stripRejectedClaudeSdkParagraph = provider.googleMode === "cloud-code-assist"
+        && parsed.modelId === "gemini-3.7-flash";
+      const { systemInstruction, contents, replayedCallIds } = messagesToGeminiFormat(
+        parsed,
+        identityModelId,
+        stripRejectedClaudeSdkParagraph,
+      );
       lastInjectedCallIds = [...replayedCallIds];
       lastReasoningReplayScope = parsed._reasoningReplayScope;
       const tools = toolsToGeminiFormat(parsed);
@@ -827,6 +853,10 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           } else {
             sanitizeAntigravityClaudeSignatures(contents);
           }
+          // After replay, not instead of it: a real signature always wins, and the sentinel only
+          // fills a first functionCall that replay could not sign. Outside the cache branch too,
+          // because the turn still needs a signature when no session was ever recorded.
+          applyAntigravityThoughtSignatureFallback(wireModelId, contents);
           // Claude-on-Antigravity rejects assistant-tail (model-tail in Gemini terms) histories
           // as prefill: "This model does not support assistant message prefill. The conversation
           // must end with a user message." Context compaction, previous_response_id expansion,
@@ -871,6 +901,10 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           applyAntigravityReplay(
             vertexReplayModel,
             vertexReplaySession,
+            (compiled.body as { contents: unknown[] }).contents,
+          );
+          applyAntigravityThoughtSignatureFallback(
+            vertexReplayModel,
             (compiled.body as { contents: unknown[] }).contents,
           );
         }
