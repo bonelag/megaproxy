@@ -17,6 +17,7 @@
  */
 import { catalogModelEfforts, nativeEffortClamp, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type CatalogModel, type NativeContextLimitsInput } from "../codex/catalog";
 import { claudeCodeAlias, claudeCodeNativeAlias } from "./alias";
+import { cursorFastIdFor } from "../adapters/cursor/catalog";
 import { desktop3pAlias } from "./desktop-3p";
 import { AUTO_CONTEXT_OFF, type AutoContextMode } from "./context-windows";
 
@@ -132,8 +133,11 @@ export function buildAnthropicModelInfos(
   idStyle: AnthropicIdStyle = "desktop3p",
   aliasForRoute: (provider: string, modelId: string) => string = desktop3pAlias,
   nativeContextCap?: NativeContextLimitsInput,
-  discovery1mModels?: readonly string[],
+  discovery1mModelsOrFastMode?: readonly string[] | boolean,
+  fastMode?: boolean,
 ): AnthropicModelInfo[] {
+  const discovery1mModels = Array.isArray(discovery1mModelsOrFastMode) ? discovery1mModelsOrFastMode : undefined;
+  const effectiveFastMode = typeof discovery1mModelsOrFastMode === "boolean" ? discovery1mModelsOrFastMode : fastMode;
   const out: AnthropicModelInfo[] = [];
   const seen = new Set<string>();
 
@@ -168,7 +172,16 @@ export function buildAnthropicModelInfos(
     }
   }
   for (const m of routedModels) {
-    const id = idStyle === "readable" ? claudeCodeAlias(m.provider, m.id) : aliasForRoute(m.provider, m.id);
+    // Global Fast has no toggle on this surface, so the fast identity is what gets listed —
+    // a client here can only pick a listed id. Limited to the readable CLI style: Desktop 3P
+    // ids are hashed from the model name, so rewriting them would strand a saved selection.
+    const fastModelId = effectiveFastMode === true && m.provider === "cursor" && idStyle === "readable"
+      ? cursorFastIdFor(m.id)
+      : undefined;
+    const listedModelId = fastModelId ?? m.id;
+    const id = idStyle === "readable"
+      ? claudeCodeAlias(m.provider, listedModelId)
+      : aliasForRoute(m.provider, m.id);
     if (seen.has(id)) continue;
     seen.add(id);
     const ladder = Array.isArray(m.reasoningEfforts) ? m.reasoningEfforts : [];
@@ -178,7 +191,7 @@ export function buildAnthropicModelInfos(
         ? Math.min(m.maxInputTokens, m.contextWindow)
         : m.maxInputTokens)
       : undefined;
-    const info = modelInfo(id, `${m.id} (${m.provider})`, ladder, imageInput, routedMaxInput ?? m.contextWindow);
+    const info = modelInfo(id, `${listedModelId} (${m.provider})`, ladder, imageInput, routedMaxInput ?? m.contextWindow);
     out.push(info);
     if (is1mEnabledForModel([`${m.provider}/${m.id}`, id, `${m.id} (${m.provider})`], m.contextWindow)) {
       push1mVariant(info, m.contextWindow, routedMaxInput);
