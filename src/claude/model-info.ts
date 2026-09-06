@@ -135,12 +135,14 @@ export function buildAnthropicModelInfos(
   nativeContextCap?: NativeContextLimitsInput,
   discovery1mModelsOrFastMode?: readonly string[] | boolean,
   fastMode?: boolean,
+  // Presence is the feature gate: the caller passes undefined when `fastRows` is off, so a
+  // default install publishes nothing. The predicate answers ELIGIBILITY, not enablement.
+  fastRows?: (model: CatalogModel | { provider: string; id: string }) => boolean,
 ): AnthropicModelInfo[] {
   const discovery1mModels = Array.isArray(discovery1mModelsOrFastMode) ? discovery1mModelsOrFastMode : undefined;
   const effectiveFastMode = typeof discovery1mModelsOrFastMode === "boolean" ? discovery1mModelsOrFastMode : fastMode;
   const out: AnthropicModelInfo[] = [];
   const seen = new Set<string>();
-
   const is1mEnabledForModel = (keys: string[], contextWindow?: number) => {
     if (discovery1mModels !== undefined) {
       const canonicalSet = new Set(discovery1mModels.map(s => toCanonicalModelKey(s)));
@@ -148,6 +150,27 @@ export function buildAnthropicModelInfos(
     }
     return contextWindow !== undefined && contextWindow >= ONE_MILLION;
   };
+
+  // Every id the loops below will really emit, computed BEFORE either runs. `seen` alone is
+  // not enough: it grows as they run, so whether a synthetic id collided with a real one
+  // would depend on iteration order. With both `foo` and a real `foo--fast` in the roster,
+  // the synthetic id for `foo` IS the real model's id, and whichever ran first would win it.
+  const realDiscoveryIds = new Set<string>([
+    ...nativeSlugs.map(slug => (
+      idStyle === "readable" ? claudeCodeNativeAlias(slug) : aliasForRoute("native", slug)
+    )),
+    ...routedModels.map(m => {
+      // The same asymmetry the routed loop applies: readable uses the LISTED id, so a
+      // fastMode-rewritten Cursor row is counted under the id it is really published as,
+      // while Desktop 3P hashes the RAW id.
+      const listed = effectiveFastMode === true && m.provider === "cursor" && idStyle === "readable"
+        ? cursorFastIdFor(m.id) ?? m.id
+        : m.id;
+      return idStyle === "readable"
+        ? claudeCodeAlias(m.provider, listed)
+        : aliasForRoute(m.provider, m.id);
+    }),
+  ]);
 
   const push1mVariant = (base: AnthropicModelInfo, contextWindow: number | undefined, maxInputTokens?: number) => {
     if (base.id.includes("[1m]")) return;
@@ -158,6 +181,21 @@ export function buildAnthropicModelInfos(
       ? Math.max(ONE_MILLION, maxInputTokens)
       : ONE_MILLION;
     out.push({ ...base, id, display_name: `${base.display_name} · 1M`, max_input_tokens: advertised });
+  };
+  /**
+   * Publish a Fast sibling beside a row, following `push1mVariant` rather than the
+   * `fastMode` rewrite below: `fastMode` is a global switch with no per-request choice, so
+   * it REPLACES the listed id, while a selector has to leave the default pickable beside it.
+   *
+   * Because it only ADDS a row, it is safe for the Desktop 3P hashed style too — the
+   * exclusion `fastMode` needs exists because rewriting a hash strands a saved selection.
+   */
+  const pushFastVariant = (base: AnthropicModelInfo) => {
+    const id = `${base.id}--fast`;
+    // A real model always wins its own id, whatever the iteration order.
+    if (realDiscoveryIds.has(id) || seen.has(id)) return;
+    seen.add(id);
+    out.push({ ...base, id, display_name: `${base.display_name} · Fast` });
   };
   for (const slug of nativeSlugs) {
     const id = idStyle === "readable" ? claudeCodeNativeAlias(slug) : aliasForRoute("native", slug);
@@ -170,6 +208,9 @@ export function buildAnthropicModelInfos(
     if (is1mEnabledForModel([slug, id, `native/${slug}`], nativeWindow)) {
       push1mVariant(info, nativeWindow, nativeMaxInput);
     }
+    // Natives too, not only routed rows: gpt-5.6-sol is the flagship Fast model, and
+    // omitting it would leave this surface without the model the feature exists for.
+    if (fastRows?.({ provider: "native", id: slug }) === true) pushFastVariant(info);
   }
   for (const m of routedModels) {
     // Global Fast has no toggle on this surface, so the fast identity is what gets listed —
@@ -196,6 +237,10 @@ export function buildAnthropicModelInfos(
     if (is1mEnabledForModel([`${m.provider}/${m.id}`, id, `${m.id} (${m.provider})`], m.contextWindow)) {
       push1mVariant(info, m.contextWindow, routedMaxInput);
     }
+    // The whole model is passed, not a (provider, id) pair: a combo row lives in its own
+    // namespace with no config.providers entry, so the caller classifies it from the
+    // aggregated supportsServiceTier the row already carries.
+    if (fastRows?.(m) === true) pushFastVariant(info);
   }
   return out;
 }

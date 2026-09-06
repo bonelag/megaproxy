@@ -224,6 +224,17 @@ call creation 이후 클라이언트는 다음의 지원되는 모든 inbound �
 프록시는 업스트림 join URL을 정규화한 뒤, 양방향 텍스트 및 바이너리 프레임을 투명하게 릴레이합니다. 업스트림
 인증은 프록시가 소유한 상태로 유지되며, 클라이언트 프로토콜 헤더는 보존됩니다.
 
+call creation과 sideband join은 같은 OpenAI 계정으로 이루어져야 하며, 그렇지 않으면 업스트림이 join을
+거부합니다(`404`). 두 요청 모두 Codex의 `session-id`와 `thread-id` 헤더를 실어 보냅니다. Pool 모드는
+계정 선택을 그 쌍에 묶어 두므로(프로세스 로컬) 프록시에 도착한 join은 통화를 만든 계정을 그대로 쓰고,
+Direct 모드는 두 요청 모두 호출자의 현재 bearer를 전달합니다. 릴레이되는 클라이언트 헤더는 정확히
+`openai-alpha`, `x-session-id`, `session-id`, `thread-id`, `originator`, `x-oai-attestation`
+(`src/server/live.ts`의 `LIVE_CLIENT_PROTOCOL_HEADERS`)이며, `Authorization`과 ChatGPT 계정 id는
+ChatGPT 경로에서 프록시가 소유합니다(Pool은 저장된 계정으로 교체, Direct는 검증된 호출자 bearer를 전달).
+API 키 프로바이더는 자체 bearer를 씁니다. Codex가 join을 프록시로 보내는 것은
+`experimental_realtime_ws_base_url`이 프록시를 가리킬 때뿐이며, `ocx start`가 이 키를
+`openai_base_url` 옆에 주입합니다([Codex 연동](/ko/guides/codex-integration/) 참고).
+
 ## `POST /v1/responses/compact`
 
 Compaction은 긴 Responses 대화를 줄여야 하는 클라이언트를 위해 대체 히스토리를 반환합니다.
@@ -278,7 +289,7 @@ data-plane key는 management credential이 아닙니다. management API는 별�
 | 401 | `authentication_error` | 필요한 프록시 admission credential이 없거나 유효하지 않습니다 |
 | 403 | `origin_rejected` | Responses/OpenAI data-plane 요청 또는 WebSocket 업그레이드가 허용되지 않은 origin에서 들어왔습니다 |
 | 503 | `combo_unavailable` | 선택한 combo의 모든 대상이 사용할 수 없거나, cooldown 중이거나, 비활성화되어 있거나, 다른 이유로 부적합합니다 |
-| 400 | `unreadable_encrypted_agent_task` | 암호화된 v2 worker task를 소비할 수 있는 적격 네이티브 ChatGPT 대상이 없습니다 |
+| 400 | `unreadable_encrypted_agent_task` | 암호화된 v2 worker task를 처리할 수 있는 정규 ChatGPT 대상이나 명시적으로 신뢰한 Responses 대상이 없습니다 |
 | 426 | `upgrade_required` | Responses WebSocket transport가 비활성화되어 있거나 업그레이드에 실패했습니다. HTTP를 사용하십시오 |
 
 Anthropic-origin 실패는 Anthropic의 error envelope로 렌더링됩니다. 따라서 해당 방언에서 origin 거부는

@@ -24,6 +24,12 @@ Auth page can restore it: absent rows are created from the canonical preset, dis
 rows are re-enabled without replacing saved mode or model settings, and noncanonical `openai`
 rows are not offered that recovery path.
 
+Luna Reserve compatibility is a ChatGPT account capability on the canonical OpenAI forward path,
+not an OpenAI API-key entitlement. Its manual stored-main selector requires effective local authless
+Desktop mode and current credential-bound upstream permission; a catalog entry alone does not
+authorize a request. See [Luna Reserve alongside routed models](/reference/cli/providers-accounts/#luna-reserve-alongside-routed-models)
+for setup, restart order, authorization requirements, and unsupported helpers.
+
 ### Providers overview pool capacity
 
 For Codex login in Pool mode, the Providers overview shows a configured-weight estimate of the
@@ -458,23 +464,33 @@ material off it. Muse Spark is also reachable through resellers, with a narrower
 `command-code` carries both tiers, while `opencode-go` serves only
 `muse-spark-1.3-contributor`.
 
-**Meta Muse Code (`meta-muse`).** If you already use the Muse Code CLI, this imports the
-API key it stored after `muse login` instead of asking you to provision a second one.
-macOS only — the CLI keeps that key in the macOS Keychain, and no other platform's
-storage has been verified. OpenCodex never launches the CLI: if no credential is present
-it tells you to run `muse login` yourself.
+**Meta Muse Code (`meta-muse`).** On macOS, if you already use the Muse Code CLI, this
+imports the API key it stored after `muse login` instead of asking you to provision a
+second one. OpenCodex never launches the CLI: if no credential is present it tells you to
+run `muse login` yourself.
+
+Elsewhere it asks you to paste the key. Meta ships no native Windows CLI, and on Linux the
+CLI exists but where it stores its credential has not been verified, so OpenCodex refuses
+to guess at a credential store and points you at [dev.meta.ai](https://dev.meta.ai)
+instead, where the same key is visible. A pasted key faces the same format check and the
+same live validation against the Model API as an imported one. See
+[Platform support](/reference/platform-support/) for the full per-platform picture.
 
 **Read this before enabling it.** Meta scopes that credential to the Muse Code CLI, so
 using it here is an *unsupported* path. Meta does not authorize subscription coverage
 outside its own client, how these calls settle is not observable from the API, and you
-should treat every call as billable against your account. The imported key is copied into
+should treat every call as billable against your account. The key, imported or pasted, is copied into
 OpenCodex's auth store (`~/.opencodex/auth.json`, mode 0600) like every other OAuth
 credential. The dashboard shows a Terms-of-Service warning before the first login and
 before any reauthentication — the same treatment Anthropic and Google Antigravity get.
 
-Meta reports subscription window usage inside streaming responses, but OpenCodex does not
-yet read or display it, and there is no endpoint to query it on demand, so this provider
-shows no quota. Rate limits apply per team, not per key.
+Meta reports subscription window usage inside streaming responses, and OpenCodex reads it
+from there. The account row shows the last observed 5-hour and weekly windows with how old
+that reading is — Meta publishes no endpoint to query them on demand, so a value is only
+refreshed by another streaming turn through this provider, and a turn that goes through
+request translation rather than passthrough reports none. An account that has not yet
+served a streaming turn simply shows no quota, which is not an error. Rate limits apply
+per team, not per key.
 
 For a supported setup, use `meta-model` above with your own key.
 
