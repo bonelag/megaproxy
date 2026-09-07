@@ -1460,7 +1460,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       if (body.modelMap === null) {
         delete next.modelMap;
       } else if (!isPlainObject(body.modelMap)) {
-        return jsonResponse({ error: "modelMap must be an object or null" }, 400);
+        return jsonResponse({ error: "modelMap must be an object of string->string, or null" }, 400);
       } else {
         const modelMap = body.modelMap as Record<string, unknown>;
         const map: Record<string, string> = {};
