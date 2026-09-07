@@ -1,3 +1,4 @@
+import { isOpenCodeGo, normalizeOpenCodeGoAgentMessages } from "./opencode-go";
 import { createHash } from "node:crypto";
 import type { IncomingMeta, ProviderAdapter } from "./base";
 import { namespacedToolName, type AdapterEvent, type OcxParsedRequest, type OcxProviderConfig, type OcxUsage, type TierDecision } from "../types";
@@ -630,6 +631,13 @@ function mapRoutedResponsesReasoningEffort(
   if (provider.authMode === "forward") return body;
   if (configuredReasoningEfforts(provider, modelId) === undefined) return body;
   if (!isPlainObject(body) || !isPlainObject(body.reasoning)) return body;
+  const declaredEfforts = modelRecordValue(provider.modelReasoningEfforts, modelId) ?? provider.reasoningEfforts;
+  // An explicitly empty ladder means no effort control, not no reasoning output.
+  // Omit only effort so the upstream default applies; unknown/non-rankable ladders stay untouched.
+  if (declaredEfforts?.length === 0 && Object.hasOwn(body.reasoning, "effort")) {
+    const { effort: _effort, ...reasoning } = body.reasoning;
+    return { ...body, reasoning: Object.keys(reasoning).length > 0 ? reasoning : undefined };
+  }
   const requested = body.reasoning.effort;
   if (typeof requested !== "string") return body;
 
@@ -2356,6 +2364,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         parsed._rawBody,
         forward || parsed._previousResponseInputExpanded === true,
       );
+      if (!forward && isOpenCodeGo(provider.baseUrl)) outBody = normalizeOpenCodeGoAgentMessages(outBody);
       outBody = mapRoutedResponsesReasoningEffort(outBody, provider, parsed.modelId);
       // stripPreviousResponseId() intentionally returns its input on a no-op. Detach before the
       // tier write so a force-fast/default decision can never mutate parsed._rawBody.
@@ -2428,7 +2437,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         // Codex 0.147 emits private namespace tool groups, while public/third-party Responses
         // gateways accept only flat tool variants. Run after custom/tool-search lowering so
         // namespace children already carry their final public kind before they are promoted.
-        const rewritten = rewriteRoutedNamespaceToolsForUpstream(outBody);
+        const rewritten = rewriteRoutedNamespaceToolsForUpstream(outBody, convertedRoutedCustomToolNames);
         outBody = rewritten.body;
         convertedRoutedNamespaceToolAliases = rewritten.aliases;
         // Preserve xAI's cached-only fail-closed semantics and image-search mapping before the
@@ -2545,6 +2554,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       let snapshot = "";
       let usage: OcxUsage | undefined;
       let compactionEncryptedContent: string | undefined;
+      let completedSeen = false;
       for await (const event of decodeServerSentEvents(response.body, { translatorBudget: budget })) {
         let payload: unknown;
         try { payload = JSON.parse(event.data); } catch { continue; }
@@ -2579,6 +2589,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
             return;
           case "response.completed":
             {
+              completedSeen = true;
               const responsePayload = isPlainObject(payload.response) ? payload.response : undefined;
               const output = Array.isArray(responsePayload?.output) ? responsePayload.output : [];
               const compaction = output.find(item => isPlainObject(item) && item.type === "compaction");
@@ -2618,6 +2629,18 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
               }
             }
             break;
+        }
+        // Buffered text is still upstream progress, but gateway keepalives are not.
+        // Yield after accounting, directly to the consumer: no progress queue or content leak.
+        if (
+          !completedSeen
+          && (payload.type === "response.output_text.delta"
+            || payload.type === "response.reasoning_summary_text.delta"
+            || payload.type === "response.reasoning_text.delta")
+          && typeof payload.delta === "string"
+          && payload.delta.length > 0
+        ) {
+          yield { type: "heartbeat" };
         }
       }
       // Gateways differ in which of these they emit; prefer the authoritative

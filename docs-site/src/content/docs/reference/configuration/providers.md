@@ -28,8 +28,9 @@ After GUI registration or OAuth login, the confirmation dialog lets you open the
 | `providers` | `Record<string, OcxProviderConfig>` | — | Map of provider name to provider config. |
 | `openaiProviderTierVersion?` | `2` | set by migration | Marks the single option-aware OpenAI projection as complete. |
 | `disabledModels?` | `string[]` | — | Models hidden from Codex's catalog and `/v1/models`, but not blocked from direct proxy calls. A routed id is removed from listings. An account-qualified native id hides only that selector row; a bare native GPT id hides the bare row and every account-selector row for that model. The dashboard Models page exposes only routed and bare native rows; use this configuration field directly to hide one selector-qualified row. |
-| `providerContextCaps?` | `Record<string, number>` | `{}` | Per-provider Codex-visible context caps. A cap only lowers a known context window. |
-| `contextCapValue?` | `number` | `350000` | Default value used by the dashboard context-cap controls. Changing it applies the value to every routed provider — including providers without an existing `providerContextCaps` entry — only when "apply to every routed provider" is toggled on; otherwise each provider keeps its own cap. |
+| `providerContextCaps?` | `Record<string, number>` | `{}` | Active provider context limits. Ordinary windows are lowered; native models with a supported long window can expand only up to their own supported ceiling. |
+| `providerContextCapValues?` | `Record<string, number>` | `{}` | Last selected provider limits, retained while disabled. These values do not activate a cap. An enabled value takes precedence over a remembered value. |
+| `contextCapValue?` | `number` | `350000` | Default used on first enable. A later enable restores the selected provider value. Updating the global value with `setAll: true` changes enabled caps only; `setAll: true` without a value enables all configured providers at the current global value. |
 | `codexAccounts?` | `CodexAccount[]` | `[]` | ChatGPT/Codex pool account metadata managed by Codex Auth. Secrets live separately in `codex-accounts.json`. |
 | `pausedCodexAccountIds?` | `string[]` | `[]` | Accounts excluded from Pool selection until resumed, including the main `__main__` account when paused. |
 | `codexQuotaAutoRefresh?` | `Record<string, object>` | `{}` | Per-Codex-login-account opt-in for automatic `fiveHour` and `weekly` window activation in Pool mode; Direct mode does not run this worker. In Providers/Codex Auth **Advanced settings**, one control enables or disables both supported windows across all current main and added accounts. New accounts are not opted in automatically. Enable skips windows absent from live WHAM data; disable also clears stale enabled windows. The UI reuses granular `/api/settings` writes, reconciles partial failures, and retries the original ON/OFF intent without replacing unrelated settings or completed reset markers. The API still rejects enabling an unavailable window with HTTP 409. At a reported reset time, opencodex sends one minimal non-stored Codex message using that account's quota and persists the activated timestamp. This does not apply to API-key providers. |
@@ -136,7 +137,7 @@ predictions. Explicit provider/model price overrides still take precedence.
 | `apiKeyTransport?` | `"x-api-key" \| "bearer"` | Anthropic key header style. Defaults to native `x-api-key`; valid only for key-auth `anthropic` providers. |
 | `apiKeyPool?` | `ApiKeyPoolEntry[]` | Multi-key pool. `apiKey` mirrors the active entry; each item has `id`, `key`, optional `label`, and optional numeric `addedAt`. |
 | `defaultModel?` | `string` | Model used when this provider is selected without an explicit model. |
-| `models?` | `string[]` | Seed/fallback model list. With `liveModels: false`, these are the only discovered models. |
+| `models?` | `string[]` | Seed/fallback model list. With `liveModels: false`, a nonempty `models` list is followed by `retainModels`; an empty or omitted `models` list instead seeds `defaultModel` (if configured), then `retainModels`, removing duplicate ids in first-seen order. |
 | `liveModels?` | `boolean` | Fetch the live catalog on start/sync (default `true`). Custom providers use `${baseUrl}/models`; built-ins may use a registry URL and filter. |
 | `selectedModels?` | `string[]` | Catalog allowlist after discovery. Non-empty exposes only those ids; empty or omitted exposes all discovered models. |
 | `retainModels?` | `string[]` | Ids kept in the catalog even when live discovery omits them. They need not be repeated in `models`. Empty or omitted keeps today's behavior. |
@@ -200,6 +201,14 @@ predictions. Explicit provider/model price overrides still take precedence.
 | `unsafeAllowNativeLocalExec?` | `boolean` | Cursor legacy boolean, equivalent to `nativeLocalExec: "on"` only when the newer field is unset. |
 | `nativeLocalExec?` | `"off" \| "codex-sandbox" \| "on"` | Cursor local-exec policy. `off` is default; `codex-sandbox` currently fails closed like `off`. |
 
+Custom-model `reasoningEfforts` normally override discovered provider metadata. The bounded
+exception is an explicit Astra or Daybreak custom row on the canonical `openai` Codex-forward
+destination: its advertised list is intersected with that model's pinned native capabilities.
+An explicit empty list remains empty with no default; a nonempty incompatible list falls back
+to the native default as a single choice. Defaults must belong to the final list. This changes
+the catalog projection, not stored configuration or arbitrary gateway models sharing a GPT name.
+See [custom native catalog examples](/guides/codex-app-models/).
+
 ### Discovered model display names
 
 Use `modelDisplayNames` when a provider returns machine friendly ids but the Codex model picker
@@ -221,6 +230,16 @@ all other provider settings. The example includes the surrounding required field
 }
 ```
 
+Supported bare native GPT rows in the local Codex catalog also accept exact labels in
+`providers.openai.modelDisplayNames`, for example `"gpt-6-astra": "GPT 6 Astra"`.
+Both startup synchronization and local catalog convergence reapply these labels. Removing a label
+restores the original native name only when the row's display name still matches the applied
+override. A newer external display name is preserved subject to existing native metadata normalization;
+for example, Astra (`gpt-6-astra`) still replaces a non-pinned name with its pinned native name.
+The label overlay leaves model IDs, metadata (including capabilities), ordering,
+routed combo aliases, and account-qualified rows unchanged. This local catalog override does
+not relabel the HTTP model listings or virtual `*-pro` rows.
+
 The effective label order is operator `modelDisplayNames`, then provider catalog metadata, then the
 normal `provider/model` fallback. The routed selector remains `xai/grok-4.6`, while the upstream
 wire model remains `grok-4.6`. Labels are display only. They do not change authentication, adapter
@@ -229,6 +248,20 @@ label. A management client can set or reset one label with
 `PUT /api/providers/:provider/model-display-names` and a body of
 `{ "modelId": "grok-4.6", "displayName": "Grok 4.6" }`; send `displayName: null` to reset it.
 Provider `PATCH` does not edit this map. Use this dedicated `PUT` endpoint to change or remove labels.
+
+The dashboard exposes the same durable setting on **Models**. Expand the provider, find a
+discovered model, and choose **Name**. The dialog keeps the exact `provider/model` selector visible
+while you save a friendly label. Choose **Reset name** to return to provider metadata or the normal
+selector fallback. **Name** changes presentation only; the separate alias pencil changes the
+short routing alias and is not a display name editor. Native OpenAI and custom model rows keep their
+existing controls.
+
+If the change is saved but refreshing fails, the dialog reflects the saved override and keeps
+**Retry** available. Retry repeats catalog convergence when the server reported it failed, or
+reloads the list when only the list request failed. Reset recovery keeps the reset operation;
+it does not restore the old name. Requests have a 60-second deadline covering the write and its
+follow-up list refresh. A timeout does not undo a write: use **Retry** to check the current name
+before making another change.
 
 ## Codex catalog and root `config.toml` settings
 
@@ -421,13 +454,30 @@ rotation may trigger provider restrictions.
 | `anthropicAccountPool.enabled?` | `boolean` | `false` | Enable sticky session affinity and quota-ranked new-session selection. **429 failover is not gated here**: it activates whenever two or more usable accounts are stored, exactly like every other multi-credential provider, and cannot be switched off. |
 | `anthropicAccountPool.autoSwitchThreshold?` | `number` | `80` | For new sessions, when the active account reaches this threshold, choose the lowest known cached usage in the configured window; the account chosen does not itself have to be at or above the threshold. `0` disables **proactive** usage-based switching only — new-session selection and routing recovery after an eligible 429 still consult `quotaWindow`. |
 | `anthropicAccountPool.strategy?` | `"quota" \| "round-robin" \| "fill-first"` | `"quota"` | New-session strategy; `quota` ranks accounts by the window set by `quotaWindow`, and `fill-first` evaluates its drain threshold in that same window. |
-| `anthropicAccountPool.quotaWindow?` | `"five-hour" \| "weekly" \| "max-utilization"` | `"five-hour"` | The cached provider-reported utilization bar used for usage-aware account selection. `five-hour` keeps the original behavior. `weekly` scores the weekly bar and skips accounts whose 5-hour bar is exhausted while another eligible account remains, but falls back to exhausted candidates when none do. `max-utilization` scores the highest known bar, so it can use 5-hour usage before weekly usage is available; if neither is known, the account follows unknown-usage ordering. Known usage ranks before unknown usage under the opt-in `weekly` and `max-utilization` windows only; an omitted or explicit `five-hour` preserves the legacy ordering. If every eligible account is unknown, selection still returns one in eligible order. After the documented lower-5-hour tie-break, exact ties preserve eligible order. A healthy affinity-bound session is not proactively rebalanced. For new-session assignment and routing recovery after an eligible 429 replacement, `quota` ranks eligible candidates directly with this window; `fill-first` advances in stable order using this window's threshold and exhaustion rules; `round-robin` ignores it. Cooldown, failover limits, and reauthentication eligibility remain separate local state. Per-account weekly bars are only known once the dashboard Providers page has polled them. |
+| `anthropicAccountPool.quotaWindow?` | `"five-hour" \| "weekly" \| "max-utilization"` | `"five-hour"` | The cached provider-reported utilization bar used for usage-aware account selection. `five-hour` keeps the original behavior. `weekly` scores the weekly bar and skips accounts whose 5-hour bar is exhausted while another eligible account remains, but falls back to exhausted candidates when none do. `max-utilization` scores the highest known bar, so it can use 5-hour usage before weekly usage is available; if neither is known, the account follows unknown-usage ordering. Known usage ranks before unknown usage under the opt-in `weekly` and `max-utilization` windows only; an omitted or explicit `five-hour` preserves the legacy ordering. If every eligible account is unknown, selection still returns one in eligible order. After the documented lower-5-hour tie-break, exact ties preserve eligible order. A healthy affinity-bound session is not proactively rebalanced. For new-session assignment and routing recovery after an eligible 429 replacement, `quota` ranks eligible candidates directly with this window; `fill-first` advances in stable order using this window's threshold and exhaustion rules; `round-robin` ignores it. Cooldown, failover limits, and reauthentication eligibility remain separate local state. Per-account weekly bars come from usage probes or observed response headers. |
 | `anthropicAccountPool.stickyLimit?` | `number` | `1` | Successful new-session binds retained on one round-robin selection. Range 1–100. |
 
-When enabled, 429 records bounded cooldown from `Retry-After` or a default backoff and may rotate
-within the request. Affinity is process-local and size-bounded. Credential 401/403 marks the account
-as needing reauthentication. If all eligible accounts are cooling, clients receive 429 with
+When enabled, 429 records a cooldown and may rotate within the request. The cooldown length comes
+from a usable `Retry-After`, otherwise from the latest valid reset time among rate-limit windows
+Anthropic reports as `rejected`, including weekly windows. Valid upstream deadlines are not
+shortened to a fixed cooldown ceiling; non-finite or unrepresentable deadlines are ignored.
+A refusal with no usable deadline falls back to a 60-second default backoff. Affinity is process-local
+and size-bounded. Credential 401/403 marks the account as needing reauthentication. If all eligible accounts are cooling, clients receive 429 with
 `Retry-After` when known, not an authentication error.
+
+Anthropic responses also report the serving account's 5-hour and weekly utilization, and whichever
+of those two a given response carries is recorded against that account — each window independently,
+on refusals as well as successes. Usage-aware selection therefore works from the accounts you
+actually use, without waiting for the dashboard Providers page to poll them. These readings refresh
+the existing row rather than replacing it, so the model-scoped weekly bars that only the usage
+endpoint reports are preserved until their known reset time passes. Expired measurements become
+unknown, including retained standard windows omitted by later headers. A reset-only header cannot
+extend an older utilization measurement. Values with no known reset retain their existing behavior;
+missing measurements are never replaced with zero usage.
+
+Header observations do not postpone usage probes or clear a failed
+probe's unavailable status. After restart, cached Anthropic observations remain available while
+the next quota read probes again, because the saved observations do not include the probe clock.
 
 :::caution[Experimental]
 Leave this disabled unless you understand Anthropic account policy risk. Prefer manual
@@ -738,8 +788,22 @@ container usually has no unlocked keychain session, so requests would fail close
 `${ENV_VAR}` reference in the service environment there instead. Env references are left untouched
 by `store`.
 
-Set `liveModels: false` to expose only `models`. If `models` is empty or omitted, the provider exposes
-no routed models. Live discovery rejects more than 4 MiB or 2,000 raw model rows before caching;
+The `zhipu-bigmodel-responses` preset seeds `glm-5.3` and `glm-5-turbo` with
+`liveModels: false` for `https://open.bigmodel.cn/api/v1`. Its static roster and
+per-model context, effort, and summary metadata come from the
+[BigModel Responses guide](/guides/providers/#bigmodel-coding-plan-over-responses).
+The official local `models.json` example does not establish a live `/models` API.
+
+With `liveModels: false`, an empty or omitted `models` list seeds the configured `defaultModel`
+first, followed by `retainModels`; duplicate ids are removed while preserving first occurrence.
+A nonempty explicit `models` list instead seeds `models` followed by `retainModels`, without
+implicitly adding a different `defaultModel`. That default can still be listed explicitly in
+`models` or `retainModels`. If none of these fields supplies an id, the static seed is empty.
+This is seed order, not a promise of final picker order. `selectedModels`, `disabledModels` and
+provider-disabled policy still apply. `authMode: "forward"` keeps its separate branch and does
+not use this routed static seed. These rules do not change live-discovery failure fallback.
+
+Live discovery rejects more than 4 MiB or 2,000 raw model rows before caching;
 built-in presets may use lower limits and filter to chat-eligible rows. Oversized or malformed results
 follow stale/configured fallback. A valid zero-eligible result remains authoritative and is not
 silently replaced or truncated.
@@ -810,3 +874,51 @@ ids with context `922000` and max input `922000`; OpenRouter seeds `openai/gpt-5
   "visionSidecar": { "enabled": true }
 }
 ```
+
+## OpenCode Go reasoning efforts
+
+Go catalog rows preserve their configured reasoning efforts exactly, including during
+catalog sync. OpenCodex does not append synthetic `max` or `ultra` choices to these rows.
+Use `modelReasoningEfforts` and `modelDefaultReasoningEfforts` for each model's accepted
+upstream values. Key these per-provider maps by upstream model ID, not the routed
+`opencode-go/<model-id>` catalog slug. For example, a configured `["high", "max"]` list
+remains exactly those two choices; a configured `["high", "xhigh"]` list does not gain `max`.
+See the [OpenCode Go model list](https://opencode.ai/docs/go/#models) for the current roster.
+A configured subset can exclude the lower tiers. Other providers retain their existing behavior.
+
+For a native-first picker, include native ids in `modelPickerOrder` followed by the
+routed ids. This orders the complete picker while preserving OpenCodex's separate natural-priority
+guidance calculation. Native Codex's advertised five follow picker priority and may change;
+exact-name override eligibility is not limited to that advertisement. Routed-only orders keep
+their previous behavior. See the
+[ordering migration note](/guides/model-ordering/#migration-note-native-ids-in-existing-orders).
+`modelDisplayNames` on a provider controls readable labels without changing wire ids.
+
+## OpenCode Go session and agent messages
+
+With the [`openai-responses` adapter](/reference/adapters/#openai-responses) and
+base URL `https://opencode.ai/zen/go/v1`, plaintext Codex `agent_message` items
+become user messages when `authMode` is not `"forward"` (for example, `"key"`).
+Providers using `authMode: "forward"` retain these items unchanged. This conversion is scoped to that destination, including
+renamed provider entries; other Responses destinations keep their input unchanged.
+Author and recipient remain explicit text metadata, and the content parts are preserved.
+Encrypted and unknown content is not normalized; native encrypted tasks still require the
+separate opt-in [task recovery](/reference/configuration/agents/#encrypted-v2-task-recovery).
+
+With task recovery enabled, replayed `NEW_TASK` and `MESSAGE` items reuse a cached assignment only
+after validating the caller and matching the parent-thread scope. Replay restoration
+does not make a new recovery request or extend cache expiry. Expired or unseen
+ciphertext is not replaced. Fresh encrypted `NEW_TASK` and `MESSAGE` items use the same
+opt-in recovery path, including native-parent `send_message` delivery. Message type,
+sender, recipient, parent scope and caller credentials remain part of validation or cache identity.
+
+When a request contains several agent messages, cached replay restoration checks each
+message independently. The cache separates message type, sender, recipient and ciphertext
+within the admitted caller/account and parent scope. Fresh recovery only handles the
+current tail message (ignoring trailing `compaction_trigger` or `additional_tools` metadata).
+It does not batch-recover unseen historical messages; those remain unchanged. A cache miss
+or expiry does not extend the history-recovery contract.
+
+Sender and recipient on Go Responses are context for the receiving model, not a new
+machine-readable routing protocol. Tool routing continues to use the existing collaboration
+contracts.

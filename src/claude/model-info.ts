@@ -15,7 +15,7 @@
  *  - created_at is a fixed constant; max_input_tokens is authoritative-or-null;
  *    max_tokens is always null (no authoritative output limit exists proxy-side).
  */
-import { catalogModelEfforts, nativeEffortClamp, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type CatalogModel, type NativeContextLimitsInput } from "../codex/catalog";
+import { orderForModelPicker, catalogModelEfforts, nativeEffortClamp, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type CatalogModel, type NativeContextLimitsInput } from "../codex/catalog";
 import { claudeCodeAlias, claudeCodeNativeAlias } from "./alias";
 import { cursorFastIdFor } from "../adapters/cursor/catalog";
 import { desktop3pAlias } from "./desktop-3p";
@@ -138,6 +138,7 @@ export function buildAnthropicModelInfos(
   // Presence is the feature gate: the caller passes undefined when `fastRows` is off, so a
   // default install publishes nothing. The predicate answers ELIGIBILITY, not enablement.
   fastRows?: (model: CatalogModel | { provider: string; id: string }) => boolean,
+  ordering?: { modelPickerOrder?: readonly string[]; featured?: readonly string[] },
 ): AnthropicModelInfo[] {
   const discovery1mModels = Array.isArray(discovery1mModelsOrFastMode) ? discovery1mModelsOrFastMode : undefined;
   const effectiveFastMode = typeof discovery1mModelsOrFastMode === "boolean" ? discovery1mModelsOrFastMode : fastMode;
@@ -171,10 +172,20 @@ export function buildAnthropicModelInfos(
         : aliasForRoute(m.provider, m.id);
     }),
   ]);
-
-  const push1mVariant = (base: AnthropicModelInfo, contextWindow: number | undefined, maxInputTokens?: number) => {
+  // [1m] picker variant (devlog 260712 B1): Claude Code accounts exactly 1M for ids
+  // carrying the marker (2.1.207 binary: /\[1m\]/i → 1e6, compaction preserved), so
+  // ONLY models with an authoritative >=1M window get a second selectable row —
+  // the auto-context widening that let a 372K route carry the marker (and be
+  // over-filled) is the #854 defect and does not come back. Guards (audit R1#11):
+  // same dedupe set, never double-suffix.
+  const push1mVariant = (
+    base: AnthropicModelInfo,
+    contextWindow: number | undefined,
+    maxInputTokens?: number,
+    selectorId?: string,
+  ) => {
     if (base.id.includes("[1m]")) return;
-    const id = `${base.id}[1m]`;
+    const id = selectorId ?? `${base.id}[1m]`;
     if (seen.has(id)) return;
     seen.add(id);
     const advertised = typeof maxInputTokens === "number" && maxInputTokens > 0
@@ -212,6 +223,8 @@ export function buildAnthropicModelInfos(
     // omitting it would leave this surface without the model the feature exists for.
     if (fastRows?.({ provider: "native", id: slug }) === true) pushFastVariant(info);
   }
+  const nativeEnd = out.length;
+  const routedGroups = new Map<CatalogModel, AnthropicModelInfo[]>();
   for (const m of routedModels) {
     // Global Fast has no toggle on this surface, so the fast identity is what gets listed —
     // a client here can only pick a listed id. Limited to the readable CLI style: Desktop 3P
@@ -225,6 +238,7 @@ export function buildAnthropicModelInfos(
       : aliasForRoute(m.provider, m.id);
     if (seen.has(id)) continue;
     seen.add(id);
+    const groupStart = out.length;
     const ladder = Array.isArray(m.reasoningEfforts) ? m.reasoningEfforts : [];
     const imageInput = Array.isArray(m.inputModalities) ? m.inputModalities.includes("image") : false;
     const routedMaxInput = typeof m.maxInputTokens === "number" && m.maxInputTokens > 0
@@ -234,13 +248,31 @@ export function buildAnthropicModelInfos(
       : undefined;
     const info = modelInfo(id, `${listedModelId} (${m.provider})`, ladder, imageInput, routedMaxInput ?? m.contextWindow);
     out.push(info);
+    // Anthropic passthrough guard (audit 021 #3): never auto-widen canonical claude
+    // routes — only a genuine >=1M window earns the variant row there.
+    // Claude Code groups canonical Fable ids before it compares the [1m] marker. This
+    // reversible alias only separates picker families; it is not an OpenAI-native route.
+    // The Messages ingress restores the canonical Anthropic id before passthrough.
+    const oneMillionSelector = idStyle === "readable"
+      && m.provider === "anthropic"
+      && listedModelId.startsWith("claude-fable-")
+      ? `${claudeCodeNativeAlias(listedModelId)}[1m]`
+      : undefined;
     if (is1mEnabledForModel([`${m.provider}/${m.id}`, id, `${m.id} (${m.provider})`], m.contextWindow)) {
-      push1mVariant(info, m.contextWindow, routedMaxInput);
+      push1mVariant(info, m.contextWindow, routedMaxInput, oneMillionSelector);
     }
     // The whole model is passed, not a (provider, id) pair: a combo row lives in its own
     // namespace with no config.providers entry, so the caller classifies it from the
     // aggregated supportsServiceTier the row already carries.
     if (fastRows?.(m) === true) pushFastVariant(info);
+    routedGroups.set(m, out.slice(groupStart));
   }
-  return out;
+  if (!ordering?.modelPickerOrder?.length) return out;
+  // Sort only after deduplication, preserving the registry's original collision winner
+  // and keeping each model's base/1M/Fast siblings together.
+  return [
+    ...out.slice(0, nativeEnd),
+    ...orderForModelPicker([...routedGroups.keys()], ordering.modelPickerOrder, ordering.featured)
+      .flatMap(model => routedGroups.get(model)!),
+  ];
 }

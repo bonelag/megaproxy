@@ -21,6 +21,8 @@ import {
 import { createTranslatorBudget } from "../../src/lib/translator-budget";
 import type { OcxConfig } from "../../src/types";
 import { withTestTranslatorBudget } from "../helpers/translator-budget";
+import { restoreRoutedNamespaceCalls } from "../../src/responses/namespace-tool-compat";
+import { restoreRoutedCustomCalls } from "../../src/responses/custom-tool-compat";
 
 const createResponsesPassthroughAdapter = (...args: Parameters<typeof createResponsesPassthroughAdapterProduction>) =>
   withTestTranslatorBudget(createResponsesPassthroughAdapterProduction(...args));
@@ -567,6 +569,58 @@ describe("DeepSeek Responses endpoint contract", () => {
     }
   });
 
+  test.each([undefined, "max", "ultra"])("BigModel Turbo omits outbound effort %s and preserves summary requests", (effort) => {
+    const id = "zhipu-bigmodel-responses";
+    const config: OcxConfig = {
+      port: 10100,
+      defaultProvider: id,
+      providers: { [id]: providerConfigSeed(getProviderRegistryEntry(id)!) },
+    };
+    const route = routeModel(config, `${id}/glm-5-turbo`);
+    for (const withSummary of [false, true]) {
+      const raw = {
+        model: route.modelId,
+        input: "ping",
+        ...(effort !== undefined || withSummary ? {
+          reasoning: {
+            ...(effort !== undefined ? { effort } : {}),
+            ...(withSummary ? { summary: "auto" } : {}),
+          },
+        } : {}),
+      };
+      const before = structuredClone(raw);
+      const request = createResponsesPassthroughAdapter(route.provider).buildRequest(parseRequest(raw));
+      const wire = JSON.parse(request.body);
+      expect(request.url).toBe("https://open.bigmodel.cn/api/v1/responses");
+      if (withSummary) expect(wire.reasoning).toEqual({ summary: "auto" });
+      else expect(wire).not.toHaveProperty("reasoning");
+      expect(raw).toEqual(before);
+    }
+  });
+
+  test("a provider-wide empty ladder removes schema-valid raw effort", () => {
+    const keyed = { adapter: "openai-responses", baseUrl: "https://example.test/v1", authMode: "key" as const };
+    const raw = { model: "model", input: "ping", reasoning: { effort: "high", summary: "auto" } };
+    const wire = JSON.parse(createResponsesPassthroughAdapter({ ...keyed, reasoningEfforts: [] })
+      .buildRequest(parseRequest(raw)).body);
+    expect(wire.reasoning).toEqual({ summary: "auto" });
+    expect(raw.reasoning.effort).toBe("high");
+  });
+
+  test("empty-ladder repair preserves unknown, non-rankable and native forward effort behavior", () => {
+    const keyed = { adapter: "openai-responses", baseUrl: "https://example.test/v1", authMode: "key" as const };
+    for (const unchanged of [keyed, { ...keyed, reasoningEfforts: ["enabled"] }, { ...provider, reasoningEfforts: [] }]) {
+      const raw = { model: "gpt-5.6-sol", input: "ping", reasoning: { effort: "ultra" } };
+      const wire = JSON.parse(createResponsesPassthroughAdapter(unchanged).buildRequest(parseRequest(raw)).body);
+      expect(wire.reasoning.effort).toBe("ultra");
+    }
+    // A model-specific nonempty ladder overrides a provider-wide empty declaration.
+    const wire = JSON.parse(createResponsesPassthroughAdapter({
+      ...keyed, reasoningEfforts: [], modelReasoningEfforts: { model: ["low", "high", "max"] },
+    }).buildRequest(parseRequest({ model: "model", input: "ping", reasoning: { effort: "ultra" } })).body);
+    expect(wire.reasoning.effort).toBe("max");
+  });
+
   test("a config saved before the fix is backfilled, and a hand-set path is preserved", () => {
     const saved = { adapter: "openai-chat", baseUrl: "https://api.deepseek.com", apiKey: "sk-test" } as Parameters<typeof enrichProviderFromRegistry>[1];
     enrichProviderFromRegistry("deepseek", saved);
@@ -909,6 +963,7 @@ describe("routed compaction lowering order", () => {
     expect([...(built.convertedRoutedToolSearchNames ?? [])]).toEqual(["opencodex_tool_search"]);
     expect([...(built.convertedRoutedNamespaceToolAliases ?? new Map()).entries()]).toEqual([
       ["collaboration__spawn_agent", { namespace: "collaboration", name: "spawn_agent", kind: "function" }],
+      ["collaboration.spawn_agent", { namespace: "collaboration", name: "spawn_agent", kind: "function" }],
     ]);
   });
 
@@ -2492,6 +2547,24 @@ describe("OpenAI Responses passthrough sanitization", () => {
     }]);
   });
 
+  test("external task parsing preserves the existing raw passthrough repair", () => {
+    const adapter = createResponsesPassthroughAdapter({
+      adapter: "openai-responses", baseUrl: "https://api.x.ai/v1", authMode: "key" as const, apiKey: "xai-test",
+    });
+    const raw = {
+      model: "grok-4.6",
+      input: [{ type: "function_call_output", id: "external-fixture", name: "handoff_input", namespace: "task_inbox", output: "external input" }],
+    };
+    const original = structuredClone(raw);
+    const parsed = parseRequest(raw);
+    expect(parsed.context.messages).toMatchObject([{ role: "user", content: "external input" }]);
+    expect(raw).toEqual(original);
+    const body = JSON.parse(adapter.buildRequest(parsed, meta).body) as { input: unknown[] };
+    expect(body.input).toEqual([{ type: "message", role: "user", content: [
+      { type: "input_text", text: "[tool output for unknown call]\nexternal input" },
+    ] }]);
+  });
+
   test("api-key mode keeps stateful tool outputs with call_id intact", () => {
     const adapter = createResponsesPassthroughAdapter({
       adapter: "openai-responses",
@@ -3712,6 +3785,59 @@ describe("routed namespace and custom-tool identity", () => {
 
   const frame = (event: string, payload: Record<string, unknown>): string =>
     `event: ${event}\ndata: ${JSON.stringify({ type: event, ...payload })}`;
+
+  test.each(["function_call", "custom_tool_call"])("adapter preserves original custom kind for upstream %s after actual lowering order", type => {
+    const adapter = createResponsesPassthroughAdapter(config.providers.fixture!);
+    const built = adapter.buildRequest({
+      modelId: "routed-model", context: { messages: [] }, stream: false, options: {},
+      _rawBody: { model: "routed-model", input: "read", tools: rawTools },
+    }, { headers: new Headers() });
+    const aliases = built.convertedRoutedNamespaceToolAliases;
+    const names = built.convertedRoutedCustomToolNames;
+    if (!aliases || !names) throw new Error("Missing adapter conversion provenance");
+    expect([...names]).toEqual([`${customNamespace}__read`]);
+    expect(JSON.parse(built.body).tools).toMatchObject([
+      { type: "function", name: `${customNamespace}__read` },
+      { type: "function", name: `${functionNamespace}__read` },
+    ]);
+    for (const separator of ["__", "."]) {
+      const name = `${customNamespace}${separator}read`;
+      expect(aliases.get(name)?.kind).toBe("custom");
+      expect(aliases.get(`${functionNamespace}${separator}read`)?.kind).toBe("function");
+      const call = type === "function_call" ? { ...customUpstreamItem, name } : {
+        type, name, id: "ctc_custom_read", call_id: "call_custom_read", input: "freeform payload", status: "completed",
+      };
+      const restored = restoreRoutedNamespaceCalls({ output: [call] }, aliases);
+      expect(restored.changed).toBe(true);
+      expect(restoreRoutedCustomCalls(restored.value, names).value).toEqual({ output: [{
+        type: "custom_tool_call", name: "read", namespace: customNamespace,
+        id: "ctc_custom_read", call_id: "call_custom_read", input: "freeform payload", status: "completed",
+      }] });
+      const mismatched = { type: "custom_tool_call", name: `${functionNamespace}${separator}read`, input: "opaque payload" };
+      expect(restoreRoutedNamespaceCalls(mismatched, aliases)).toEqual({ value: mismatched, changed: false });
+    }
+  });
+
+  test("adapter custom provenance does not add excluded or colliding namespace aliases", () => {
+    const adapter = createResponsesPassthroughAdapter(config.providers.fixture!);
+    const build = (tools: unknown[], tool_choice: unknown) => adapter.buildRequest({
+      modelId: "routed-model", context: { messages: [] }, stream: false, options: {},
+      _rawBody: { model: "routed-model", input: "read", tools, tool_choice },
+    }, { headers: new Headers() });
+    expect(build(rawTools, "none").convertedRoutedNamespaceToolAliases?.size).toBe(0);
+    const selected = build(rawTools, { type: "function", namespace: functionNamespace, name: "read" });
+    expect([...selected.convertedRoutedNamespaceToolAliases!.keys()])
+      .toEqual([`${functionNamespace}__read`, `${functionNamespace}.read`]);
+    const customSelected = build(rawTools, { type: "custom", namespace: customNamespace, name: "read" });
+    expect([...customSelected.convertedRoutedNamespaceToolAliases!.keys()])
+      .toEqual([`${customNamespace}__read`, `${customNamespace}.read`]);
+    expect(customSelected.convertedRoutedNamespaceToolAliases?.get(`${customNamespace}__read`)?.kind).toBe("custom");
+    const collision = build([...rawTools, { type: "function", name: `${customNamespace}.read`, parameters: {} }], "auto");
+    expect(collision.convertedRoutedNamespaceToolAliases?.has(`${customNamespace}.read`)).toBe(false);
+    expect(collision.convertedRoutedNamespaceToolAliases?.get(`${customNamespace}__read`)?.kind).toBe("custom");
+    expect(() => build([...rawTools, { type: "function", name: `${customNamespace}__read`, parameters: {} }], "auto"))
+      .toThrow("namespace tool wire-name collision");
+  });
 
   test("round-trips same-named namespaced custom and function calls through JSON and SSE", async () => {
     const adapter = createResponsesPassthroughAdapter(config.providers.fixture!);

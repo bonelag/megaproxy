@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { shouldInjectApiAuthHeader } from "../../codex/loopback-target";
 
 /**
  * Codex parses a catalog entry's `input_modalities` as a closed enum, and one out-of-enum
@@ -183,6 +184,17 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
   // bypass this seam with a dynamic config import — doing so replaced a user's
   // ~/.opencodex/config.json with the `existing-uuid` test fixture.
   const persistConfig = deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode;
+  const convergeVisibleCatalogs = async () => {
+    const catalogRefresh = await convergeCodexCatalog();
+    const refresh = deps.refreshOwnedCatalogIntegrations
+      ?? (await import("../../integrations/catalog-refresh")).refreshOwnedCatalogIntegrations;
+    const clientIntegrations = await refresh({
+      config,
+      port: Number(url.port) || config.port,
+      models: () => loadExportModels(config),
+    });
+    return { catalogRefresh, clientIntegrations };
+  };
 
   if (url.pathname === "/api/model-discovery" && req.method === "GET") {
     const providers = Object.fromEntries(Object.entries(config.providers).map(([name, provider]) => [
@@ -469,6 +481,13 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       if (!(error instanceof ClientPathError)) throw error;
       return jsonResponse({ error: error.message }, 400, req, config);
     }
+    if (requested === "raycast" && shouldInjectApiAuthHeader(config)) {
+      return jsonResponse({
+        error: "Raycast export requires an unauthenticated loopback destination; this listener requires an admission header Raycast cannot supply.",
+        reason: "non_loopback",
+      }, 400, req, config);
+    }
+    const baseUrl = opencodeProxyBaseUrl(Number(url.port) || config.port, config.hostname, config);
     let models: ExportModel[];
     try {
       // The ONE loader every export surface uses. It carries the visibility
@@ -488,7 +507,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       );
     }
     const built = buildClientConfigText(requested, {
-      baseUrl: opencodeProxyBaseUrl(Number(url.port) || config.port, config.hostname),
+      baseUrl,
       models,
       config,
     });
@@ -518,8 +537,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     const disabled = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === "string") : [];
     config.disabledModels = disabled;
     persistConfig(config);
-    const catalogRefresh = await convergeCodexCatalog();
-    return jsonResponse({ ok: true, disabled, catalogRefresh });
+    return jsonResponse({ ok: true, disabled, ...await convergeVisibleCatalogs() });
   }
 
   // One user-facing visibility switch spans two persisted filters: a provider allowlist and the
@@ -566,7 +584,10 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       }
       const id = value.id.trim();
       const native = value.native === true;
-      if (!id || (provider === "openai") !== native || (native && !supportedNative.has(id))) {
+      const configuredOpenAiCustom = provider === "openai" && !native && providerConfig
+        && (config.customModels ?? []).some(model => model.provider === provider && model.modelId === id);
+      if (!id || (native && (provider !== "openai" || !supportedNative.has(id)))
+        || (provider === "openai" && !native && !configuredOpenAiCustom)) {
         return jsonResponse({ error: "invalid model visibility target" }, 400);
       }
       const key = `${native ? "native" : "routed"}:${id}`;
@@ -641,8 +662,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
 
     config.disabledModels = disabled;
     persistConfig(config);
-    const catalogRefresh = await convergeCodexCatalog();
-    return jsonResponse({ ok: true, scope, provider, enabled: body.enabled, disabled, catalogRefresh });
+    return jsonResponse({ ok: true, scope, provider, enabled: body.enabled, disabled, ...await convergeVisibleCatalogs() });
   }
 
   if (url.pathname === "/api/custom-models" && req.method === "GET") {
@@ -862,7 +882,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       delete target.selectedModels;
       delete target.modelPreset;
       persistConfig(config);
-      return jsonResponse({ ok: true, provider, mode, selected: [], catalogRefresh: await convergeCodexCatalog() });
+      return jsonResponse({ ok: true, provider, mode, selected: [], ...await convergeVisibleCatalogs() });
     }
     if (mode === "custom") {
       // Keep whatever is selected; only the marker changes, so a user can pin their edits
@@ -907,7 +927,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       mode: "preset",
       appliedVersion: preset.version,
       selected: presetIds,
-      catalogRefresh: await convergeCodexCatalog(),
+      ...await convergeVisibleCatalogs(),
     });
   }
   if (url.pathname === "/api/selected-models" && req.method === "PUT") {
@@ -931,8 +951,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     // re-materialize over it afterwards.
     markModelPresetDiverged(config.providers[provider]);
     persistConfig(config);
-    const catalogRefresh = await convergeCodexCatalog();
-    return jsonResponse({ ok: true, provider, selected: models, catalogRefresh });
+    return jsonResponse({ ok: true, provider, selected: models, ...await convergeVisibleCatalogs() });
   }
   return null;
 }

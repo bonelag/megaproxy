@@ -4,11 +4,12 @@
  * contract; every other gateway has to be driven as a plain summarizer, or Codex
  * fatals on a compaction turn that came back as an ordinary message.
  */
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, jest, spyOn, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleResponses, handleResponsesCompact } from "../../src/server/responses";
+import { looksLikeBackendCiphertext } from "../../src/server/responses/encrypted-payload";
 import * as adapterResolveModule from "../../src/server/adapter-resolve";
 import * as visionModule from "../../src/vision";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
@@ -947,6 +948,57 @@ describe("compact alternate-account attempt (#913)", () => {
     });
   }
 
+  test("native compact headers followed by a stalled body return 504 without retry and release account cleanup", async () => {
+    await withPoolEnv("ocx-compact-body-deadline-", async config => {
+      config.stallTimeoutSec = 2;
+      const readStarted = Promise.withResolvers<void>();
+      let sends = 0;
+      let cancelled = 0;
+      let acceptedBody = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull() { readStarted.resolve(); },
+        cancel() { cancelled++; return new Promise<void>(() => {}); },
+      }, { highWaterMark: 0 });
+      globalThis.fetch = (async () => {
+        sends++;
+        return new Response(body, { headers: { "content-type": "application/json" } });
+      }) as typeof fetch;
+      const releaseSpy = spyOn(authContextModule, "releaseCodexAuthContextProbeLease");
+      const client = new AbortController();
+      // Same scoped, non-concurrent Bun timer control as responses/ws-upstream.test.ts.
+      jest.useFakeTimers();
+      const pending = handleResponsesCompact(
+        compactionRequest({ model: "gpt-5.5", input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "earlier turn" }] },
+        ] }, client.signal), config, { model: "", provider: "" },
+        undefined, undefined, { onRequestBodyRead: () => { acceptedBody = true; } },
+      );
+      try {
+        await Promise.race([
+          readStarted.promise,
+          pending.then(response => { throw new Error(`compact returned ${response.status} before reading its body`); }),
+        ]);
+        expect(acceptedBody).toBe(true);
+        expect(sends).toBe(1);
+        jest.advanceTimersByTime(2_000);
+        const response = await pending;
+        expect(response.status).toBe(504);
+        expect(await response.json()).toMatchObject({ error: { code: "upstream_stall_timeout" } });
+        expect(sends).toBe(1);
+        expect(cancelled).toBe(1);
+        expect(body.locked).toBe(false);
+        expect(releaseSpy).toHaveBeenCalledWith(expect.objectContaining({ kind: "pool", accountId: "pool-a" }));
+      } finally {
+        client.abort();
+        try { await pending; } finally {
+          jest.clearAllTimers();
+          jest.useRealTimers();
+          releaseSpy.mockRestore();
+        }
+      }
+    });
+  });
+
   test("canonical trailing slashes are pinned before native compact sends pool credentials", async () => {
     await withPoolEnv("ocx-compact-canonical-url-", async config => {
       config.providers.openai!.baseUrl = "https://chatgpt.com/backend-api/codex///";
@@ -1629,6 +1681,233 @@ describe("computer screenshot output translation boundary", () => {
       { type: "image_url", image_url: { url: "https://example.com/ordinary.png" } },
     ] }]);
   });
+});
+
+describe("external task-input envelopes (#3735)", () => {
+  // Synthetic charset/length fixture: short plaintext in this slot is deliberately
+  // normalized to input_text before parsing, so it cannot exercise opaque rejection.
+  const opaqueOutput = `g${"A".repeat(127)}`;
+  const external = (output: unknown = "external task input") => ({
+    type: "function_call_output", id: "external-fixture", name: "handoff_input", namespace: "task_inbox", output,
+  });
+  const body = (item: Record<string, unknown>) => ({
+    model: "gw/model", stream: false, input: [item],
+  });
+
+  test("opaque negative fixtures survive the plaintext-slot classifier", () => {
+    expect(looksLikeBackendCiphertext(opaqueOutput)).toBe(true);
+  });
+
+  test("sends a complete envelope as user text without an orphan-tool marker", async () => {
+    const captured: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured.push(JSON.parse(String(init?.body)));
+      return jsonResponse({ id: "chat_external", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+    }) as typeof fetch;
+    const res = await handleResponses(compactionRequest(body(external("  preserve this input\n"))),
+      keyProviderConfig({ adapter: "openai-chat" }), { model: "", provider: "" });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.messages).toEqual([{ role: "user", content: "  preserve this input\n" }]);
+    expect(JSON.stringify(captured)).not.toContain("[tool output for unknown call]");
+  });
+
+  test("preserves ordered text and image content through translation", async () => {
+    const captured: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured.push(JSON.parse(String(init?.body)));
+      return jsonResponse({ id: "chat_external_image", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+    }) as typeof fetch;
+    const res = await handleResponses(compactionRequest(body(external([
+      { type: "output_text", text: "inspect " },
+      { type: "input_image", image_url: "https://example.com/task.png", detail: "original" },
+      { type: "input_text", text: " then continue" },
+    ]))), keyProviderConfig({ adapter: "openai-chat" }), { model: "", provider: "" });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.messages).toEqual([{ role: "user", content: [
+      { type: "text", text: "inspect " },
+      { type: "image_url", image_url: { url: "https://example.com/task.png", detail: "high" } },
+      { type: "text", text: " then continue" },
+    ] }]);
+  });
+
+  test("retains existing plaintext-slot normalization before task-input admission", async () => {
+    const captured: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured.push(JSON.parse(String(init?.body)));
+      return jsonResponse({ id: "chat_plaintext_slot", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+    }) as typeof fetch;
+    const res = await handleResponses(compactionRequest(body(external([
+      { type: "encrypted_content", encrypted_content: "plaintext task" },
+    ]))), keyProviderConfig({ adapter: "openai-chat" }), { model: "", provider: "" });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.messages).toEqual([{ role: "user", content: "plaintext task" }]);
+  });
+
+  const invalid: Array<[string, Record<string, unknown>]> = [
+    ["empty call id", { ...external(), call_id: "" }],
+    ["null call id", { ...external(), call_id: null }],
+    ["numeric call id", { ...external(), call_id: 42 }],
+    ["incomplete metadata", { ...external(), namespace: "" }],
+    ["custom output", { ...external(), type: "custom_tool_call_output" }],
+    ["blank output", external("  ")],
+    ["empty output array", external([])],
+    ["opaque output", external([{ type: "encrypted_content", encrypted_content: opaqueOutput }])],
+    ["mixed opaque output", external([{ type: "input_text", text: "retained input" }, { type: "encrypted_content", encrypted_content: opaqueOutput }])],
+    ["malformed image", external([{ type: "input_image", image_url: 42 }])],
+  ];
+  for (const [name, item] of invalid) {
+    test(`rejects ${name} before upstream work`, async () => {
+      let fetches = 0;
+      globalThis.fetch = (async () => { fetches++; throw new Error("invalid envelope reached upstream"); }) as typeof fetch;
+      const res = await handleResponses(compactionRequest(body(item)),
+        keyProviderConfig({ adapter: "openai-chat" }), { model: "", provider: "" });
+      expect(res.status).toBe(400);
+      const error = await res.json() as { error?: { message?: string } };
+      expect(error.error?.message).toBe("tool result requires a non-empty string call_id");
+      expect(fetches).toBe(0);
+      expect(JSON.stringify(error)).not.toContain("retained input");
+    });
+  }
+});
+
+describe("established-history external task input (#3807)", () => {
+  // Synthetic complete envelope from the #3735 contract; #3807's history rendering
+  // is not a captured outbound request. Keep the real tool pair distinct from delivery.
+  const deliveryText = "  Follow up on the earlier tool result.\n";
+  const acknowledged = "Delivery acknowledged.";
+  const continuationText = "Continue the established task.";
+  const summary = "Earlier tool returned 7; follow-up delivery is pending.";
+  const history = () => [
+    { type: "message", role: "user", content: "Read the earlier value." },
+    { type: "function_call", call_id: "call_history", name: "read_value", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_history", output: "earlier value: 7" },
+    { type: "message", role: "assistant", content: "Earlier result recorded." },
+    {
+      type: "function_call_output", id: "fco_external_followup",
+      name: "send_message_to_thread", namespace: "codex_app", output: deliveryText,
+    },
+  ];
+  const requestBody = () => ({
+    model: "gw/model", stream: false, store: false, input: history(),
+    tools: [{ type: "function", name: "read_value", parameters: { type: "object", properties: {} } }],
+  });
+  const wireHistory = [
+    { role: "user", content: "Read the earlier value." },
+    { role: "assistant", tool_calls: [{ id: "call_history", type: "function", function: { name: "read_value", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "call_history", content: "earlier value: 7" },
+    { role: "assistant", content: "Earlier result recorded." },
+    { role: "user", content: deliveryText },
+  ];
+
+  function captureChat(text: string): Array<Record<string, unknown>> {
+    const captured: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured.push(JSON.parse(String(init?.body)));
+      return jsonResponse({
+        choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+    }) as typeof fetch;
+    return captured;
+  }
+
+  function expectHistory(
+    sent: Record<string, unknown>,
+    tail: Array<Record<string, unknown>> = [],
+    withToolCatalog = true,
+  ) {
+    const messages = sent.messages as Array<Record<string, unknown>>;
+    // Ordinary non-OpenAI chat turns prepend catalog guidance; compaction removes
+    // context.tools before translation. Require that exact prefix, not arbitrary extras.
+    const prefix = withToolCatalog ? [{
+      role: "system",
+      content: expect.stringContaining("Valid tool names for this turn are exactly `read_value`."),
+    }] : [];
+    expect(messages).toHaveLength(prefix.length + wireHistory.length + tail.length);
+    expect(messages).toMatchObject([...prefix, ...wireHistory, ...tail]);
+    // Exactly one original pair: delivery must not acquire a synthesized tool identity.
+    expect(messages.flatMap(message => message.tool_calls ?? [])).toEqual(wireHistory[1]!.tool_calls);
+    expect(messages.filter(message => message.role === "tool")).toEqual([wireHistory[2]]);
+    expect(JSON.stringify(sent)).not.toContain("[tool output for unknown call]");
+  }
+
+  test("ordinary response preserves inter-task delivery after an established tool pair", async () => {
+    const captured = captureChat(acknowledged);
+    const res = await handleResponses(compactionRequest(requestBody()),
+      keyProviderConfig({ adapter: "openai-chat" }), { model: "", provider: "" });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { status?: string };
+    expect(json.status).toBe("completed");
+    expect(captured).toHaveLength(1);
+    expectHistory(captured[0]!);
+  });
+
+  test("stored-ID continuation replays the established tool pair and inter-task delivery in order", async () => {
+    const captured = captureChat(acknowledged);
+    const config = keyProviderConfig({ adapter: "openai-chat" });
+    const first = await handleResponses(compactionRequest({ ...requestBody(), store: true }),
+      config, { model: "", provider: "" });
+    expect(first.status).toBe(200);
+    const saved = await first.json() as { id: string; status?: string };
+    expect(saved.status).toBe("completed");
+    expect(typeof saved.id).toBe("string");
+    expect(saved.id.length).toBeGreaterThan(0);
+    expect(captured).toHaveLength(1);
+    expectHistory(captured[0]!);
+
+    // Send only the new user turn: the handler must retrieve the previous raw history.
+    const res = await handleResponses(compactionRequest({
+      ...requestBody(), previous_response_id: saved.id,
+      input: [{ type: "message", role: "user", content: continuationText }],
+    }), config, { model: "", provider: "" });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { status?: string };
+    expect(json.status).toBe("completed");
+    expect(captured).toHaveLength(2);
+    expectHistory(captured[1]!, [
+      { role: "assistant", content: acknowledged },
+      { role: "user", content: continuationText },
+    ]);
+  });
+
+  for (const version of ["v2 trigger", "v1 compact"] as const) {
+    test(`${version} preserves established-history delivery and pairing before summarization`, async () => {
+      const captured = captureChat(summary);
+      const config = keyProviderConfig({ adapter: "openai-chat" });
+      const res = version === "v2 trigger"
+        ? await handleResponses(compactionRequest({
+          ...requestBody(), input: [...history(), { type: "compaction_trigger" }],
+        }), config, { model: "", provider: "" })
+        : await handleResponsesCompact(new Request("http://localhost/v1/responses/compact", {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(requestBody()),
+        }), config, { model: "", provider: "" });
+      expect(res.status).toBe(200);
+      const json = await res.json() as { output: Array<Record<string, unknown>> };
+      expect(captured).toHaveLength(1);
+      expectHistory(captured[0]!, [
+        { role: "user", content: expect.stringContaining("CONTEXT CHECKPOINT COMPACTION") },
+      ], false);
+      expect(captured[0]!.tools).toBeUndefined();
+      expect(JSON.stringify(captured)).not.toContain("compaction_trigger");
+      if (version === "v2 trigger") {
+        expect(json.output.filter(item => item.type === "compaction")).toEqual([{
+          type: "compaction", id: expect.stringMatching(/^cmp_/),
+          encrypted_content: `ocx1:${Buffer.from(summary, "utf8").toString("base64")}`,
+        }]);
+      } else {
+        expect(json.output).toEqual([
+          { type: "message", role: "user", content: [{ type: "input_text", text: "Read the earlier value." }] },
+          { type: "message", role: "user", content: [{ type: "input_text", text: expect.stringContaining(`\n${summary}`) }] },
+        ]);
+      }
+    });
+  }
 });
 
 describe("unpaired tool result boundary (#3259)", () => {

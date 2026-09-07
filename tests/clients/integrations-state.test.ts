@@ -401,6 +401,25 @@ describe("classifier unit behavior", () => {
     expect(parseConfig("{{{", "json")).toBe(PARSE_FAILED);
   });
 
+  test("parseConfig refuses typed TOML dates before a JSON clone can turn them into strings", () => {
+    for (const literal of [
+      "2026-09-05T10:00:00Z",
+      "2026-09-05T10:00:00-07:00",
+      "2026-09-05T10:00:00.123456",
+      "2026-09-05",
+      "10:00:00.123456",
+    ]) {
+      for (const text of [
+        `expires = ${literal}\n`,
+        `[user]\nexpires = ${literal}\n`,
+        `items = [{ expires = ${literal} }]\n`,
+      ]) {
+        expect(parseConfig(text, "toml")).toBe(PARSE_FAILED);
+      }
+      expect(parseConfig(`expires = "${literal}"\n`, "toml")).toEqual({ expires: literal });
+    }
+  });
+
   test("parseConfig refuses json number literals a rewrite would change", () => {
     // Overflow to Infinity — a rewrite would bake in null.
     expect(parseConfig("{\"a\": 1e999}", "json")).toBe(PARSE_FAILED);
@@ -756,9 +775,9 @@ describe("installation detection is independent of config state", () => {
  * from. Rationale and the per-client table: 020 §1 amendment.
  */
 describe("the loopback-only set is one fact, read through one seam", () => {
-  test("omp, pi, kimi, gajae, dsh, mcode, zcode, prime and aside are loopback-only and nobody else is", () => {
+  test("omp, pi, kimi, gajae, dsh, mcode, zcode, prime, aside and raycast are loopback-only and nobody else is", () => {
     const loopbackOnly = INTEGRATION_CLIENT_IDS.filter(id => isLoopbackOnly(id));
-    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside"]);
+    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside", "raycast"]);
   });
 
   test("the registry restates nothing — it reads the export spec", () => {
