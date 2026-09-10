@@ -358,6 +358,43 @@ function reasoningDetailSegmentForWire(text: string): Record<string, unknown> {
   return { type: "reasoning.text", id: "reasoning-text-1", format: "MiniMax-response-v1", index: 0, text };
 }
 
+function shouldPreserveReasoningContent(
+  provider: OcxProviderConfig,
+  modelId: string,
+): boolean {
+  if (modelInList(provider.preserveReasoningContentModels, modelId)) return true;
+  const lower = modelId.toLowerCase();
+  if (
+    lower.includes("deepseek-reasoner")
+    || lower.includes("deepseek-r1")
+    || (lower.includes("deepseek") && (lower.includes("reason") || lower.includes("r1") || lower.includes("thinking") || lower.includes("v4")))
+  ) {
+    return true;
+  }
+  if (
+    provider.adapter === "openai-chat"
+    && (provider.baseUrl?.includes("deepseek.com") || (provider as { id?: string }).id === "deepseek")
+    && !lower.includes("deepseek-chat")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function shouldInjectReasoningPlaceholder(
+  provider: OcxProviderConfig,
+  modelId: string,
+): boolean {
+  if (Array.isArray(provider.requiresReasoningPlaceholderModels) && !modelInList(provider.requiresReasoningPlaceholderModels, modelId)) {
+    return false;
+  }
+  if (modelInList(provider.requiresReasoningPlaceholderModels ?? provider.preserveReasoningContentModels, modelId)) {
+    return true;
+  }
+  return shouldPreserveReasoningContent(provider, modelId);
+}
+
+
 function invalidChoicesEvent(usage?: OcxUsage): Extract<AdapterEvent, { type: "error" }> {
   return {
     type: "error",
@@ -777,7 +814,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
         if (
           reasoningContent.length === 0
           && toolCalls.length > 0
-          && modelInList(provider.preserveReasoningContentModels, parsed.modelId)
+          && shouldPreserveReasoningContent(provider, parsed.modelId)
         ) {
           const cached = toolCalls
             .map(tc => (tc.id ? peekReasoningForCall(tc.id, replayCacheScope) : undefined))
@@ -786,7 +823,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           // recorded under every call id — join unique texts only.
           if (cached.length > 0) {
             reasoningContent = [...new Set(cached)].join("\n");
-          } else if (modelInList(provider.requiresReasoningPlaceholderModels ?? provider.preserveReasoningContentModels, parsed.modelId)) {
+          } else if (shouldInjectReasoningPlaceholder(provider, parsed.modelId)) {
             // Fallback (extends #950, closes #1193): the replay cache is
             // bounded (64 entries / 256 KiB / 1 h TTL) and always misses on
             // long sessions, and some tool rounds carry no recorded reasoning
@@ -799,8 +836,15 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
             // non-thinking histories are never given a fabricated placeholder.
             reasoningContent = " ";
           }
+        } else if (
+          reasoningContent.length === 0
+          && toolCalls.length === 0
+          && shouldPreserveReasoningContent(provider, parsed.modelId)
+          && shouldInjectReasoningPlaceholder(provider, parsed.modelId)
+        ) {
+          reasoningContent = " ";
         }
-        if (reasoningContent.length > 0 && modelInList(provider.preserveReasoningContentModels, parsed.modelId)) {
+        if (reasoningContent.length > 0 && shouldPreserveReasoningContent(provider, parsed.modelId)) {
           // MiniMax's interleaved-thinking contract requires the structured
           // reasoning_details array back on the next turn; a reasoning_content
           // string is the native-format pass-back the docs mark unsupported.
@@ -854,7 +898,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           flushPendingToolCalls();
           const name = safeToolName(msg.toolName);
           const cachedReasoning =
-            toolCallId && modelInList(provider.preserveReasoningContentModels, parsed.modelId)
+            toolCallId && shouldPreserveReasoningContent(provider, parsed.modelId)
               ? peekReasoningForCall(toolCallId, replayCacheScope)
               : undefined;
           // Same fallback as the main-assistant path: never emit a bare orphan
@@ -868,8 +912,8 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           // falsy hit as a miss so the placeholder still fires.
           const orphanReasoning =
             cachedReasoning
-            || (modelInList(provider.preserveReasoningContentModels, parsed.modelId)
-              && modelInList(provider.requiresReasoningPlaceholderModels ?? provider.preserveReasoningContentModels, parsed.modelId)
+            || (shouldPreserveReasoningContent(provider, parsed.modelId)
+              && shouldInjectReasoningPlaceholder(provider, parsed.modelId)
               ? " "
               : undefined);
           const orphanReasoningFields: Record<string, unknown> = !orphanReasoning

@@ -119,6 +119,28 @@ function assistantContentToBlocks(content: unknown): Rec[] {
   return blocks;
 }
 
+function extractAssistantReasoning(msg: Rec): string | undefined {
+  if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) {
+    return msg.reasoning_content;
+  }
+  if (typeof msg.reasoning === "string" && msg.reasoning.length > 0) {
+    return msg.reasoning;
+  }
+  if (Array.isArray(msg.content)) {
+    for (const part of msg.content) {
+      if (isRec(part) && (part.type === "thinking" || part.type === "reasoning")) {
+        if (typeof part.thinking === "string" && part.thinking.length > 0) {
+          return part.thinking;
+        }
+        if (typeof part.text === "string" && part.text.length > 0) {
+          return part.text;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
 function pushSystemText(parts: string[], content: unknown): void {
   const text = contentToText(content).trim();
   if (text) parts.push(text);
@@ -279,8 +301,20 @@ export function chatCompletionsToResponsesBody(raw: unknown): Rec {
         break;
       }
       case "assistant": {
+        const reasoningText = extractAssistantReasoning(msg);
+        if (reasoningText) {
+          input.push({
+            type: "reasoning",
+            id: `rs_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+            summary: [{ type: "summary_text", text: reasoningText }],
+          });
+        }
         const blocks = assistantContentToBlocks(msg.content);
-        if (blocks.length > 0) input.push({ type: "message", role: "assistant", content: blocks });
+        if (blocks.length > 0) {
+          input.push({ type: "message", role: "assistant", content: blocks });
+        } else if (reasoningText && msg.tool_calls === undefined) {
+          input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: "" }] });
+        }
         if (msg.tool_calls !== undefined) toolCallsToItems(msg.tool_calls, input, knownNameByCallId);
         break;
       }

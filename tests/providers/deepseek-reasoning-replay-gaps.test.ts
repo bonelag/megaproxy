@@ -349,6 +349,49 @@ describe("issue #950 — tool-call reasoning replay invariant (openai-chat wire)
     expect(assistant).toBeDefined();
     expect(assistant!["reasoning_content"]).toBe(" ");
   });
+
+  test("text-only assistant turns in thinking mode receive reasoning placeholder when omitted", () => {
+    const { messages } = wireFor([
+      userMessage(),
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "hello" }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "next question" }] },
+    ]);
+    const assistant = messages.find(m => m.role === "assistant");
+    expect(assistant).toBeDefined();
+    expect(assistant!["reasoning_content"]).toBe(" ");
+  });
+
+  test("deepseek-reasoner preserves reasoning_content on custom or unlisted provider config", () => {
+    const parsed = parseRequest({
+      model: "custom-deepseek/deepseek-reasoner",
+      input: [
+        userMessage(),
+        reasoningItem(),
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "computed answer" }] },
+        userMessage(),
+      ],
+      stream: true,
+    });
+    const config: OcxConfig = {
+      port: 10100,
+      defaultProvider: "custom-deepseek",
+      providers: {
+        "custom-deepseek": {
+          adapter: "openai-chat",
+          baseUrl: "https://api.deepseek.com/v1",
+          apiKey: "key",
+          models: ["deepseek-reasoner"],
+        },
+      },
+    };
+    const route = routeModel(config, parsed.modelId);
+    parsed.modelId = route.modelId;
+    const req = createOpenAIChatAdapter(route.provider).buildRequest(parsed as OcxParsedRequest);
+    const { messages } = JSON.parse(req.body as string) as { messages: Array<Record<string, unknown>> };
+    const assistant = messages.find(m => m.role === "assistant");
+    expect(assistant).toBeDefined();
+    expect(assistant!["reasoning_content"]).toBe(REASONING);
+  });
 });
 
 describe("issue #950 — reasoning replay cache bounds", () => {

@@ -238,6 +238,45 @@ test("chatCompletionsToResponsesBody maps messages/tools/system", () => {
   expect(input.some(i => i.type === "function_call_output" && i.call_id === "call_1")).toBe(true);
 });
 
+test("chatCompletionsToResponsesBody preserves reasoning_content on assistant messages", () => {
+  const body = chatCompletionsToResponsesBody({
+    model: "mock/test-model",
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello", reasoning_content: "thinking about greetings" },
+      { role: "user", content: "next" },
+    ],
+  });
+  const input = body.input as Array<Record<string, unknown>>;
+  const reasoningItem = input.find(i => i.type === "reasoning");
+  expect(reasoningItem).toBeDefined();
+  expect(reasoningItem?.summary).toEqual([{ type: "summary_text", text: "thinking about greetings" }]);
+  const assistantMsg = input.find(i => i.type === "message" && i.role === "assistant");
+  expect(assistantMsg).toBeDefined();
+  expect(assistantMsg?.content).toEqual([{ type: "output_text", text: "hello" }]);
+});
+
+test("chatCompletionsToResponsesBody preserves assistant reasoning with tool_calls and null content", () => {
+  const body = chatCompletionsToResponsesBody({
+    model: "mock/test-model",
+    messages: [
+      { role: "user", content: "read file" },
+      {
+        role: "assistant",
+        content: null,
+        reasoning_content: "I need to call read_file",
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "read_file", arguments: "{}" } }],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "done" },
+    ],
+  });
+  const input = body.input as Array<Record<string, unknown>>;
+  const reasoningItem = input.find(i => i.type === "reasoning");
+  expect(reasoningItem).toBeDefined();
+  expect(reasoningItem?.summary).toEqual([{ type: "summary_text", text: "I need to call read_file" }]);
+  expect(input.some(i => i.type === "function_call" && i.call_id === "call_1")).toBe(true);
+});
+
 describe("chatCompletionsToResponsesBody image parts", () => {
   test.each([
     { part: { type: "image_url", image_url: "https://example.com/image.png" }, expected: { type: "input_image", image_url: "https://example.com/image.png" } },

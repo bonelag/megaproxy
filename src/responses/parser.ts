@@ -258,11 +258,30 @@ export function parseRequest(
           }
           case "assistant": {
             const parts = outputTextOf(msg.content);
+            const thinkingInContent: OcxThinkingContent[] = [];
+            if (Array.isArray(msg.content)) {
+              for (const part of msg.content) {
+                if (isObj(part) && (part.type === "thinking" || part.type === "reasoning")) {
+                  const thinking = typeof part.thinking === "string" ? part.thinking
+                    : typeof part.text === "string" ? part.text
+                    : "";
+                  if (thinking.length > 0) {
+                    thinkingInContent.push({
+                      type: "thinking",
+                      thinking,
+                      ...(typeof part.signature === "string" ? { signature: part.signature } : {}),
+                    });
+                  }
+                }
+              }
+            }
             messages.push({
               role: "assistant",
-              content: pendingReasoning.length > 0
-                ? [...pendingReasoning.map(entry => entry.part), ...parts]
-                : parts,
+              content: [
+                ...pendingReasoning.map(entry => entry.part),
+                ...thinkingInContent,
+                ...parts,
+              ],
               ...(msg.phase ? { phase: msg.phase } : {}),
               model: data.model,
               timestamp: now,
