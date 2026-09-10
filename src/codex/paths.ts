@@ -1,4 +1,4 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { expandUserPath } from "../config";
 import { defaultCodexHome } from "./home";
@@ -7,6 +7,11 @@ function resolveCodexHome(): string {
   const raw = process.env.CODEX_HOME?.trim();
   if (raw) {
     const path = resolve(expandUserPath(raw));
+    try {
+      mkdirSync(path, { recursive: true });
+    } catch {
+      // Best effort; statSync below will catch real errors
+    }
     let stat;
     try {
       stat = statSync(path);
