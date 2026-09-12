@@ -36,7 +36,7 @@ package-lock.json
 # an empty file behind, and they accumulate in whatever directory the check ran
 # from. They are machine-local scratch and must never be committed.
 .dirfd-probe-*
-
+devlog
 # Local agent/session artifacts
 # These are per-machine agent state (goalplans, ledgers, evidence scratch).
 # They are never part of the product and must not be committed, not even with
