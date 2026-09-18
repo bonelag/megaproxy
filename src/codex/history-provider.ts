@@ -8,6 +8,7 @@ import { atomicWriteFile, getConfigDir } from "../config";
 import {
   CODEX_HISTORY_RESUMABLE_SOURCES,
   codexHistoryBackupId,
+  legacyCodexHistoryBackupId,
   sameCodexHistoryPath,
   validateCodexHistoryBackupManifest,
   type CodexHistoryBackupEntry,
@@ -33,6 +34,32 @@ export function historyBackupPathFor(stateDbPath: string): string {
 }
 
 /**
+ * Manifest name a database path spelled with the Win32 extended-length prefix
+ * (`\\?\C:\...`) received before that prefix was normalized out of the identity
+ * (#4442). Identical to historyBackupPathFor for every other spelling.
+ */
+export function legacyHistoryBackupPathFor(stateDbPath: string): string {
+  return join(getConfigDir(), `codex-history-backup-${legacyCodexHistoryBackupId(stateDbPath)}.json`);
+}
+
+/**
+ * The manifest that actually shadows one state database. Canonical name first; when
+ * only a pre-#4442 extended-length name exists, that manifest still shadows the
+ * database rather than reading as absent. When BOTH names exist the canonical
+ * manifest wins and the legacy file is left untouched — a conflict is resolved by
+ * keeping both, never by silently replacing one.
+ */
+export function resolveExistingHistoryBackupPath(
+  stateDbPath: string,
+  exists: (path: string) => boolean = existsSync,
+): string {
+  const canonical = historyBackupPathFor(stateDbPath);
+  if (exists(canonical)) return canonical;
+  const legacy = legacyHistoryBackupPathFor(stateDbPath);
+  return legacy !== canonical && exists(legacy) ? legacy : canonical;
+}
+
+/**
  * Open the live `state_5.sqlite` the way the Codex app expects a *secondary* writer to behave:
  * wait on the WAL/file lock instead of failing instantly, so we never race the app's own
  * connection pool into a half-applied checkpoint. The app opens this DB with `busy_timeout=5s`
@@ -47,6 +74,22 @@ let historyDbBusyTimeoutMs = 5000;
  */
 export function setHistoryDbBusyTimeoutForTests(ms: number): void {
   historyDbBusyTimeoutMs = ms;
+}
+
+/**
+ * Carry that timeout across a realm boundary. A Worker starts from the default above and cannot
+ * observe a parent that shortened the window — the same reason its run message carries the homes
+ * explicitly — so `history-job.ts` sends this value and `history-worker.ts` adopts it. In
+ * production both sides already hold the codex-rs-matching 5s. A non-finite or negative value is
+ * refused rather than allowed to disable the wait the app expects.
+ */
+export function currentHistoryDbBusyTimeoutMs(): number {
+  return historyDbBusyTimeoutMs;
+}
+
+export function adoptHistoryDbBusyTimeout(ms: number): void {
+  if (!Number.isFinite(ms) || ms < 0) return;
+  historyDbBusyTimeoutMs = Math.floor(ms);
 }
 
 function openStateDb(stateDbPath: string): Database {
@@ -142,6 +185,41 @@ function readFirstRolloutLine(fd: number): string | null {
     if (collected.length > MAX_FIRST_LINE) return null;
   }
   return nlIndex === -1 ? null : collected.subarray(0, nlIndex).toString("utf8");
+}
+
+/**
+ * Bounded tail of complete JSONL lines, newest-last.
+ *
+ * Used to refuse a rollout that *became* paginated after a legacy first line
+ * (#4311). Line 1 can still look writable after a newer Codex migrates the
+ * thread in place, and the native projector then dies on the first
+ * out-of-sequence ordinal a legacy append introduces. Every record written
+ * after such a migration carries an ordinal, so the newest records are where
+ * the evidence is.
+ *
+ * One read of a fixed window from EOF, split once. An earlier draft grew the
+ * window chunk by chunk and re-decoded the accumulated buffer on every
+ * iteration, which is quadratic: a rollout whose only `session_meta` sits at
+ * the top would have decoded and split up to the whole window ~256 times. The
+ * window is a cap, not a target — it is not walked and it is not the file.
+ *
+ * Returns `null` only when the file cannot be measured, which the caller
+ * treats as an unreadable record rather than a writable rollout.
+ */
+const ROLLOUT_TAIL_WINDOW_BYTES = 1 << 20;
+
+function readRolloutTailCompleteLines(fd: number): string[] | null {
+  const size = Number(fstatSync(fd).size);
+  if (!Number.isFinite(size) || size < 0) return null;
+  if (size === 0) return [];
+  const start = Math.max(0, size - ROLLOUT_TAIL_WINDOW_BYTES);
+  const window = Buffer.alloc(size - start);
+  const read = readSync(fd, window, 0, window.length, start);
+  if (read === 0) return [];
+  const lines = window.subarray(0, read).toString("utf8").split("\n");
+  // Unless the window reached BOF, the first element starts mid-record (and
+  // possibly mid-codepoint), so it is not a complete line.
+  return (start === 0 ? lines : lines.slice(1)).filter(line => line.length > 0);
 }
 
 function planFirstLineProvider(firstLine: string, expectedId: string, provider: string): FirstLineProviderPlan {
@@ -249,6 +327,19 @@ class CodexHistoryIntegrityError extends Error {
  * O_APPEND does not allocate an ordinal or update that writer's in-memory cursor.
  * Refuse before changing the DB, manifest, or first-line provider; never guess N+1.
  */
+/**
+ * The one refusal reason that means "the native writer owns this history", as opposed
+ * to "something is wrong". It is a stand-down for the relabel unit on apply
+ * (`src/codex/inject.ts`) and for the history half of a restore; every other reason is
+ * a hard refusal in both directions.
+ *
+ * Exported as a constant rather than repeated as a literal because the apply and restore
+ * directions have to agree on it exactly. They drifted once already: apply learned to
+ * stand down while restore kept refusing, which is how #4812's uninstall deadlock
+ * survived the fix that was supposed to end it.
+ */
+export const HISTORY_RELABEL_STANDS_DOWN = "history_paginated_requires_native_writer";
+
 function assertLegacyHistoryRecord(line: string): void {
   let value: unknown;
   try { value = JSON.parse(line); } catch { throw new CodexHistoryIntegrityError("history_rollout_record_invalid"); }
@@ -258,7 +349,7 @@ function assertLegacyHistoryRecord(line: string): void {
   const record = value as Record<string, unknown>;
   const payload = record.payload;
   if (Object.hasOwn(record, "ordinal") || (payload !== null && typeof payload === "object" && (payload as Record<string, unknown>).history_mode === "paginated")) {
-    throw new CodexHistoryIntegrityError("history_paginated_requires_native_writer");
+    throw new CodexHistoryIntegrityError(HISTORY_RELABEL_STANDS_DOWN);
   }
 }
 
@@ -288,6 +379,26 @@ function assertLegacyHistoryWritable(path: string, heldFd?: number): void {
     const first = readFirstRolloutLine(fd);
     if (!first) throw new CodexHistoryIntegrityError("history_rollout_record_invalid");
     assertLegacyHistoryRecord(first);
+    // Line 1 is not enough: a newer Codex can migrate a live rollout in place,
+    // leaving the original session_meta and writing ordinals / history_mode only
+    // onto later records (#4311). The native projector then stops at the first
+    // cloned ordinal-0 append. Inspect a bounded window of the newest records
+    // and refuse before any mutation of the rollout, the row, or the manifest.
+    const tail = readRolloutTailCompleteLines(fd);
+    if (tail === null) throw new CodexHistoryIntegrityError("history_rollout_record_invalid");
+    if (tail.length === 0) return;
+    const last = tail[tail.length - 1];
+    if (!last) throw new CodexHistoryIntegrityError("history_rollout_record_invalid");
+    if (last !== first) assertLegacyHistoryRecord(last);
+    // Cheap filter: only re-parse tail lines that look paginated. Needed because
+    // a compensating append can make the last line look legacy again while an
+    // earlier-in-tail native conversion still carries ordinals (#4311).
+    for (const line of tail) {
+      if (line === first || line === last) continue;
+      if (line.includes("\"ordinal\"") || line.includes("\"history_mode\"")) {
+        assertLegacyHistoryRecord(line);
+      }
+    }
   } finally {
     if (heldFd === undefined) closeSync(fd);
   }
@@ -299,7 +410,7 @@ function assertLegacyHistoryWritable(path: string, heldFd?: number): void {
 function assertLegacyHistoryStore(db: Database): void {
   const columns = db.query<{ name: string }, []>("PRAGMA table_info(threads)").all();
   if (columns.some(column => column.name === "history_mode")) {
-    throw new CodexHistoryIntegrityError("history_paginated_requires_native_writer");
+    throw new CodexHistoryIntegrityError(HISTORY_RELABEL_STANDS_DOWN);
   }
 }
 
@@ -318,14 +429,14 @@ export function preflightCodexHistoryInjection(
     // A partially restored row may already be native while its manifest still
     // owns work. Match the restore worker's target set before removing routing.
     const restoreEntries = providerTableMode ? []
-      : Object.values(readBackup(historyBackupPathFor(resolvedPath), resolvedPath).manifest.entries);
+      : Object.values(readBackup(resolveExistingHistoryBackupPath(resolvedPath), resolvedPath).manifest.entries);
     if (!existsSync(resolvedPath)) {
       return restoreEntries.length > 0 ? "history_state_database_missing" : null;
     }
     db = new Database(resolvedPath, { readonly: true });
     const columns = db.query<{ name: string }, []>("PRAGMA table_info(threads)").all();
     const paginatedColumn = columns.some(column => column.name === "history_mode");
-    if (paginatedColumn && restoreEntries.length > 0) return "history_paginated_requires_native_writer";
+    if (paginatedColumn && restoreEntries.length > 0) return HISTORY_RELABEL_STANDS_DOWN;
     for (const entry of restoreEntries) assertLegacyHistoryWritable(entry.rolloutPath);
     const rows = db.query<{ rollout_path: string; history_mode: string | null }, []>(`
       SELECT rollout_path, ${paginatedColumn ? "history_mode" : "NULL AS history_mode"}
@@ -335,7 +446,7 @@ export function preflightCodexHistoryInjection(
         : "model_provider = 'opencodex'"}
     `).all();
     for (const row of rows) {
-      if (paginatedColumn || row.history_mode === "paginated") return "history_paginated_requires_native_writer";
+      if (paginatedColumn || row.history_mode === "paginated") return HISTORY_RELABEL_STANDS_DOWN;
       assertLegacyHistoryWritable(row.rollout_path);
     }
     return null;
@@ -1388,7 +1499,7 @@ function openaiRestoreIsNoop(stateDbPath: string, backupPath: string): boolean {
 export function syncCodexHistoryProvider(
   provider: CodexHistoryProvider,
   stateDbPath = resolveCodexStateDbPath(),
-  backupPath = historyBackupPathFor(stateDbPath),
+  backupPath = resolveExistingHistoryBackupPath(stateDbPath),
   opts: { skipWhenProvablyNoop?: boolean } = {},
 ): CodexHistorySyncResult {
   // Opt-in steady-state gate (Design B loopback callers only): default semantics of
@@ -1714,7 +1825,7 @@ export function restoreLegacyOpenaiHistory(stateDbPath = resolveCodexStateDbPath
  */
 export function migrateHistoryToOpenai(
   stateDbPath = resolveCodexStateDbPath(),
-  backupPath = historyBackupPathFor(stateDbPath),
+  backupPath = resolveExistingHistoryBackupPath(stateDbPath),
   opts: { attempts?: number; delayMs?: number; sleepFn?: (ms: number) => void } = {},
 ): CodexHistorySyncResult {
   // Steady-state gate: this migration is Design-B-specific (inject + guardian callers),
@@ -1747,7 +1858,7 @@ export function snapshotCodexHistoryNoop(
   const stateDbPresent = existsSync(stateDbPath);
   const backupPresent = existsSync(backupPath);
   const base = { canonicalStateDbPath, stateDbPresent, canonicalBackupPath, backupPresent };
-  if (!sameCodexHistoryPath(backupPath, historyBackupPathFor(stateDbPath))) {
+  if (!sameCodexHistoryPath(backupPath, resolveExistingHistoryBackupPath(stateDbPath))) {
     return { kind: "unknown", pendingRows: null, backupEntries: null, ...base, reason: "backup-path" };
   }
   const backup = inspectBackupForNoop(backupPath, stateDbPath);
@@ -1831,7 +1942,7 @@ export interface PendingHistoryCount {
  */
 export function countPendingOpencodexHistory(
   stateDbPath = resolveCodexStateDbPath(),
-  backupPath = historyBackupPathFor(stateDbPath),
+  backupPath = resolveExistingHistoryBackupPath(stateDbPath),
   opts: { validateRestoreTargets?: boolean } = {},
 ): PendingHistoryCount {
   const backup = readBackupStrict(backupPath, stateDbPath);

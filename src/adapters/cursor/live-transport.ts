@@ -20,6 +20,7 @@ import {
   createCursorContextUsageTracker,
   createCursorProtobufEventState,
   finalizeTurnEvents,
+  hasBufferedTextToolCalls,
   mapCursorProtobufServerMessage,
   mapSyntheticMcpExecToToolEvents,
   reportableContextTokens,
@@ -53,9 +54,11 @@ import {
 } from "./gen/agent_pb";
 import { debugProviderDiagnostic } from "../../lib/debug";
 import { classifyCursorError, CursorUnexpectedCancelError, isCursorAbortError, isCursorBenignCancelError, safeCursorErrorMessage } from "./cursor-errors";
+import { cursorPolicyErrorExplanation } from "./policy-error";
 import { mcpArgsFromToolCall } from "./protobuf-events";
 import { OCX_RESPONSES_TOOL_PROVIDER } from "./tool-definitions";
 import {
+  cursorNativeExecRedirectHint,
   handleCursorNativeExec,
   handleCursorNativeKv,
   releaseCursorBlobRequestScope,
@@ -209,7 +212,8 @@ export function parseConnectEndStreamError(payload: Uint8Array): Error | null {
   try {
     const parsed = JSON.parse(new TextDecoder().decode(payload)) as { error?: { code?: string; message?: string } };
     if (parsed?.error) {
-      return new Error(`Cursor Connect error ${parsed.error.code ?? "unknown"}: ${parsed.error.message ?? "Unknown error"}`);
+      const explanation = cursorPolicyErrorExplanation(parsed.error);
+      return new Error(`Cursor Connect error ${parsed.error.code ?? "unknown"}: ${explanation ?? parsed.error.message ?? "Unknown error"}`);
     }
     return null;
   } catch {
@@ -697,6 +701,7 @@ class LiveCursorTransport implements CursorTransport {
       clientToolDefs,
       rejectNativeFileMutations: cursorRequestAdvertisesApplyPatch(request.tools, request.toolChoice),
       structuredEditAvailable: syntheticStructuredEditToolNames.size > 0,
+      nativeExecRedirectHint: cursorNativeExecRedirectHint(cursorVisibleTools, this.execContext.mcpToolDefs ?? []),
     };
     const toolSchemas = new Map<string, unknown>();
     const cursorToolNameMap = new Map<string, string>();
@@ -728,6 +733,8 @@ class LiveCursorTransport implements CursorTransport {
         syntheticStructuredEditToolNames,
         translatorBudget: this.translatorBudget,
         contextUsage,
+        wireModelId: request.modelId,
+        identityScope: request._cursorIdentityScope,
         ...(prepared.estimatedInputTokens !== undefined
           ? { estimatedInputTokens: prepared.estimatedInputTokens }
           : {}),
@@ -1261,6 +1268,7 @@ class LiveCursorTransport implements CursorTransport {
             state.openToolCalls.size > 0
             || this.sawAssistantText
             || hasPendingClientToolFinalization
+            || hasBufferedTextToolCalls(state)
           )
         ) {
           const terminal = hasPendingClientToolFinalization && state.openToolCalls.size === 0
@@ -1427,7 +1435,7 @@ class LiveCursorTransport implements CursorTransport {
           settler.settleFinish();
           return;
         }
-        if (this.framesReceived > 0 && this.sawAssistantText) {
+        if (this.framesReceived > 0 && (this.sawAssistantText || hasBufferedTextToolCalls(state))) {
           for (const event of finalizeTurnEvents(state)) push(event);
           releaseBacklogLease();
           settler.settleFinish();

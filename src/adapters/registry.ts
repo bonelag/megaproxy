@@ -6,7 +6,6 @@ import { createCodeBuddyAdapter } from "./codebuddy/adapter";
 import { createQoderAdapter } from "./qoder/adapter";
 import { createCommandCodeAdapter } from "./command-code";
 import { createCursorAdapter } from "./cursor";
-import { createDevinCliAdapter } from "./devin-cli/adapter";
 import { createDevinAdapter } from "./devin";
 import { createGoogleAdapter } from "./google";
 import { createKiroAdapter } from "./kiro";
@@ -16,6 +15,7 @@ import { createOllamaNativeAdapter } from "./ollama-native";
 import { createResponsesPassthroughAdapter } from "./openai-responses";
 import type { OcxProviderConfig } from "../types";
 import { createAdapterTierMetadata } from "../providers/fastwire";
+import { withInputMediaGuard } from "./input-media-guard";
 
 export type AdapterCacheRetention = "none" | "short" | "long";
 
@@ -43,7 +43,6 @@ export type AdapterWire =
   | "google"
   | "kiro"
   | "cursor"
-  | "devin-cli"
   | "devin";
 
 export type AdapterMutationContract =
@@ -126,11 +125,6 @@ export const ADAPTER_REGISTRY = {
     mutation: "codex-owned-with-gated-native-fallback",
     create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => createCursorAdapter(provider),
   },
-  "devin-cli": {
-    wire: "devin-cli",
-    mutation: "codex-owned",
-    create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => createDevinCliAdapter(provider),
-  },
   devin: {
     wire: "devin",
     mutation: "codex-owned",
@@ -187,6 +181,9 @@ export function createRegisteredAdapter(
   const definition = getAdapterDefinition(provider.adapter);
   if (!definition) throw new Error(`Unknown adapter: ${provider.adapter}`);
   const adapter = definition.create(provider, context);
+  if (effectiveAdapterContract(provider.adapter).wire !== "openai-responses") {
+    withInputMediaGuard(adapter);
+  }
   const buildRequest = adapter.buildRequest.bind(adapter);
   adapter.buildRequest = (parsed, incoming) => {
     const attachTierMetadata = (request: Awaited<ReturnType<ProviderAdapter["buildRequest"]>>) => {

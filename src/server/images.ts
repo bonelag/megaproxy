@@ -19,6 +19,7 @@ import {
   cooldownErrorResponse,
   CodexAuthContextError,
   CodexMainProfileDrainingError,
+  CodexModelAvailabilityError,
   CodexPoolAuthenticationError,
   CodexThreadAffinityExpiredError,
 } from "../codex/auth-context";
@@ -50,6 +51,7 @@ import { callXaiImages } from "../images/xai-client";
 import type { AdmissionLease } from "../lib/admission";
 import { codexAccountSelectionForTurn } from "./lifecycle";
 import { applyProviderHeaders } from "../lib/provider-request-headers";
+import { codexModelAvailabilityErrorResponse } from "./responses/codex-auth-error";
 
 export type ImagesEndpoint = "generations" | "edits";
 
@@ -675,6 +677,8 @@ export async function handleImages(
         const safeAccountLabel = formatCodexProviderForLog("openai", err.accountId, config);
         console.error(`[images] Pool account ${safeAccountLabel} token failed; reauthentication required`);
         forwardAuthError = formatErrorResponse(401, "authentication_error", "Selected Codex account needs reauthentication");
+      } else if (err instanceof CodexModelAvailabilityError) {
+        forwardAuthError = codexModelAvailabilityErrorResponse(err);
       } else if (err instanceof CodexPoolAuthenticationError) {
         forwardAuthError = formatErrorResponse(401, "authentication_error", err.message);
       } else {
