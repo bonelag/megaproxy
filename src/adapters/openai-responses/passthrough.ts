@@ -1,6 +1,7 @@
 import { normalizeRoutedAgentMessages } from "../routed-agent-messages";
 import { stripBracketedModelSuffix } from "../openai-chat";
 import { normalizeOpenCodeGoAdditionalTools } from "../opencode-go-additional-tools";
+import { applyOpenCodeZenHeaders, cloakOpenCodeZenResponsesTools, isOpenCodeZenEndpoint } from "../opencode-zen";
 import { isXaiResponsesDestination } from "../../providers/xai-transport";
 import { Buffer } from "node:buffer";
 import type { IncomingMeta, ProviderAdapter } from "../base";
@@ -243,6 +244,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         }
         if (provider.apiKey) headers["Authorization"] = `Bearer ${provider.apiKey}`;
         if (provider.headers) Object.assign(headers, provider.headers);
+        applyOpenCodeZenHeaders(headers, url, provider.apiKey);
       }
       // Some Responses-compatible gateways select their Codex compatibility path from the real
       // client fingerprint. This is a single non-credential fallback, not broader caller-header
@@ -389,6 +391,9 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         outBody = stripCanonicalOnlyToolFields(outBody, provider.supportsOpenAiWebSearchToolFields === false);
       }
       if (!forward) outBody = normalizeOpenCodeGoAdditionalTools(outBody, url);
+      if (isOpenCodeZenEndpoint(url) && outBody && typeof outBody === "object") {
+        cloakOpenCodeZenResponsesTools(outBody as Record<string, unknown>);
+      }
       // Same predicate as the routedCompaction gate in handleResponses(): an authMode check would
       // let a noncanonical custom forward provider skip this rewrite while the server still routes
       // it as a summarizer turn (#422). The compaction body build removes the tool surface and must

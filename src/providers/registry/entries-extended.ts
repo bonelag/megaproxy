@@ -955,6 +955,15 @@ export const PROVIDER_REGISTRY_EXTENDED: readonly ProviderRegistryEntry[] = [
     // Same DeepSeek routes as the Go preset above, behind the same vendor, so they carry
     // the same json_schema rejection (#1338 / #1415).
     noJsonSchemaModels: [...DEEPSEEK_GATEWAY_THINKING_MODELS, ...OPENCODE_FREE_DEEPSEEK_MODELS],
+    modelWireDefaults: {
+      "muse-spark-1.2-contributor-free": "openai-responses",
+      "muse-spark-1.3-contributor-free": "openai-responses",
+      "muse-spark-1.2": "openai-responses",
+      "muse-spark-1.3": "openai-responses",
+      "muse-spark-1.2-contributor": "openai-responses",
+      "muse-spark-1.3-contributor": "openai-responses",
+    },
+    statelessResponses: true,
   },
   { id: "vercel-ai-gateway", label: "Vercel AI Gateway", baseUrl: "https://ai-gateway.vercel.sh/v1", adapter: "openai-chat", authKind: "key", dashboardUrl: "https://vercel.com/dashboard" },
   {
@@ -1000,6 +1009,15 @@ export const PROVIDER_REGISTRY_EXTENDED: readonly ProviderRegistryEntry[] = [
     // the keyed tier's json_schema treatment and its reasoning contract rather than a
     // narrower table that silently falls behind whenever the keyed one is updated.
     noJsonSchemaModels: [...DEEPSEEK_GATEWAY_THINKING_MODELS, ...OPENCODE_FREE_DEEPSEEK_MODELS],
+    modelWireDefaults: {
+      "muse-spark-1.2-contributor-free": "openai-responses",
+      "muse-spark-1.3-contributor-free": "openai-responses",
+      "muse-spark-1.2": "openai-responses",
+      "muse-spark-1.3": "openai-responses",
+      "muse-spark-1.2-contributor": "openai-responses",
+      "muse-spark-1.3-contributor": "openai-responses",
+    },
+    statelessResponses: true,
   },
   { id: "xiaomi", label: "Xiaomi MiMo", baseUrl: "https://api.xiaomimimo.com/anthropic", adapter: "anthropic", authKind: "key", dashboardUrl: "https://xiaomimimo.com", defaultModel: "mimo-v2.5-pro" },
   // Xiaomi's public OpenAI-compatible endpoint is a distinct transport from both the Anthropic

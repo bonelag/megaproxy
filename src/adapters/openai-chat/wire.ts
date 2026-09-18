@@ -1,4 +1,5 @@
 import { agentRouterDefaultHeaders } from "../agentrouter";
+import { applyOpenCodeZenHeaders } from "../opencode-zen";
 import { openaiChatCompletionsUrl } from "../openai-chat-url";
 import type { OcxProviderConfig } from "../../types";
 
@@ -31,6 +32,7 @@ export function openAIChatTransport(provider: OcxProviderConfig): {
   };
   if (hasCredential) headers.Authorization = `Bearer ${provider.apiKey}`;
   if (provider.headers) Object.assign(headers, provider.headers);
+  applyOpenCodeZenHeaders(headers, provider.baseUrl, provider.apiKey);
   // A configured relative path wins, mirroring how the Responses adapter honours
   // `responsesPath`. An upstream can serve both wires under different prefixes, and a
   // per-model wire override only swaps the adapter, so without this the opted-in Chat

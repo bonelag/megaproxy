@@ -42,6 +42,7 @@ import { messagesToChatFormat } from "./openai-chat/messages";
 import { withOpenAIChatToolNames } from "./openai-chat/tool-name-registry";
 import { isNativeOpenAIChatTarget, openAIChatTransport, stripBracketedModelSuffix } from "./openai-chat/wire";
 import { toolChoiceToChatFormat, toolsToChatFormatForProvider } from "./openai-chat/tool-schema";
+import { cloakOpenCodeZenChatTools, isOpenCodeZenEndpoint } from "./opencode-zen";
 
 export { stripBracketedModelSuffix } from "./openai-chat/wire";
 export { buildOpenAIChatPassthroughRequest } from "./openai-chat/passthrough";
@@ -281,6 +282,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           }
         }
         if (parsed.stream) body.stream_options = { include_usage: true };
+        if (isOpenCodeZenEndpoint(provider.baseUrl)) {
+          cloakOpenCodeZenChatTools(body);
+        }
 
         const bodyJson = JSON.stringify(body);
         const actualServiceTier = typeof body.service_tier === "string" ? body.service_tier : null;

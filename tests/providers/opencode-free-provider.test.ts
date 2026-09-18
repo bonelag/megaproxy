@@ -59,7 +59,7 @@ describe("opencode-free provider", () => {
     const req = adapter.buildRequest(minimalRequest());
     const headers = req.headers as Record<string, string>;
     expect(headers["Authorization"]).toBeUndefined();
-    expect(headers["User-Agent"]).toBe("opencode");
+    expect(headers["User-Agent"]).toBe("opencode/1.18.31");
     expect(headers["x-opencode-client"]).toBe("desktop");
     expect(req.url).toBe("https://opencode.ai/zen/v1/chat/completions");
   });
@@ -117,7 +117,7 @@ describe("opencode-free provider", () => {
     test("the merged headers reach the wire, not just the resolved config", () => {
       const routed = routedProviderConfig("opencode-free", persisted({ "x-opencode-client": "desktop" }));
       const req = createOpenAIChatAdapter(routed).buildRequest(minimalRequest());
-      expect((req.headers as Record<string, string>)["User-Agent"]).toBe("opencode");
+      expect((req.headers as Record<string, string>)["User-Agent"]).toBe("opencode/1.18.31");
     });
 
     test("a user override wins and does not become a second comma-joined value", () => {
@@ -214,6 +214,31 @@ describe("opencode-free provider", () => {
     expect(preset).toBeDefined();
     expect(preset.keyOptional).toBe(true);
     expect(preset.note).toBeDefined();
+  });
+
+  test("Muse Spark models route to openai-responses wire and include decoy tools", async () => {
+    const { resolveWireProtocolOverride, resolveAdapter } = require("../../src/server/adapter-resolve");
+    const { parseRequest } = require("../../src/responses/parser");
+    const { createTranslatorBudget } = require("../../src/lib/translator-budget");
+    const routed = routedProviderConfig("opencode-free", providerConfigSeed(entry!));
+    const resolved = resolveWireProtocolOverride("opencode-free", "muse-spark-1.3-contributor-free", routed);
+    expect(resolved.adapter).toBe("openai-responses");
+    const adapter = resolveAdapter(resolved);
+    const rawBody = {
+      model: "muse-spark-1.3-contributor-free",
+      stream: true,
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+    };
+    const req = await adapter.buildRequest(parseRequest(rawBody), { headers: new Headers(), translatorBudget: createTranslatorBudget() });
+    expect(req.url).toBe("https://opencode.ai/zen/v1/responses");
+    expect(req.headers["User-Agent"]).toBe("opencode/1.18.31");
+    expect(req.headers["x-opencode-client"]).toBe("desktop");
+    expect(req.headers["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}/);
+    expect(req.headers["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}/);
+    const body = JSON.parse(req.body);
+    expect(body.tool_choice).toBe("auto");
+    expect(body.tools.some((t: any) => t.name === "bash")).toBe(true);
+    expect(body.tools.some((t: any) => t.name === "read")).toBe(true);
   });
 });
 
