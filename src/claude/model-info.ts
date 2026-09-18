@@ -103,29 +103,6 @@ function modelInfo(id: string, displayName: string, ladder: readonly string[], i
 export type AnthropicIdStyle = "desktop3p" | "readable";
 
 /** Build the full anthropic-flavor discovery list (ids are Desktop 3P aliases). */
-export function toCanonicalModelKey(key: string): string {
-  if (!key) return "";
-  let clean = key.replace(/\[1m\]/gi, "").trim().toLowerCase();
-  
-  if (clean.startsWith("claude-ocx-") || clean.startsWith("claude-ocx2-")) {
-    const rest = clean.replace(/^claude-ocx2?-/, "");
-    const parts = rest.split("--");
-    if (parts.length >= 2) {
-      const provider = parts[0];
-      const model = parts.slice(1).join("--").replaceAll("~s", "/").replaceAll("~t", "~");
-      return `${provider}/${model}`;
-    }
-  }
-
-  const match = /^(.+?)\s*\((.+?)\)$/.exec(clean);
-  if (match) {
-    const [, model, provider] = match;
-    return `${provider.trim()}/${model.trim()}`;
-  }
-
-  return clean;
-}
-
 export function buildAnthropicModelInfos(
   nativeSlugs: readonly string[],
   routedModels: readonly CatalogModel[],
@@ -133,25 +110,14 @@ export function buildAnthropicModelInfos(
   idStyle: AnthropicIdStyle = "desktop3p",
   aliasForRoute: (provider: string, modelId: string) => string = desktop3pAlias,
   nativeContextCap?: NativeContextLimitsInput,
-  discovery1mModelsOrFastMode?: readonly string[] | boolean,
   fastMode?: boolean,
   // Presence is the feature gate: the caller passes undefined when `fastRows` is off, so a
   // default install publishes nothing. The predicate answers ELIGIBILITY, not enablement.
   fastRows?: (model: CatalogModel | { provider: string; id: string }) => boolean,
   ordering?: { modelPickerOrder?: readonly string[]; featured?: readonly string[] },
 ): AnthropicModelInfo[] {
-  const discovery1mModels = Array.isArray(discovery1mModelsOrFastMode) ? discovery1mModelsOrFastMode : undefined;
-  const effectiveFastMode = typeof discovery1mModelsOrFastMode === "boolean" ? discovery1mModelsOrFastMode : fastMode;
   const out: AnthropicModelInfo[] = [];
   const seen = new Set<string>();
-  const is1mEnabledForModel = (keys: string[], contextWindow?: number) => {
-    if (discovery1mModels !== undefined) {
-      const canonicalSet = new Set(discovery1mModels.map(s => toCanonicalModelKey(s)));
-      return keys.some(k => canonicalSet.has(toCanonicalModelKey(k)));
-    }
-    return contextWindow !== undefined && contextWindow >= ONE_MILLION;
-  };
-
   // Every id the loops below will really emit, computed BEFORE either runs. `seen` alone is
   // not enough: it grows as they run, so whether a synthetic id collided with a real one
   // would depend on iteration order. With both `foo` and a real `foo--fast` in the roster,
@@ -164,7 +130,7 @@ export function buildAnthropicModelInfos(
       // The same asymmetry the routed loop applies: readable uses the LISTED id, so a
       // fastMode-rewritten Cursor row is counted under the id it is really published as,
       // while Desktop 3P hashes the RAW id.
-      const listed = effectiveFastMode === true && m.provider === "cursor" && idStyle === "readable"
+      const listed = fastMode === true && m.provider === "cursor" && idStyle === "readable"
         ? cursorFastIdFor(m.id) ?? m.id
         : m.id;
       return idStyle === "readable"
@@ -184,12 +150,22 @@ export function buildAnthropicModelInfos(
     maxInputTokens?: number,
     selectorId?: string,
   ) => {
+    // The [1m] marker makes Claude Code account 1e6 tokens for the row, so it
+    // may only name models whose AUTHORITATIVE effective window is >= 1M —
+    // never the auto-context widening, which would mark a 372K route and have
+    // Claude Code over-fill it (the #854 defect).
+    if (contextWindow === undefined || contextWindow < ONE_MILLION) return;
     if (base.id.includes("[1m]")) return;
     const id = selectorId ?? `${base.id}[1m]`;
     if (seen.has(id)) return;
     seen.add(id);
+    // The marker fixes Claude Code's accounting at 1e6, but a model may accept less input
+    // than that — a routed GPT-5.6 row runs a 1,050,000 window while refusing past 922,000
+    // (measured — see devlog/_plan/260817_native_gpt56_1m_context/001_measurement_evidence.md).
+    // Advertising the flat 1e6 there would invite mid-session context_length_exceeded, so the
+    // variant reports whichever of the two is smaller.
     const advertised = typeof maxInputTokens === "number" && maxInputTokens > 0
-      ? Math.max(ONE_MILLION, maxInputTokens)
+      ? Math.min(ONE_MILLION, maxInputTokens)
       : ONE_MILLION;
     out.push({ ...base, id, display_name: `${base.display_name} · 1M`, max_input_tokens: advertised });
   };
@@ -214,11 +190,11 @@ export function buildAnthropicModelInfos(
     seen.add(id);
     const nativeWindow = nativeOpenAiContextWindow(slug, nativeContextCap);
     const nativeMaxInput = nativeOpenAiMaxInputTokens(slug, nativeContextCap);
+    // max_input_tokens is an INPUT limit, so it follows the measured input ceiling rather
+    // than the total window whenever the model publishes one.
     const info = modelInfo(id, `${slug} (native)`, nativeEffectiveLadder(slug), true, nativeMaxInput ?? nativeWindow);
     out.push(info);
-    if (is1mEnabledForModel([slug, id, `native/${slug}`], nativeWindow)) {
-      push1mVariant(info, nativeWindow, nativeMaxInput);
-    }
+    push1mVariant(info, nativeWindow, nativeMaxInput);
     // Natives too, not only routed rows: gpt-5.6-sol is the flagship Fast model, and
     // omitting it would leave this surface without the model the feature exists for.
     if (fastRows?.({ provider: "native", id: slug }) === true) pushFastVariant(info);
@@ -229,7 +205,7 @@ export function buildAnthropicModelInfos(
     // Global Fast has no toggle on this surface, so the fast identity is what gets listed —
     // a client here can only pick a listed id. Limited to the readable CLI style: Desktop 3P
     // ids are hashed from the model name, so rewriting them would strand a saved selection.
-    const fastModelId = effectiveFastMode === true && m.provider === "cursor" && idStyle === "readable"
+    const fastModelId = fastMode === true && m.provider === "cursor" && idStyle === "readable"
       ? cursorFastIdFor(m.id)
       : undefined;
     const listedModelId = fastModelId ?? m.id;
@@ -241,6 +217,9 @@ export function buildAnthropicModelInfos(
     const groupStart = out.length;
     const ladder = Array.isArray(m.reasoningEfforts) ? m.reasoningEfforts : [];
     const imageInput = Array.isArray(m.inputModalities) ? m.inputModalities.includes("image") : false;
+    // max_input_tokens is an input limit, so a row that publishes a lower input ceiling than
+    // its window (native GPT-5.6 forwarded through a provider: 922k under 1.05M) reports the
+    // ceiling. Rows without one keep reporting the window, as before.
     const routedMaxInput = typeof m.maxInputTokens === "number" && m.maxInputTokens > 0
       ? (typeof m.contextWindow === "number" && m.contextWindow > 0
         ? Math.min(m.maxInputTokens, m.contextWindow)
@@ -258,9 +237,7 @@ export function buildAnthropicModelInfos(
       && listedModelId.startsWith("claude-fable-")
       ? `${claudeCodeNativeAlias(listedModelId)}[1m]`
       : undefined;
-    if (is1mEnabledForModel([`${m.provider}/${m.id}`, id, `${m.id} (${m.provider})`], m.contextWindow)) {
-      push1mVariant(info, m.contextWindow, routedMaxInput, oneMillionSelector);
-    }
+    push1mVariant(info, m.contextWindow, routedMaxInput, oneMillionSelector);
     // The whole model is passed, not a (provider, id) pair: a combo row lives in its own
     // namespace with no config.providers entry, so the caller classifies it from the
     // aggregated supportsServiceTier the row already carries.

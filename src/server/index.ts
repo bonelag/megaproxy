@@ -882,6 +882,8 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       accountId: MAIN_CODEX_ACCOUNT_ID,
       ...createResetCreditWhamClient(config, MAIN_CODEX_ACCOUNT_ID),
     });
+  }
+
   // Pre-write ~/.claude/cache/gateway-models.json for Claude Code discovery
   import("../claude/gateway-cache")
     .then(({ refreshGatewayModelCacheFromProxy }) => refreshGatewayModelCacheFromProxy(boundPort, { admissionConfig: config }))
