@@ -72,7 +72,7 @@ beforeEach(() => {
     configurable: true,
     value: async (url: string) => {
       const body = String(url).includes("/status")
-        ? { applied: true, appliedAt: null, stale: false, health: { lastRequestAt: null, requestCount: 0, errorCount: 0 } }
+        ? { desiredEnabled: true, applied: true, appliedAt: null, stale: false, health: { lastRequestAt: null, requestCount: 0, errorCount: 0 } }
         : payload();
       return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) } as unknown as Response;
     },
@@ -227,4 +227,26 @@ test("flipping the Chat tab toggle marks the profile dirty", async () => {
   await act(async () => { toggle.click(); });
   expect(toggle.checked).toBe(false);
   expect(container.querySelector(".claude-dirty.active")).not.toBeNull();
+});
+
+test("a malformed status payload shows the failure state instead of crashing", async () => {
+  /*
+   * The status poll used to trust any JSON: an error-shaped OK body missing
+   * health would be cached and rendered, then status.health.requestCount
+   * threw inside the page. The guard rejects it, so the resource records a
+   * cold failure and the existing failure presentation shows.
+   */
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: async (url: string) => {
+      const body = String(url).includes("/status")
+        ? { error: "malformed" }
+        : payload();
+      return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) } as unknown as Response;
+    },
+  });
+
+  await mount();
+
+  expect(container.textContent ?? "").toContain("Failed to load Claude Desktop profile.");
 });
