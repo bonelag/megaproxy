@@ -26,6 +26,7 @@ runs helper features around provider requests.
 | `corsAllowOrigins?` | `string[]` | `[]` | Additional exact origins allowed by CORS. Loopback origins are always allowed. Authority-based browser extension origins such as `chrome-extension://<extension-id>` are supported; `*` is not a wildcard. Firefox and Safari regenerate the extension UUID (per install / per browser launch), so update the entry when the origin changes. |
 | `apiKeys?` | `OcxApiKey[]` | `[]` | Generated `ocx_…` data-plane admission credentials on non-loopback binds. They do not authorize management APIs; management access uses the separate credential documented in the [management reference](/reference/management-api/). Dashboard-managed. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | disabled | Opt-in archived-session cleanup policy. Never enabled implicitly. |
+| `usageLedgerMaxBytes?` | `number` | unset | Opt-in ceiling in bytes for `usage.jsonl`. Absent means the request history grows without limit, which stays the default. See [usage history size](#usage-history-size). |
 | `appOwnedMemoryBudgetMb?` | `number` | `256` | Cap in MiB for evictable app-owned logs, caches, blobs, and continuation payloads. Range 64–4096; not an RSS cap. |
 | `metricsExport.enabled?` | `boolean` | `false` | Enable process-local aggregate request metrics at authenticated `GET /api/metrics`. Restart required; disabled mode returns 404 and starts no exporter activity. |
 | `spend?` | `{ root?: { maxTokens?: number }; identity?: { maxTokens?: number }; pool?: { maxTokens?: number }; retentionDays?: number }` | unset | Durable token ceilings, off unless you write one. Each scope bounds settled spend plus in-flight reservations plus unresolved spend: `root` is one task including its whole fan-out, `identity` is one account across every task it serves, and `pool` is one provider pool. They intersect, so a request is admitted only when all three have room — which is what holds a ceiling against a client that mints a new task id per request. A reservation is the request's whole input plus its enforceable output ceiling, counted as if every cached prefix misses. Observe-only mode still journals, so every server owns the state directory's single-writer lease; an explicit sibling must use a separate `OPENCODEX_HOME`. Spend survives an ordinary process restart when its writes reached the filesystem, but the journal does not promise survival across host power loss because each append is not fsynced. Raising or removing the value is what grants more. `maxTokens` must be a positive integer (0 would refuse everything), `retentionDays` is 1–365 and defaults to 7, and an unknown key in this section is rejected rather than ignored. A refusal is a local HTTP 429 carrying `x-opencodex-local-refusal: workflow_spend_exhausted`, and its message names the scope and the ceiling; no provider is contacted. |
@@ -63,10 +64,27 @@ arrives, the proxy cannot tell whether the model already processed the request, 
 to send it again and answers HTTP 429 with `upstream_reset_replay_refused`. The status is
 deliberate: a 5xx here is an instruction to most clients, including Codex, to send the whole
 turn again, which is the duplicate the refusal exists to prevent. No `Retry-After` is
-attached, and the proxy performs no key rotation, account failover or same-target replay on
-it, nor does it record the refusal as rate-limit or quota evidence against the credential it
-was holding. Tool-call side requests such as vision and web search are replayed normally, because
-repeating them cannot duplicate a turn.
+attached, and the response carries `x-should-retry: false`, which the official OpenAI and
+Anthropic SDKs read before their own status rules — without it those clients retry a 429 on
+their own schedule and resend the turn anyway. The same replay-refusal behavior applies on
+`/v1/responses` and `/v1/chat/completions`, whether the request is forwarded natively or translated.
+Routed `/v1/messages` requests translate through Responses and project the same status, code, and
+retry headers into an Anthropic-shaped error envelope. The proxy
+performs no key rotation, account failover or same-target replay on it, nor does it record the
+refusal as rate-limit or quota evidence against the credential it was holding. Tool-call side
+requests such as vision and web search are replayed normally, because repeating them cannot
+duplicate a turn.
+
+A native Responses provider can opt into replacing that send with
+[`retryOnReset`](/reference/configuration/providers/#provider-entries-ocxproviderconfig). The same grant covers the
+case where the connection survives the header and the SSE body then dies carrying only control
+events, because the caller has observed nothing in either one. A replacement happens only when
+the request is self-contained (`store: false`, complete input, client-executed tools only, no
+server-side continuation state), and one logical request gets the configured number of
+replacements in total — across every recovery leg and every combo child, not one each. The
+refusal returns as soon as that grant is spent, the leg has no send left, or a replacement fails
+for any other reason. A request that already emitted output or a tool call keeps the refusal
+regardless. A caller that cancels mid-replacement gets the cancellation, not the refusal.
 
 `noProxy` accepts either a comma-separated string or an array. Both forms add entries without
 replacing an inherited `NO_PROXY`:
@@ -370,6 +388,26 @@ either `target.reduceToBytes` or `target.removeOldestPercent`. `mode` defaults t
 Configure it on the Storage page or with `GET`/`PUT /api/storage/cleanup-policy`; trigger a manual run
 with `POST /api/storage/cleanup-policy/run`.
 
+## Usage history size
+
+`usageLedgerMaxBytes` is unset by default, and unset means the request history in `usage.jsonl`
+grows without limit. Nothing deletes history you did not ask to have deleted.
+
+Set it to a byte ceiling and the proxy trims the file after an append crosses it, keeping the
+newest whole rows and dropping the oldest. It trims a little below the ceiling rather than exactly
+to it, so the next append does not immediately re-cross the line. The minimum accepted value is
+1 MiB; a smaller number, or one that is not a safe integer, leaves the limit off rather than
+failing the configuration.
+
+Rows are copied byte for byte and never rewritten, so every field survives a trim — including
+fields a newer build wrote that an older one does not understand. The replacement is refused
+outright if anything appended to the ledger while it ran, so a request logged during a trim is
+never lost; the next append tries again. Trimming also refreshes what the dashboard shows, so
+`/api/logs` stops serving rows the ledger no longer has.
+
+There is no dashboard control for this yet; set it in `config.json` or with
+`ocx config set usageLedgerMaxBytes <bytes>`.
+
 ## Quota-reset notifications (`quotaResetNotify`)
 
 Off by default. When the section is absent, no detection runs, no timer starts, and no state
@@ -563,7 +601,9 @@ input size and content. Restart the proxy after editing
 Codex uses small helper models for tasks such as titles and commit messages. Enable
 `shadowCallIntercept` to redirect recognized source-model prefixes to another configured model. The
 replacement keeps the request's configured reasoning effort. Set `sourceModels` only when a client
-uses different helper ids.
+uses different helper ids. A non-empty `sourceModels` replaces the default prefixes instead of
+extending them, so include `gpt-5.6-luna` in the list when current clients should still be
+intercepted.
 Interception is model-based: every request whose bare model id matches `sourceModels` can be
 redirected, including normal `request_kind: "turn"` requests. `x-codex-turn-metadata` does not exempt
 a matching request.
@@ -577,6 +617,24 @@ a matching request.
   }
 }
 ```
+
+### When the target is unavailable
+
+The replacement is the one destination the operator chose, so a target that stops resolving fails
+the helper call instead of sending it elsewhere. When the target's provider is disabled or deleted,
+or its combo no longer exists, an intercepted request returns `409` with error code
+`intercept_target_unavailable` before anything is sent upstream. The request log records the same
+code. The request is not passed through to the native helper model and does not fall back to the
+default provider, because either would change the destination, credentials and cost without your
+choice. A combo or routing-profile target still fails over among its own members. A qualified
+target such as `provider/model` whose provider segment names nothing configured is treated the same
+way, and the settings API refuses to save one. A bare model id that resolves through the default
+provider stays valid.
+
+Disabling (`PATCH /api/providers?name=<provider>` with `disabled: true`) or deleting a provider that the
+target resolves to still succeeds; the response adds `dependentShadowIntercept: { model, enabled }`
+and the dashboard shows a warning. Re-enabling the provider, or choosing another target, restores
+interception.
 
 ## Sidecars
 
@@ -676,6 +734,6 @@ wildcard `hostname`, where the public listener already holds `127.0.0.1:<port>`.
 
 `codexNativeSteering` and `codexNativeInjection` enable separate, default-off native
 WebSocket control paths. See the canonical guide for
-[supported steering routes and settings](../../guides/codex-integration.md#steering-continuation-settings-and-public-api),
-[typed result and approval continuations](../../guides/codex-integration.md#rich-tool-results-and-explicit-approvals-after-response-completion),
-and [confirmation deadlines and retained context](../../guides/codex-integration.md#steering-confirmation-deadlines-and-retained-context).
+[supported steering routes and settings](/guides/codex-integration/#steering-continuation-settings),
+[typed result and approval continuations](/guides/codex-integration/#rich-tool-results-and-explicit-approvals-after-response-completion),
+and [confirmation deadlines and retained context](/guides/codex-integration/#steering-confirmation-deadlines-and-retained-context).

@@ -90,29 +90,32 @@ function assertExactKeys(value: Record<string, unknown>, keys: readonly string[]
 }
 
 /**
- * Applied-state markers survive every profile rebuild.
+ * Applied-state markers survive a no-op rebuild.
  *
  * `parseDesktopProfile`, `reconcileDesktopProfile` and `moveDesktopRoute` each construct a
  * fresh `{ version, assignments, defaults }`, and the management routes persist whatever they
  * return. Without this carry-through, saving an assignment — or merely dragging a model to
  * another family — would erase the fingerprint the apply route wrote, and the GUI would report
  * "not applied" for a config that is applied on disk.
+ *
+ * `chatTabEnabled` is not applied-state. It is the stored Chat-tab pin and must survive a
+ * catalog change and a family drag even when the fingerprint is cleared.
  */
 function appliedMarkers(source: {
   appliedFingerprint?: unknown;
   appliedAt?: unknown;
-  chatTabEnabled?: unknown;
 }): {
   appliedFingerprint?: string;
   appliedAt?: string;
-  chatTabEnabled?: boolean;
 } {
   return {
     ...(typeof source.appliedFingerprint === "string" ? { appliedFingerprint: source.appliedFingerprint } : {}),
     ...(typeof source.appliedAt === "string" ? { appliedAt: source.appliedAt } : {}),
-    // Default is "on" at write time; only an explicit false is preserved as a stored opt-out.
-    ...(typeof source.chatTabEnabled === "boolean" ? { chatTabEnabled: source.chatTabEnabled } : {}),
   };
+}
+
+function chatTabMarker(source: { chatTabEnabled?: unknown }): { chatTabEnabled?: boolean } {
+  return typeof source.chatTabEnabled === "boolean" ? { chatTabEnabled: source.chatTabEnabled } : {};
 }
 
 function parseOptionalBool(value: unknown, path: string): boolean | undefined {
@@ -131,6 +134,19 @@ function assignment1mFields(
     ...(supports1m !== undefined ? { supports1m } : {}),
     ...(effectivePrefer !== undefined ? { prefer1m: effectivePrefer } : {}),
   };
+}
+
+export function sameProfileContent(left: DesktopProfile, right: DesktopProfile): boolean {
+  return DESKTOP_FAMILIES.every(family => left.defaults[family] === right.defaults[family])
+    && JSON.stringify(Object.entries(left.assignments).sort(([a], [b]) => a.localeCompare(b)))
+      === JSON.stringify(Object.entries(right.assignments).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+/** Retain applied-state bookkeeping only when the desired Desktop config is unchanged. */
+export function preserveDesktopAppliedState(source: DesktopProfile, rebuilt: DesktopProfile): DesktopProfile {
+  return sameProfileContent(source, rebuilt)
+    ? { ...rebuilt, ...appliedMarkers(source), ...chatTabMarker(source) }
+    : rebuilt;
 }
 
 function isFamily(value: unknown): value is DesktopFamily {
@@ -224,7 +240,7 @@ export function parseDesktopProfile(value: unknown): DesktopProfile {
     }
     defaults[family] = route;
   }
-  return { version: 1, assignments, defaults, ...appliedMarkers(value) };
+  return { version: 1, assignments, defaults, ...appliedMarkers(value), ...chatTabMarker(value) };
 }
 
 function formatSlotDate(year: number, dayOfYear: number): string {
@@ -301,12 +317,8 @@ export function reconcileDesktopProfile(
     const current = defaults[family];
     defaults[family] = current && assignments[current]?.family === family ? current : (members[0] ?? null);
   }
-  return parseDesktopProfile({
-    version: 1,
-    assignments,
-    defaults,
-    ...appliedMarkers(profile),
-  });
+  const rebuilt = parseDesktopProfile({ version: 1, assignments, defaults, ...chatTabMarker(profile) });
+  return preserveDesktopAppliedState(profile, rebuilt);
 }
 
 export function moveDesktopRoute(
@@ -330,7 +342,7 @@ export function moveDesktopRoute(
   const destinationMembers = Object.keys(assignments).filter(key => assignments[key]!.family === family).sort();
   if (makeDefault || !defaults[family] || assignments[defaults[family]!]?.family !== family) defaults[family] = route;
   if (!defaults[family] && destinationMembers.length > 0) defaults[family] = destinationMembers[0]!;
-  return parseDesktopProfile({ version: 1, assignments, defaults, ...appliedMarkers(parsed) });
+  return parseDesktopProfile({ version: 1, assignments, defaults, ...chatTabMarker(parsed) });
 }
 
 export function setDesktopFamilyDefault(
@@ -342,7 +354,13 @@ export function setDesktopFamilyDefault(
   const members = Object.keys(parsed.assignments).filter(key => parsed.assignments[key]!.family === family);
   if (route === null && members.length > 0) throw new DesktopProfileError("cannot clear a non-empty family default", `profile.defaults.${family}`);
   if (route !== null && parsed.assignments[route]?.family !== family) throw new DesktopProfileError("route is not a member of this family", `profile.defaults.${family}`);
-  return parseDesktopProfile({ ...parsed, defaults: { ...parsed.defaults, [family]: route } });
+  const rebuilt = parseDesktopProfile({
+    version: 1,
+    assignments: parsed.assignments,
+    defaults: { ...parsed.defaults, [family]: route },
+    ...chatTabMarker(parsed),
+  });
+  return preserveDesktopAppliedState(parsed, rebuilt);
 }
 
 export function renderDesktopProfile(

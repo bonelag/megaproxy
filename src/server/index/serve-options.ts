@@ -24,6 +24,7 @@ import {
 } from "./startup-warnings";
 
 import { remoteWorkspaceEnabled } from "../../remote-control/workspace-activation";
+import { isClaudeInterceptedPath } from "../../claude/intercept/listener";
 import { markActivity } from "../../lib/sidecar-tracker";
 import { knownModelIdsForProvider } from "../../router";
 import {
@@ -49,8 +50,8 @@ import { MAIN_CODEX_ACCOUNT_ID } from "../../codex/main-account";
 import {
   availableAccountGatedNativeModels,
   codexModelEntitlementStateForAccount,
-  resolveCodexModelEntitlements,
 } from "../../codex/model-entitlements";
+import { resolveAdmittedCodexModelEntitlements } from "../../codex/model-entitlement-admission";
 import { CatalogGatherBusyError } from "../../codex/catalog/provider-fetch";
 import {
   registerCodexWebSocket,
@@ -100,6 +101,7 @@ import {
   withCors,
   withManagementCors,
 } from "../auth-cors";
+import { resolveAdmissionModelScope, routeAllowedByScope } from "../admission-model-scope";
 import {
   disableResponsesRequestTimeout,
   handleResponses,
@@ -166,6 +168,7 @@ import {
 } from "../../lib/local-management-attestation";
 import { SYSTEM_RESTART_CAPABILITY_VERSION } from "../../lib/system-restart-contract";
 import { LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION } from "../../lib/local-provider-reload-contract";
+import { LOCAL_ASIDE_SYNC_CAPABILITY_VERSION } from "../../lib/local-aside-sync-contract";
 import {
   GUI_PAIR_BROWSER_ORIGIN_HEADER,
   GUI_PAIR_CAPABILITY_VERSION,
@@ -196,7 +199,16 @@ import { readyProtocolMetadata } from "../../remote/protocol";
 import { modelCapabilityFields } from "../models-capabilities";
 import { createWebsocketHandler } from "./websocket-handler";
 
-export type ServerIngress = "public" | "unauthenticated-loopback" | "hub-management";
+export type ServerIngress = "public" | "unauthenticated-loopback" | "hub-management" | "claude-intercept";
+
+/**
+ * Routes the Claude intercept TLS listener may reach. Everything else on that socket is relayed
+ * to the real upstream by the listener itself, so a request that lands here with another path
+ * is a bug, not a client — refuse it.
+ */
+export function claudeInterceptRouteAllowed(url: URL, req: Request): boolean {
+  return isClaudeInterceptedPath(url.pathname, req.method);
+}
 
 export interface ServeOptionsContext {
   readonly server: Server<WsData>;
@@ -300,12 +312,24 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           config,
         );
       }
+      if (ingress === "claude-intercept" && !claudeInterceptRouteAllowed(codexCompatibleUrl(req.url), req)) {
+        return withCors(
+          formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${new URL(req.url).pathname}`),
+          req,
+          loopbackPolicy(),
+        );
+      }
       // Auth and CORS decisions below read `policy`, not `config`. For the public listener the
       // two are the same object, so its behaviour is unchanged; for the loopback listener the
       // view substitutes 127.0.0.1 as the bind address, which is what routes it through the
       // same code path a plain loopback bind has always taken — Host-header check included.
       // Routing, provider selection and response bodies keep using `config`.
-      const policy: RequestPolicyView = ingress === "unauthenticated-loopback" ? loopbackPolicy() : config;
+      // The Claude intercept listener is loopback by construction (the CONNECT proxy binds
+      // 127.0.0.1 and the request was rewritten onto a loopback origin), and its callers carry
+      // Anthropic credentials, not opencodex admission tokens — so it takes the loopback view too.
+      const policy: RequestPolicyView = ingress === "unauthenticated-loopback" || ingress === "claude-intercept"
+        ? loopbackPolicy()
+        : config;
       const url = codexCompatibleUrl(req.url);
       markActivity(`${req.method} ${url.pathname}`);
 
@@ -327,20 +351,32 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         || readyzPath !== undefined
         || url.pathname.startsWith("/v1/")
       )) {
-        const message = "OpenCodex package files changed while this proxy was running; restart OpenCodex before retrying.";
-        const response = url.pathname === "/healthz" || readyzPath !== undefined
+        const message = "OpenCodex package files changed while this proxy was running; it restarts on its own, or run 'ocx restart' ('ocx service restart' for a background service).";
+        const fencedPort = ctx.boundPort ?? requestServer.port ?? listenPort;
+        const fencedHealth = url.pathname === "/healthz";
+        const response = fencedHealth || readyzPath !== undefined
           ? jsonResponse({
               status: "restart_required",
               service: "opencodex",
               version: VERSION,
               uptime: process.uptime(),
               pid: process.pid,
-              port: ctx.boundPort ?? requestServer.port ?? listenPort,
+              port: fencedPort,
+              // Identity stays attestable while readiness is fenced (#5496): the CLI can only
+              // restart or stop what it can prove it owns, and an unverified 503 body is not proof.
+              // installedVersion is what an in-place respawn will run from the replaced tree.
+              ...(fencedHealth ? {
+                restartCapability: SYSTEM_RESTART_CAPABILITY_VERSION,
+                installedVersion: packageTreeIntegrity.installedVersion?.(),
+              } : {}),
               error: { code: "package_tree_changed", message },
             }, 503, req, policy)
           : packageTreeChangedResponse(req, policy, message);
         const headers = new Headers(response.headers);
         headers.set("Retry-After", "5");
+        const challenge = fencedHealth ? req.headers.get(LOCAL_ATTESTATION_CHALLENGE_HEADER) : null;
+        const proof = challenge ? createLocalAttestationProof(localAttestationSecret, challenge, process.pid, fencedPort) : null;
+        if (proof) headers.set(LOCAL_ATTESTATION_PROOF_HEADER, proof);
         return new Response(response.body, { status: 503, headers });
       }
 
@@ -542,6 +578,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           port: healthPort,
           restartCapability: SYSTEM_RESTART_CAPABILITY_VERSION,
           providerReloadCapability: LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION,
+          asideSyncCapability: LOCAL_ASIDE_SYNC_CAPABILITY_VERSION,
           guiPairCapability: GUI_PAIR_CAPABILITY_VERSION,
         }, 200, req, policy);
         const challenge = req.headers.get(LOCAL_ATTESTATION_CHALLENGE_HEADER);
@@ -819,7 +856,13 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             // Codex sends its own client_version on this request, and upstream filters the
             // entitlement roster by it. Passing it through is what stops an entitled account
             // being told it cannot use models a newer client can (#2886).
-            resolveCodexModelEntitlements(config, { clientVersion: url.searchParams.get("client_version") }),
+            // The request signal fences the credential phase too: a client that has already
+            // gone away must not keep a native-main token refresh alive, and its late result
+            // must not commit on behalf of a request that no longer exists.
+            resolveAdmittedCodexModelEntitlements(config, {
+              clientVersion: url.searchParams.get("client_version"),
+              signal: req.signal,
+            }),
           ]);
         } catch (error) {
           if (error instanceof CatalogGatherBusyError) {
@@ -1101,6 +1144,17 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             return disabledModels.has(id) ? [] : [{ id, metadataId }];
           })
         );
+        // What a scoped key may see, filtered by the same predicate that refuses
+        // it on the data plane, so the catalog and the send path cannot disagree.
+        // This is a convenience, never the boundary: hiding a row only stops a
+        // client that reads the catalog first, which is why the refusal lives on
+        // the request path and this filter reuses it rather than replacing it.
+        // Filtering happens where the resolved provider and model are still in
+        // hand -- a published id is a selector, and re-resolving one here would
+        // re-run combo selection just to render a list.
+        const listScope = resolveAdmissionModelScope(config, admission);
+        const listAllows = (providerName: string, modelId: string): boolean =>
+          routeAllowedByScope(listScope, { providerName, modelId });
         // The projection is opt-in. Keep the default path free of Cursor install detection,
         // and resolve the bundle table once for the whole list rather than once per row.
         const effortRowsEnabled = config.cursorEffortRows === true;
@@ -1133,7 +1187,9 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             effortRowKnownIds,
           ));
         };
-        const routedRows = await Promise.all(uniqueCatalogModelsForRawPublicList(goOrdered).map(async m => {
+        const routedRows = await Promise.all(uniqueCatalogModelsForRawPublicList(goOrdered)
+          .filter(m => listAllows(m.provider, m.id))
+          .map(async m => {
           // Same rule as the anthropic branch: with the global fast switch on, a client
           // that has no Fast toggle is offered the fast identity directly. An operator
           // alias is an explicit decision and still wins.
@@ -1180,8 +1236,12 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           ));
         }));
         const data = [
-          ...visibleNatives.flatMap(id => expandedNativeModelRow(id)),
-          ...visibleAccountNatives.flatMap(({ id, metadataId }) => expandedNativeModelRow(id, metadataId)),
+          ...visibleNatives
+            .filter(id => listAllows(OPENAI_CODEX_PROVIDER_ID, id))
+            .flatMap(id => expandedNativeModelRow(id)),
+          ...visibleAccountNatives
+            .filter(({ metadataId }) => listAllows(OPENAI_CODEX_PROVIDER_ID, metadataId))
+            .flatMap(({ id, metadataId }) => expandedNativeModelRow(id, metadataId)),
           ...routedRows.flat(),
         ];
         return jsonResponse({ object: "list", data }, 200, req, policy);
@@ -1246,7 +1306,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         };
         const endpoint = url.pathname.endsWith("/edits") ? "edits" as const : "generations" as const;
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => {
-          const response = await handleImages(req, config, endpoint, logCtx, turnAdmissionLease);
+          const response = await handleImages(req, config, endpoint, logCtx, turnAdmissionLease, admission);
           addFinalRequestLog(requestId, start, logCtx, response.status, response.status === 499 ? { closeReason: "client_cancel" } : undefined);
           return withCors(response, req, policy);
         }, { requestId, start, logCtx });
@@ -1534,7 +1594,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => {
           const response = audioClient
             ? await handleExternalLive(req, config, logCtx, { client: audioClient, lease: turnAdmissionLease, bindings: liveCallBindings })
-            : await handleLive(req, config, logCtx, turnAdmissionLease);
+            : await handleLive(req, config, logCtx, turnAdmissionLease, admission);
           addFinalRequestLog(
             requestId,
             start,
@@ -1609,7 +1669,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             : liveSidebandTarget && audioClient
               ? await resolveExternalLiveSocket(audioClient, config, logCtx, liveSidebandTarget, { lease: turnAdmissionLease, bindings: liveCallBindings, signal: acquisition?.signal })
               : liveSidebandTarget
-                ? await resolveLiveSidebandUpgrade(req, config, logCtx, liveSidebandTarget, turnAdmissionLease)
+                ? await resolveLiveSidebandUpgrade(req, config, logCtx, liveSidebandTarget, turnAdmissionLease, admission)
                 : formatErrorResponse(401, "authentication_error", "opencodex API key required");
         } catch (error) {
           try { releaseAcquisition(); }

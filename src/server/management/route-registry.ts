@@ -148,6 +148,8 @@ export const MANAGEMENT_ROUTES: readonly ManagementRoute[] = [
   { method: "POST", path: "/api/grok/apply", module: "server/management/agent-settings-routes", mutates: true },
   { method: "GET", path: "/api/grok/reset-coupons", module: "server/management/grok-coupon-routes", mutates: false },
   { method: "POST", path: "/api/grok/reset-coupons/consume", module: "server/management/grok-coupon-routes", mutates: true },
+  { method: "GET", path: "/api/anthropic/reset-grants", module: "server/management/anthropic-reset-grant-routes", mutates: false, exempt: { reason: "deferred-verb", why: "Reading Claude reset grants has no CLI verb yet; the dashboard ticket badge is the only reader in this unit.", owner: "260923_claude_reset_grants wp1", ownerDoc: "devlog/_plan/260923_claude_reset_grants/010_plan.md" } },
+  { method: "POST", path: "/api/anthropic/reset-grants/consume", module: "server/management/anthropic-reset-grant-routes", mutates: true, exempt: { reason: "session-only", why: "Spending a Claude reset grant requires the gui-session principal (anthropic-reset-grant-routes.ts handleConsume); the admin token is refused." } },
   { method: "PUT", path: "/api/claude-code", module: "server/management/agent-settings-routes", mutates: true },
   { method: "PUT", path: "/api/claude-desktop", module: "server/management/agent-settings-routes", mutates: true },
   { method: "PUT", path: "/api/codex-auth/features/default-mode-request-user-input", module: "server/management/agent-settings-routes", mutates: true },
@@ -240,6 +242,12 @@ export const MANAGEMENT_ROUTES: readonly ManagementRoute[] = [
   { method: "GET", path: "/api/storage/trash", module: "server/management/logs-usage-routes", mutates: false },
   { method: "GET", path: "/api/storage/trash/restore/test-stream", module: "server/management/logs-usage-routes", mutates: false, exempt: { reason: "test-seam", why: "Opt-in streaming seam declared at src/storage/restore-job.ts:34." } },
   { method: "GET", path: "/api/usage", module: "server/management/logs-usage-routes", mutates: false },
+  // server/management/usage-timeline-routes
+  { method: "GET", path: "/api/usage/timeline", module: "server/management/usage-timeline-routes", mutates: false },
+  // server/management/companion-routes
+  { method: "POST", path: "/api/companion/open-in-browser", module: "server/management/companion-routes", mutates: true, exempt: { reason: "session-only", why: "Dashboard-only navigation helper; the GUI session opens its current view in the system browser, and there is no standalone CLI operation to drive." } },
+  { method: "GET", path: "/api/companion/settings", module: "server/management/companion-routes", mutates: false },
+  { method: "PUT", path: "/api/companion/settings", module: "server/management/companion-routes", mutates: true },
   { method: "POST", path: "/api/storage/cleanup", module: "server/management/logs-usage-routes", mutates: true },
   { method: "POST", path: "/api/storage/cleanup-policy/run", module: "server/management/logs-usage-routes", mutates: true },
   { method: "POST", path: "/api/storage/cleanup/preview", module: "server/management/logs-usage-routes", mutates: true },
