@@ -79,11 +79,22 @@ export function contextEndpoint(path: string): string | undefined {
   return CONTEXT_ENDPOINTS.has(endpoint) ? endpoint : undefined;
 }
 
-/** Alias only the data-plane prefix. Existing auth/origin and route gates still run. */
+/**
+ * Alias the Codex data-plane prefix, then collapse one doubled `/v1`.
+ *
+ * Claude Code appends `/v1/...` to whatever base URL it was given. `ocx claude` writes an
+ * origin, but a custom settings row often already ends in `/v1`, so the request arrives as
+ * `/v1/v1/messages`. Route matching is exact, so that 404s. One extra prefix is the whole
+ * mistake; `/v1/v1/v1` stays doubled so a deeper misconfiguration is still visible.
+ * Existing auth, origin and route gates still run on the result.
+ */
 export function codexCompatibleUrl(rawUrl: string): URL {
   const url = new URL(rawUrl);
   if (url.pathname === CONTEXT_BACKEND_PREFIX || url.pathname.startsWith(CONTEXT_BACKEND_PREFIX + "/")) {
     url.pathname = "/v1" + url.pathname.slice(CONTEXT_BACKEND_PREFIX.length);
+  }
+  if (url.pathname === "/v1/v1" || url.pathname.startsWith("/v1/v1/")) {
+    url.pathname = url.pathname.slice("/v1".length);
   }
   return url;
 }

@@ -13,6 +13,11 @@ describe("route and config isolation", () => {
       expect(codexCompatibleUrl(`http://127.0.0.1:10100/backend-api/codex/${route}?a=1`).pathname).toBe(`/v1/${route}`);
     }
     expect(codexCompatibleUrl("http://127.0.0.1:10100/v1/responses?a=1").href).toBe("http://127.0.0.1:10100/v1/responses?a=1");
+    expect(codexCompatibleUrl("http://127.0.0.1:10100/v1/v1/messages?beta=true").pathname).toBe("/v1/messages");
+    expect(codexCompatibleUrl("http://127.0.0.1:10100/v1/v1/messages/count_tokens").pathname).toBe("/v1/messages/count_tokens");
+    expect(codexCompatibleUrl("http://127.0.0.1:10100/v1/v1/chat/completions").pathname).toBe("/v1/chat/completions");
+    expect(codexCompatibleUrl("http://127.0.0.1:10100/v1/v1").pathname).toBe("/v1");
+    expect(codexCompatibleUrl("http://127.0.0.1:10100/v1/v1/v1/messages").pathname).toBe("/v1/v1/messages");
     expect(codexCompatibleUrl("http://127.0.0.1:10100/backend-api/codex/api/config").pathname).toBe("/v1/api/config");
     expect(contextEndpoint("/v1/alpha/notes/v2/write_file")).toBe("alpha/notes/v2/write_file");
     expect(contextEndpoint("/v1/alpha/notes/v2/delete_file")).toBeUndefined();
