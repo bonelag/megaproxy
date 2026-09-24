@@ -51,6 +51,7 @@ import type { RequestLogContext } from "./request-log";
 import { codexLogAccountId } from "./responses";
 import type { AdmissionLease } from "../lib/admission";
 import { codexAccountSelectionForTurn } from "./lifecycle";
+import { applyProviderHeaders } from "../lib/provider-request-headers";
 import { codexModelAvailabilityErrorResponse } from "./responses/codex-auth-error";
 
 /** Voice call create can wait on SDP negotiation; bound a hung upstream. */
