@@ -1273,6 +1273,7 @@ const OAUTH_RECONCILE_FIELDS: (keyof OcxProviderConfig)[] = [
   "modelReasoningEffortMap",
   "noTemperatureModels",
   "noTopPModels",
+  "noStopModels",
   "noPenaltyModels",
   "autoToolChoiceOnlyModels",
   "preserveReasoningContentModels",

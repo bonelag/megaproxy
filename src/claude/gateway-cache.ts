@@ -6,9 +6,12 @@
  * subscription-preserving launch deliberately sets no token, so the CLI can never
  * refresh its picker list itself — it reads whatever cache exists. We therefore
  * pre-write the cache in the exact on-disk schema the CLI uses:
- *   { baseUrl, fetchedAt, models: [{ id, display_name? }] }  (mode 0600)
- * mirroring its `/^(claude|anthropic)/i` usable-id filter. The picker validates
+ *   { baseUrl, fetchedAt, models: [{ id, display_name?, description? }] }  (mode 0600)
+ * mirroring the picker rule that the id must contain `claude` or `anthropic`.
+ * Current aliases are `ocx-claude-*`, so an anchored `^(claude|anthropic)` filter
+ * would drop every newly minted routed model. The picker validates
  * only `baseUrl === ANTHROPIC_BASE_URL`, so a foreign base URL is simply ignored.
+ * `description` replaces the picker's generic "From gateway" line (Claude Code >= 2.1.257).
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -20,6 +23,7 @@ import type { OcxConfig } from "../types";
 export interface GatewayModelRow {
   id: string;
   display_name?: string;
+  description?: string;
 }
 
 export interface GatewayModelCacheRefreshOptions {
@@ -67,15 +71,18 @@ export function writeGatewayModelCache(baseUrl: string, models: readonly Gateway
     }
 
     // Mirror the CLI's usable-id filter so our file matches what it would cache.
-    const usable = isDiscoveryEnabled ? models.filter(m => /^(claude|anthropic)/i.test(m.id)) : [];
-
+    const usable = isDiscoveryEnabled ? models.filter(m => /(claude|anthropic)/i.test(m.id)) : [];
     const cacheDir = join(configDir, "cache");
     mkdirSync(cacheDir, { recursive: true });
     const path = join(cacheDir, "gateway-models.json");
     const payload = {
       baseUrl: effectiveBaseUrl,
       fetchedAt: Date.now(),
-      models: usable.map(m => (m.display_name === undefined ? { id: m.id } : { id: m.id, display_name: m.display_name })),
+      models: usable.map(m => ({
+        id: m.id,
+        ...(m.display_name === undefined ? {} : { display_name: m.display_name }),
+        ...(m.description === undefined ? {} : { description: m.description }),
+      })),
     };
     writeFileSync(path, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
     return path;
@@ -129,6 +136,7 @@ export async function refreshGatewayModelCacheFromProxy(
       .map(m => ({
         id: m.id as string,
         display_name: typeof m.display_name === "string" ? m.display_name : undefined,
+        description: typeof m.description === "string" ? m.description : undefined,
       }));
     return writeGatewayModelCache(baseUrl, models, options.configDir);
   } catch {

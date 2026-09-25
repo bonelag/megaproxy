@@ -77,9 +77,11 @@ import { handleCompanionRoutes } from "./management/companion-routes";
 import { handleCodexPromptRoutes } from "./management/codex-prompt-routes";
 import { handleIntegrationRoutes } from "./management/integration-routes";
 import { handleNativeIntegrationRoutes } from "./management/native-integration-routes";
+import { handleClaudeDesktopPickerRoutes } from "./management/claude-desktop-picker-routes";
 import { handleCursorIntegrationRoutes } from "./management/cursor-integration-routes";
 import type { ManagementContext } from "./management/context";
 import type { ManagementPrincipal, ManagementSessionControl } from "./management-auth";
+import type { ManagementRequestIngress } from "./management/context";
 export type { ManagementApiDeps } from "./management/context";
 import { fetchAllModels } from "./management/shared";
 import { CatalogGatherBusyError } from "../codex/catalog/provider-fetch";
@@ -155,6 +157,16 @@ async function handleWorkflowBudgetRoutesOnDemand(ctx: ManagementContext): Promi
   return handleWorkflowBudgetRoutes(ctx);
 }
 
+/**
+ * Lazy like the Lab and routing-profile handlers: the protocol planner reaches the router and
+ * the ingress eligibility rules, which no other dashboard request needs.
+ */
+async function handleProtocolRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/protocols")) return null;
+  const { handleProtocolRoutes } = await import("./management/protocol-routes");
+  return handleProtocolRoutes(ctx);
+}
+
 async function handleGrokCouponRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
   if (!pathInManagementNamespace(ctx.url.pathname, "/api/grok/reset-coupons", true)) return null;
   const { handleGrokCouponRoutes } = await import("./management/grok-coupon-routes");
@@ -184,6 +196,12 @@ async function handleRemoteWorkspaceRoutesOnDemand(ctx: ManagementContext): Prom
   return handleRemoteWorkspaceRoutes(ctx);
 }
 
+async function handleLinkRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/link")) return null;
+  const { handleLinkRoutes } = await import("./management/link-routes");
+  return handleLinkRoutes(ctx);
+}
+
 export async function handleManagementAPI(
   req: Request,
   url: URL,
@@ -191,6 +209,7 @@ export async function handleManagementAPI(
   deps: ManagementApiDeps = {},
   principal?: ManagementPrincipal,
   sessionControl?: ManagementSessionControl,
+  requestIngress: ManagementRequestIngress = { trustedLoopback: false },
 ): Promise<Response | null> {
   if (!isAllowedManagementOrigin(req, config)) {
     return jsonResponse({ error: "cross-origin request blocked" }, 403, req, config);
@@ -273,10 +292,16 @@ export async function handleManagementAPI(
       }
     } catch { /* best-effort */ }
   }
-  const ctx: ManagementContext = { req, url, config, deps, version: VERSION, principal, sessionControl, convergeCodexCatalog, syncClaudeAgentDefsBestEffort };
+  const ctx: ManagementContext = {
+    req, url, config, deps, version: VERSION, principal, sessionControl,
+    trustedLoopbackIngress: requestIngress.trustedLoopback,
+    guiSessionIssuance: requestIngress.guiSessionIssuance ?? null,
+    convergeCodexCatalog, syncClaudeAgentDefsBestEffort,
+  };
   let routed: Response | null | undefined;
   try {
     routed = handleSessionRoutes(ctx)
+    ??     (await handleLinkRoutesOnDemand(ctx))
     ??     (await handleRemoteWorkspaceRoutesOnDemand(ctx))
     ??     (await handleConfigRoutes(ctx))
     ??     (await handleStorageLogGuardRoutes(ctx))
@@ -284,6 +309,7 @@ export async function handleManagementAPI(
     ??     (await handleRequestHistoryRoutes(ctx))
     ??     (await handleQuotaResetRoutesOnDemand(ctx))
     ??     (await handleWorkflowBudgetRoutesOnDemand(ctx))
+    ??     (await handleProtocolRoutesOnDemand(ctx))
     ??     (await handleGrokCouponRoutesOnDemand(ctx))
     ??     (await handleAnthropicResetGrantRoutesOnDemand(ctx))
     ??     handleMetricsRoutes(ctx)
@@ -294,6 +320,7 @@ export async function handleManagementAPI(
     ??     (await handleIntegrationRoutes(ctx))
     ??     (await handleNativeIntegrationRoutes(ctx))
     ??     (await handleCursorIntegrationRoutes(ctx))
+    ??     (await handleClaudeDesktopPickerRoutes(ctx))
     ??     (await handleAgentSettingsRoutes(ctx))
     ??     (await handleCodexPromptRoutes(ctx))
     ??     (await handleOauthAccountRoutes(ctx))
