@@ -882,9 +882,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   }
 
   startPackageRefresh();
-  import("../claude/gateway-cache")
-    .then(({ refreshGatewayModelCacheFromProxy }) => refreshGatewayModelCacheFromProxy(boundPort, { admissionConfig: config }))
-    .catch(() => {});
+  import("../claude/gateway-cache").then(m => m.refreshGatewayModelCacheFromProxy(boundPort, { admissionConfig: config })).catch(() => {});
   return server;
 }
 

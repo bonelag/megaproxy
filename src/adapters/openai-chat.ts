@@ -232,9 +232,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           if (parallelToolCalls !== undefined) body.parallel_tool_calls = parallelToolCalls;
         }
         if (parsed.stream) body.stream_options = { include_usage: true };
-        if (isOpenCodeZenEndpoint(provider.baseUrl)) {
-          cloakOpenCodeZenChatTools(body);
-        }
+        if (isOpenCodeZenEndpoint(provider.baseUrl)) cloakOpenCodeZenChatTools(body);
 
         const bodyJson = JSON.stringify(body);
         const actualServiceTier = typeof body.service_tier === "string" ? body.service_tier : null;
