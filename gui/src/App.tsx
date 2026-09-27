@@ -14,6 +14,7 @@ import Startup from "./pages/Startup";
 import RemoteWorkspace from "./pages/RemoteWorkspace";
 import RemoteLink from "./pages/RemoteLink";
 import ErrorBoundary from "./components/ErrorBoundary";
+import QuotaSummaryBar from "./components/quota-summary-bar/QuotaSummaryBar";
 import { SidebarGithubRow } from "./components/sidebar-github-row";
 import { DesktopStarOnboarding } from "./components/desktop-star-onboarding";
 import { IconGrid, IconServer, IconBoxes, IconBot, IconList, IconActivity, IconHardDrive, IconCodex, IconMenu, IconSun, IconMoon, IconMonitor, IconGlobe, IconPower, IconX, IconRefresh, IconMessage } from "./icons";
