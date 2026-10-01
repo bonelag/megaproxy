@@ -7,6 +7,13 @@ opencodex는 `/v1/responses`와 함께 `POST /v1/messages`(및 `count_tokens`)�
 Code에서 OAuth 로그인, 계정 풀, 키 장애 조치, 사이드카를 포함한 모든 라우팅 제공자를 별도의
 인증 작업 없이 사용할 수 있어요.
 
+Messages API를 통해 사용하는 Devin 경로(SWE-2 포함)에서는 늦게 도착하는 추론 서명을 답변보다 먼저
+보낼 수 있도록, 상위 제공자의 턴이 완료될 때까지 텍스트와 도구 호출 전송을 기다려요. 이렇게 하면 Claude Code의
+최종 결과가 비어 버리는 것을 막을 수 있어요. 생성 중에도 추론과 keepalive 진행 알림은 계속 전달돼요.
+버퍼에는 요청의 32 MiB 변환 한도가 함께 적용되며, 요청을 취소하면 생성 작업도 중단돼요.
+이 출력 순서 수정으로 Cognition이 생성된 일부 시스템 텍스트를 거부하는 별개의 문제가 해결되지는 않아요.
+시스템 지시와 안전 제약은 그대로 유지해요.
+
 ## 빠른 시작
 
 ```bash
@@ -162,8 +169,10 @@ unknown은 설정이 아직 opencodex 프록시를 가리키는지 판단할 수
 Picker 모드는 1P 모드의 일부예요. macOS에서 1P를 선택하면 기본으로 켜지지만,
 `claudeCode.intercept.picker: false`를 설정하면 꺼져요. 1P Desktop의 Code 탭 모델 선택기를 바꿔서
 사용 가능한 opencodex 모델을 이름으로 보여줘요. 처음 켤 때 macOS 로그인 키체인에서 로컬 인증 기관을
-신뢰하라는 메시지가 표시될 수 있어요. 이 인증 기관은 `claude.ai`와 그 하위 도메인으로 제한되며,
-이 메시지는 이 로컬 CA를 한 번 신뢰하기 위한 절차예요.
+신뢰하라는 메시지가 표시될 수 있어요. 이 인증 기관은 `claude.ai`와 그 하위 도메인으로 제한돼요.
+서명 키는 실행 중인 OpenCodex 프로세스 안에만 존재하므로, OpenCodex를 다시 시작할 때마다 새 인증
+기관이 발행되고 macOS가 다시 신뢰를 요청해요. 다시 시작할 때마다 메시지를 승인하거나, 나중에
+`ocx claude desktop picker trust`를 실행하면 돼요.
 
 Picker 모드가 켜져 있는 동안 Claude Desktop의 네트워크는 OpenCodex를 거쳐요. OpenCodex가 중단되면
 Picker 모드를 끄거나 Desktop을 완전히 다시 시작할 때까지 Desktop은 오프라인이에요.
@@ -182,7 +191,7 @@ opencodex 라우트에 묶어서 씁니다.
 
 ```bash
 ocx claude desktop bind claude-sonnet-4-6 xai/grok-4.7
-ocx claude desktop bind claude-opus-4-6 native/gpt-6-sol
+ocx claude desktop bind claude-opus-4-6 native/gpt-6.1-sol
 ocx claude desktop unbind claude-opus-4-6
 ```
 

@@ -7,6 +7,13 @@ opencodex は `/v1/responses` と共に `POST /v1/messages`(`count_tokens` も)�
 Code から OAuth ログイン、アカウントプール、キーフェイルオーバー、サイドカーを含むすべてのルーティングプロバイダーを別途の
 認証作業なしで使えます。
 
+Messages API 経由の Devin ルート（SWE-2 を含む）では、テキストとツール呼び出しの送信を
+上流のターンが完了するまで待ち、遅れて届く推論署名を回答より先に送ります。これにより Claude Code の
+最終結果が空になるのを防ぎます。生成中も推論と keepalive による進行通知は送信されます。
+バッファはリクエストの 32 MiB の変換上限を共有し、キャンセルすると生成処理も停止します。
+この出力順序の修正は、生成された一部のシステムテキストを Cognition が拒否する別の問題を解決するものではありません。
+システム指示と安全上の制約は保持されます。
+
 ## クイックスタート
 
 ```bash
@@ -140,8 +147,9 @@ Picker モードは 1P モードの一部です。macOS で 1P を選ぶとデ�
 `claudeCode.intercept.picker: false` を設定した場合は無効です。1P の Desktop の Code タブにある
 モデルピッカーを書き換え、利用できる opencodex モデルを名前付きで表示します。初回の有効化時は、
 macOS がログインキーチェーン内のローカル証明書認証局を信頼するよう求めることがあります。この認証局の
-制約は `claude.ai` とそのサブドメインに限られ、このダイアログはこのローカル CA に対する一度だけの
-信頼操作です。
+制約は `claude.ai` とそのサブドメインに限られます。署名鍵は実行中の OpenCodex プロセス内にだけ存在する
+ため、OpenCodex を再起動するたびに新しい認証局が発行され、macOS が再び信頼を求めます。再起動のたびに
+プロンプトを承認するか、あとから `ocx claude desktop picker trust` を実行してください。
 
 Picker モードが有効な間、Claude Desktop のネットワークは OpenCodex を経由します。OpenCodex が停止
 すると、Picker モードをオフにするか Desktop を完全に再起動するまで Desktop はオフラインになります。
@@ -160,7 +168,7 @@ Anthropic モデル ID なので、代わりにピッカーの行を opencodex �
 
 ```bash
 ocx claude desktop bind claude-sonnet-4-6 xai/grok-4.7
-ocx claude desktop bind claude-opus-4-6 native/gpt-6-sol
+ocx claude desktop bind claude-opus-4-6 native/gpt-6.1-sol
 ocx claude desktop unbind claude-opus-4-6
 ```
 

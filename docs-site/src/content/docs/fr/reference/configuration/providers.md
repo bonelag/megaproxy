@@ -170,17 +170,17 @@ configuré sous [`claudeCode.authMode`](/fr/reference/configuration/server/#clau
 
 ### Ce qu'une sauvegarde de fournisseur conserve
 
-`POST /api/providers` avec le nom d'un fournisseur existant remplace la ligne enregistrée par une ligne construite à partir de la requête. Le formulaire d'ajout/modification du tableau de bord ne peut pas envoyer tous les champs ; la sauvegarde conserve donc certains champs enregistrés que la requête omet. Cinq d'entre eux décrivent le comportement d'un amont précis : `preserveReasoningContentModels`, `requiresReasoningPlaceholderModels`, `foldDeveloperRoleToSystem`, `reasoningWireFormat`, `omitReasoningEffortWithToolsModels`.
+`POST /api/providers` avec le nom d'un fournisseur existant remplace la ligne enregistrée par une ligne construite à partir de la requête. Le formulaire d'ajout/modification du tableau de bord ne peut pas envoyer tous les champs ; la sauvegarde conserve donc certains champs enregistrés que la requête omet. Huit d'entre eux décrivent le comportement d'un amont précis : `preserveReasoningContentModels`, `requiresReasoningPlaceholderModels`, `foldDeveloperRoleToSystem`, `reasoningWireFormat`, `omitReasoningEffortWithToolsModels`, `retryOn429`, `transientRetryOn5xx`, `retryOnReset`.
 
-| Sauvegarde | Les cinq réglages | `apiKeyPool` enregistré |
+| Sauvegarde | Les huit réglages | `apiKeyPool` enregistré |
 | --- | --- | --- |
 | Même destination, champ omis | Valeur enregistrée conservée, y compris un `[]` ou un `false` explicite | Conservé |
 | Nouvelle destination, champ omis | Non conservée ; les valeurs par défaut du registre pour la nouvelle destination peuvent s'appliquer | Non conservé |
 | Champ envoyé dans la requête | La valeur de la requête | La valeur de la requête |
 
-La destination est l'adaptateur, l'URL de base (schéma et hôte comparés sans tenir compte de la casse, barres obliques finales ignorées) et, lorsque la requête en indique un, le mode d'authentification. Déplacer un fournisseur vers une autre destination abandonne les cinq réglages, qui décrivent l'amont précédent, ainsi que le pool de clés, dont les clés ont été émises pour lui. Une sauvegarde ne fusionne jamais le reste de l'ancienne ligne dans la nouvelle.
+La destination est l'adaptateur, l'URL de base (schéma et hôte comparés sans tenir compte de la casse, barres obliques finales ignorées) et, lorsque la requête en indique un, le mode d'authentification. Déplacer un fournisseur vers une autre destination abandonne les huit réglages, qui décrivent l'amont précédent, ainsi que le pool de clés, dont les clés ont été émises pour lui. Une sauvegarde ne fusionne jamais le reste de l'ancienne ligne dans la nouvelle.
 
-`PATCH /api/providers?name=<provider>` ne modifie que les champs qu'il nomme et conserve tous les autres champs enregistrés, quelle que soit la destination. Il accepte les cinq réglages ; `null` en efface un. Pour les deux listes de raisonnement, un tableau vide est enregistré comme refus explicite au lieu d'être supprimé.
+`PATCH /api/providers?name=<provider>` ne modifie que les champs qu'il nomme et conserve tous les autres champs enregistrés, quelle que soit la destination. Il accepte les huit réglages ; `null` en efface un. Pour les deux listes de raisonnement, un tableau vide est enregistré comme refus explicite au lieu d'être supprimé.
 
 ## Sécurité des connexions sortantes de diagnostic des fournisseurs
 
@@ -246,8 +246,7 @@ rotation automatique peut déclencher des restrictions du fournisseur.
 | `anthropicAccountPool.stickyLimit?` | `number` | `1` | Liaisons de nouvelle session réussies conservées sur une sélection à tour de rôle. Portée 1–100. |
 
 Lorsque cette option est activée, un 429 enregistre une temporisation bornée à partir de `Retry-After` ou d'un délai de repli, puis peut
-faire basculer la requête vers un autre compte. L'affinité est locale au processus et de taille bornée. Un 401/403 lié aux identifiants marque le compte
-comme devant être réauthentifié. Si tous les comptes admissibles sont en temporisation, les clients reçoivent un 429 accompagné de
+faire basculer la requête vers un autre compte. L'affinité est locale au processus et de taille bornée. Les erreurs de renouvellement du jeton suivent les règles de réauthentification existantes. Un 403 confirmé lié à un abonnement ou à la facturation du compte permet un basculement avant la sortie, avec une temporisation selon `Retry-After` ou de dix minutes par défaut. Un refus d’autorisation ordinaire ne déclenche pas de basculement. Si tous les comptes admissibles sont en temporisation, les clients reçoivent un 429 accompagné de
 `Retry-After` lorsqu'il est connu, et non une erreur d'authentification.
 
 :::caution[Expérimental]
@@ -554,3 +553,7 @@ le nom actuel avant d'effectuer une autre modification.
   "visionSidecar": { "enabled": true }
 }
 ```
+
+### `anthropicAccountPool.routes`
+
+Les routes `anthropicAccountPool.routes` associent un modèle à des identifiants de comptes OAuth Anthropic enregistrés. La première règle correspondante (`match`, glob sensible à la casse) limite la sélection initiale et les reprises 429 lorsque le pool est activé. `fallback: true` élargit la sélection seulement si aucun compte de la règle n’est éligible.

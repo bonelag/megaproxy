@@ -1,4 +1,4 @@
-import { compactionRoutingSchema } from "../../config/schema/leaf-validators";
+import { compactionRoutingSchema, memoryModelsSchema } from "../../config/schema/leaf-validators";
 import { compactionRecoverySchema } from "../../config/schema/compaction-recovery";
 import { captureConfigTopLevelRollback } from "../../config/rebase-provenance";
 import type { IntegrationClientId } from "../../integrations/registry";
@@ -272,7 +272,7 @@ export async function syncEnabledClientIntegrations(
     },
     config,
     port,
-  }, ["mcode", "pi", "aside", "raycast", "omo", "cline"]));
+  }, ["mcode", "pi", "aside", "raycast", "omo", "cline", "droid"]));
 
   return out;
 }
@@ -367,6 +367,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       // Absent means the historical auto-open, so the GUI can render the toggle
       // without having to know that `undefined` and `true` mean the same thing.
       oauthOpenBrowser: config.oauthOpenBrowser !== false,
+      showCodexCredits: config.showCodexCredits === true,
       // Absent means off (today's Design B injection), so the GUI/CLI render a plain switch.
       codexDesktopAuthless: config.codexDesktopAuthless === true,
       // Absent keeps Design B remote compaction; true selects the dedicated provider identity.
@@ -374,6 +375,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       codexDesktopSwitches: describeCodexDesktopSwitches(config, await observedCodexDesktopSwitchApply()),
       compactionRouting: config.compactionRouting ?? null,
       compactionRecovery: config.compactionRecovery ?? null,
+      // Absent means both phases keep their existing routes; the GUI renders that as "Off".
+      memoryModels: config.memoryModels ?? null,
       startupHealth: await readStartupHealthSnapshot(config),
       codexRuntime: {
         path: displayCodexRuntimePath(resolved.runtime.command),
@@ -460,6 +463,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       codexAccountPickerEnabled?: unknown;
       codexQuotaAutoRefresh?: unknown;
       oauthOpenBrowser?: unknown;
+      showCodexCredits?: unknown;
       ultraFastTier?: unknown;
       fastRows?: unknown;
       codexMainAccountHardLock?: unknown;
@@ -467,6 +471,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       codexClientCompaction?: unknown;
       compactionRouting?: unknown;
       compactionRecovery?: unknown;
+      memoryModels?: unknown;
     };
     if (body.codexAutoStart === undefined
       && body.streamMode === undefined
@@ -474,16 +479,22 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       && body.codexAccountPickerEnabled === undefined
       && body.codexQuotaAutoRefresh === undefined
       && body.oauthOpenBrowser === undefined
+      && body.showCodexCredits === undefined
       && body.ultraFastTier === undefined
       && body.fastRows === undefined
       && body.codexMainAccountHardLock === undefined
       && body.codexDesktopAuthless === undefined
       && body.codexClientCompaction === undefined
-      && body.compactionRouting === undefined && body.compactionRecovery === undefined) {
-      return jsonResponse({ error: "provide codexAutoStart, streamMode, appOwnedMemoryBudgetMb, codexAccountPickerEnabled, codexQuotaAutoRefresh, oauthOpenBrowser, ultraFastTier, fastRows, codexMainAccountHardLock, codexDesktopAuthless, codexClientCompaction, compactionRouting, or compactionRecovery" }, 400);
+      && body.compactionRouting === undefined
+      && body.compactionRecovery === undefined
+      && body.memoryModels === undefined) {
+      return jsonResponse({ error: "provide codexAutoStart, streamMode, appOwnedMemoryBudgetMb, codexAccountPickerEnabled, codexQuotaAutoRefresh, oauthOpenBrowser, showCodexCredits, ultraFastTier, fastRows, codexMainAccountHardLock, codexDesktopAuthless, codexClientCompaction, compactionRouting, compactionRecovery, or memoryModels" }, 400);
     }
     if (body.codexAutoStart !== undefined && typeof body.codexAutoStart !== "boolean") {
       return jsonResponse({ error: "codexAutoStart boolean is required" }, 400);
+    }
+    if (body.showCodexCredits !== undefined && typeof body.showCodexCredits !== "boolean") {
+      return jsonResponse({ error: "showCodexCredits boolean is required" }, 400);
     }
     if (body.oauthOpenBrowser !== undefined && typeof body.oauthOpenBrowser !== "boolean") {
       return jsonResponse({ error: "oauthOpenBrowser boolean is required" }, 400);
@@ -518,6 +529,12 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     if (compactionRouting != null && !compactionRouting.success) {
       return jsonResponse({ error: "compactionRouting requires a model, an optional valid reasoningEffort, and optional non-repeating triggers drawn from \"manual\" and \"auto\"" }, 400);
     }
+    const memoryModels = body.memoryModels == null
+      ? body.memoryModels
+      : memoryModelsSchema.safeParse(body.memoryModels);
+    if (memoryModels != null && !memoryModels.success) {
+      return jsonResponse({ error: "memoryModels requires a nonblank model and an optional declared reasoningEffort per configured phase, and no other fields" }, 400);
+    }
     let quotaAutoRefreshChange: { id: string; window: "fiveHour" | "weekly"; enabled: boolean } | undefined;
     if (body.codexQuotaAutoRefresh !== undefined) {
       if (!isPlainRecord(body.codexQuotaAutoRefresh)) {
@@ -547,7 +564,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     )) {
       return jsonResponse({ error: `appOwnedMemoryBudgetMb must be an integer from ${MIN_APP_OWNED_MEMORY_BUDGET_MB} to ${MAX_APP_OWNED_MEMORY_BUDGET_MB}` }, 400);
     }
-    const restoreCompactionRouting = captureConfigTopLevelRollback(config, ["compactionRouting", "compactionRecovery"]);
+    const restoreCompactionRouting = captureConfigTopLevelRollback(config, ["compactionRouting", "compactionRecovery", "memoryModels"]);
     const previousSettings = {
       codexAutoStart: config.codexAutoStart,
       hasCodexAutoStart: Object.hasOwn(config, "codexAutoStart"),
@@ -563,6 +580,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       hasCodexQuotaAutoRefresh: Object.hasOwn(config, "codexQuotaAutoRefresh"),
       oauthOpenBrowser: config.oauthOpenBrowser,
       hasOauthOpenBrowser: Object.hasOwn(config, "oauthOpenBrowser"),
+      showCodexCredits: config.showCodexCredits,
+      hasShowCodexCredits: Object.hasOwn(config, "showCodexCredits"),
       ultraFastTier: config.ultraFastTier,
       hasUltraFastTier: Object.hasOwn(config, "ultraFastTier"),
       fastRows: config.fastRows,
@@ -599,6 +618,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       } else if (body.codexAccountPickerEnabled === false) {
         config.codexAccountPickerEnabled = false;
       }
+      if (typeof body.showCodexCredits === "boolean") config.showCodexCredits = body.showCodexCredits;
       if (typeof body.oauthOpenBrowser === "boolean") {
         config.oauthOpenBrowser = body.oauthOpenBrowser;
       }
@@ -620,6 +640,9 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       else if (compactionRouting?.success) config.compactionRouting = compactionRouting.data;
       if (compactionRecovery === null) deleteConfigTopLevelKey(config, "compactionRecovery");
       else if (compactionRecovery?.success) config.compactionRecovery = compactionRecovery.data;
+      // Null clears both phases; the GUI sends that when neither row names a model.
+      if (memoryModels === null) deleteConfigTopLevelKey(config, "memoryModels");
+      else if (memoryModels?.success) config.memoryModels = memoryModels.data;
       if (quotaAutoRefreshChange) {
         const { id, window, enabled } = quotaAutoRefreshChange;
         const setting = { ...(config.codexQuotaAutoRefresh?.[id] ?? {}) };
@@ -650,6 +673,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       if (previousSettings.hasCodexQuotaAutoRefresh) {
         config.codexQuotaAutoRefresh = previousSettings.codexQuotaAutoRefresh;
       } else deleteConfigTopLevelKey(config, "codexQuotaAutoRefresh");
+      if (previousSettings.hasShowCodexCredits) config.showCodexCredits = previousSettings.showCodexCredits;
+      else deleteConfigTopLevelKey(config, "showCodexCredits");
       if (previousSettings.hasOauthOpenBrowser) {
         config.oauthOpenBrowser = previousSettings.oauthOpenBrowser;
       } else deleteConfigTopLevelKey(config, "oauthOpenBrowser");
@@ -715,6 +740,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       codexAccountPickerEnabled: pickerIsEnabled,
       codexQuotaAutoRefresh: quotaAutoRefreshSettings(config),
       oauthOpenBrowser: config.oauthOpenBrowser !== false,
+      showCodexCredits: config.showCodexCredits === true,
       catalogRefreshPending,
       fastRows: config.fastRows !== false,
       codexDesktopAuthless: authlessIsEnabled,
@@ -722,6 +748,9 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       codexDesktopSwitches,
       compactionRouting: config.compactionRouting ?? null,
       compactionRecovery: config.compactionRecovery ?? null,
+      // The panel re-reads its own save response, so a missing block would render both
+      // phases as "Off" while the server kept them.
+      memoryModels: config.memoryModels ?? null,
       codexMainAccountHardLock: isMainAccountHardLockEnabled(config),
       mainAccountHardLock: getMainAccountHardLockStatus(config),
       startupHealth: await readStartupHealthSnapshot(config),
@@ -772,7 +801,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
   }
 
   if (url.pathname === "/api/update/run" && req.method === "POST") {
-    const { normalizeUpdateChannel, startUpdateJob, UpdateJobError } = await import("../../update/job");
+    const { normalizeUpdateChannel, startUpdateJob, UpdateJobError, spawnGuiUpdateWorker } = await import("../../update/job");
     let body: { tag?: unknown; restart?: unknown };
     try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     if (body.tag !== undefined && body.tag !== "latest" && body.tag !== "preview") {
@@ -785,8 +814,17 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       const channel = normalizeUpdateChannel(body.tag as string | undefined);
       const { packageRefresh } = await import("../../update/refresh-scheduler");
       const checked = await (deps.checkPackageUpdate ?? packageRefresh.check)(channel);
+      // Resolve the systemd-scope launcher before spawning: the first request
+      // would otherwise run up to four sequential five-second probes inside
+      // spawnSync on the shared event loop.
+      const { resolveSystemdRunAsync } = await import("../../update/worker-launch");
+      const systemdRun = process.platform === "linux" && process.env.INVOCATION_ID
+        ? await resolveSystemdRunAsync()
+        : undefined;
       return jsonResponse({ ok: true, job: startUpdateJob(channel, body.restart !== false, {
         checkForUpdateFn: () => checked,
+        spawnWorkerFn: (jobId, runChannel, runRestart) =>
+          spawnGuiUpdateWorker(jobId, runChannel, runRestart, { resolveSystemdRun: () => systemdRun }),
       }) });
     } catch (err) {
       if (err instanceof UpdateJobError) {

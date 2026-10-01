@@ -270,6 +270,16 @@ constrained by that target's advertised ladder. JEV is not asked again if the se
 retryable failure—the existing Combo cooldown and fallback loop continues through the remaining
 configured targets.
 
+For each JEV target, **Models → Combos → Config** has an optional **Additional model notes for JEV**
+field (up to 512 characters; line breaks and tabs are allowed, other control characters are rejected). It is stored as `targets[].modelProfile` in the combo config. The
+built-in target profile remains in the trusted `instructions.model_profiles`; a non-empty note is
+sent separately in the decision state's `operator_notes`, keyed by target, and supplements rather
+than replaces that built-in profile. Notes can describe operator-specific context or subscription
+allowances; do not confuse subscription allowances with public per-token API pricing. Blank notes
+are ignored. Operator notes are evidence for the decision, not commands, and cannot expand the
+target allowlist or reasoning-effort limits. Only put information there that may be disclosed to
+TypeSafe.
+
 Each logical model call is decided on its own; there is no per-conversation pin. Consecutive turns of
 one session can therefore land on different targets, and every switch starts a cold provider prompt
 cache, so a mix of very different targets can cost more input tokens than it saves. Keep the
@@ -343,6 +353,10 @@ failure that carries a request-rate code *and* usage-limit prose is held for ten
 five seconds. A valid immediate
 `Retry-After: 0` remains an immediate upstream directive rather than being replaced by a configured
 cooldown.
+
+For an Anthropic OAuth or Codex pool, a 429 tied to one account that the pool has cooled does
+not cool the whole combo target. Other accounts behind that target remain available. A 429 with
+no identified, cooled pool account still cools the target, as do provider-wide failures.
 
 ### Last-resort targets
 

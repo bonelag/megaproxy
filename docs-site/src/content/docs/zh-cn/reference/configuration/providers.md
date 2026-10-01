@@ -85,6 +85,7 @@ selector，而不是分配一个新名称。
 | `chatCompletionsPath?` | `string` | 用于 `openai-chat` 请求的相对资源路径，是 `responsesPath` 的对应项，适用相同的路径规则。当同一上游以不同前缀提供 Chat Completions 和 Responses 时需要此配置：按模型的 wire override 只更换适配器而不改动 `baseUrl`，否则已启用的 Chat 请求会被发送到 Responses base。随附示例为 Z.AI。 |
 | `upstreamWebsocket?` | `boolean` | 为 `openai-responses` 请求选择性启用上游 Responses WebSocket 传输（默认 `false`）。仅对第一方 `https://api.openai.com/v1` 上游生效；自定义提供者端点始终使用有界 HTTP/SSE，因为 Bun 无法在分配完整消息之前对入站 WebSocket 消息实施大小限制。对于规范 ChatGPT `openai` 提供商，省略该字段会在符合条件的轮次使用上游 WebSocket，`false` 通过 HTTP/SSE 发送流式轮次，`true` 会被拒绝；设为 `false` 时，原生轮次中操控与注入不可用。该字段独立于客户端侧的 `websockets` 设置，且不改变端点或凭据。普通 HTTP 仍使用 SSE；非 Responses 路径和 `openai-chat` 请求仍使用 HTTP。 |
 | `supportsServiceTier?` | `boolean` | `service_tier` 能力的三态。`true`：fast 模式可以注入，调用方提供的值也会被保留。`false`：剥离该字段且绝不注入（已明确不支持的上游不会收到它）。未设置：未分类——调用方提供的值原样保留，fast 模式绝不注入。注册表已对官方 OpenAI（`true`）、DeepSeek 和 Volcengine Ark（`false`）分类；仅对真正支持分层的自定义网关显式设置。 |
+| `responseTierAuthoritative?` | `boolean` | 响应等级是否足以确认或否定 Fast。对响应元数据不具权威性的链路显式设为 `false`；未设置时保持原有行为。不会启用 Fast 或修改出站参数。详见[响应服务等级的可信度](#响应服务等级的可信度)。 |
 | `preserveResponsesReasoningContent?` | `boolean` | 在重放的 Responses reasoning 项中保留明文 reasoning 内容，而不是清空（清空是 ChatGPT 后端的规则）。对接受 reasoning 重放的上游（如 DeepSeek）启用。代理生成的 `ocxr1` 信封始终会被剥离。 |
 | `disabled?` | `boolean` | 将提供者保留在磁盘上，但从路由和模型/目录列表中排除。 |
 | `apiKey?` | `string` | API key，或在请求时解析的 `${ENV_VAR}` / `$ENV_VAR` 引用。 |
@@ -160,17 +161,48 @@ API key 提供者可以持有字面量 key，或环境引用。OAuth 提供者�
 
 ### 保存提供方时会保留什么
 
-用已有提供方的名称调用 `POST /api/providers`，会用根据请求构建的行替换已存储的行。仪表板的添加/编辑表单无法发送所有字段，因此保存时会保留请求省略的部分已存储字段。其中五个记录的是某个上游的行为：`preserveReasoningContentModels`, `requiresReasoningPlaceholderModels`, `foldDeveloperRoleToSystem`, `reasoningWireFormat`, `omitReasoningEffortWithToolsModels`。
+用已有提供方的名称调用 `POST /api/providers`，会用根据请求构建的行替换已存储的行。仪表板的添加/编辑表单无法发送所有字段，因此保存时会保留请求省略的部分已存储字段。其中八个记录的是某个上游的行为：`preserveReasoningContentModels`, `requiresReasoningPlaceholderModels`, `foldDeveloperRoleToSystem`, `reasoningWireFormat`, `omitReasoningEffortWithToolsModels`, `retryOn429`, `transientRetryOn5xx`, `retryOnReset`。
 
-| 保存 | 五项设置 | 已存储的 `apiKeyPool` |
+| 保存 | 八项设置 | 已存储的 `apiKeyPool` |
 | --- | --- | --- |
 | 目的地相同，字段省略 | 保留已存储的值，包括显式的 `[]` 或 `false` | 保留 |
 | 新目的地，字段省略 | 不保留；可能套用新目的地的注册表默认值 | 不保留 |
 | 请求中发送了该字段 | 请求中的值 | 请求中的值 |
 
-目的地指适配器、base URL（协议与主机名比较时不区分大小写，忽略末尾斜杠），以及请求中指定了时的认证模式。把提供方移到其他目的地时，描述旧上游的五项设置和为旧上游签发的密钥池都不会带过去。保存从不把旧行的其余部分合并进新行。
+目的地指适配器、base URL（协议与主机名比较时不区分大小写，忽略末尾斜杠），以及请求中指定了时的认证模式。把提供方移到其他目的地时，描述旧上游的八项设置和为旧上游签发的密钥池都不会带过去。保存从不把旧行的其余部分合并进新行。
 
-`PATCH /api/providers?name=<provider>` 只修改它指定的字段，无论目的地如何都保留其他所有已存储字段。它接受全部五项设置，`null` 表示清除。对于两个推理列表，空数组会作为显式退出选项保存，而不会被删除。
+`PATCH /api/providers?name=<provider>` 只修改它指定的字段，无论目的地如何都保留其他所有已存储字段。它接受全部八项设置，`null` 表示清除。对于两个推理列表，空数组会作为显式退出选项保存，而不会被删除。
+
+### 响应服务等级的可信度
+
+当提供者响应中的 `service_tier` 无法确定 Fast 是否生效时，在 `config.json` 中将
+`providers.<name>.responseTierAuthoritative` 设为 `false`。这是运营者对整个提供者链路的声明，
+独立于 `supportsServiceTier` 和 `fastWire`；它不会启用 Fast，也不会改变出站 `service_tier`。
+
+例如，对于已知 Codex 后端响应元数据不具权威性的网关，在现有 provider 对象中加入：
+
+```json
+{ "responseTierAuthoritative": false }
+```
+
+**网关需要显式配置。** 仅升级 OpenCodex 不会为现有 provider 自动添加该声明。未配置时，
+符合 Fast 条件且已发送 priority 的请求收到 `service_tier: "default"`，仍会按原逻辑记录为 `response-declined`。
+仅对已知响应元数据无法确认实际等级的链路设置 `false`。
+
+对于符合 Fast 条件且已发送 `priority` 的请求，`default` 和 `priority` 响应都只作为观察值。
+日志保留 `responseServiceTier`，并记录 `tierOutcome.responseTierAuthoritative: false`、
+`fastOutcome: "applied"` 和 `confirmation: "assumed"`，不会仅凭响应回显判为 `response-declined`。
+这里 **applied 表示请求参数已发出**，**assumed 表示 Fast 的实际效果尚未确认**。
+模型提示会分别显示请求等级、原始响应等级和确认状态。这些记录不能证明实际加速或计费等级。
+
+费用估算沿用请求等级的回退逻辑，不将原始回显当成已确认的价格等级；要求响应确认的定价规则
+不能使用该回显作为证据。没有可信度标记的历史记录保留原解释。
+
+该字段只接受布尔值。对于官方 API、未声明的网关等其他目的地，省略或显式设为 `true`
+都保留基于响应的判定。标准 `https://chatgpt.com/backend-api/codex` 地址配合
+`authMode: "forward"` 始终自动按非权威处理，即使配置为 `true` 也不例外。
+OpenCodex 不会依据网关名称或 URL 猜测可信度。如果同一网关混合不同的响应契约，
+应拆成独立 provider 条目，只为相关条目配置此声明。
 
 ## 提供者诊断出站安全性
 
@@ -216,7 +248,7 @@ affinity。这些策略不能规避 provider enforcement。
 | `anthropicAccountPool.quotaWindow?` | `"five-hour" \| "weekly" \| "max-utilization"` | `"five-hour"` | 基于用量选择账户时使用的、由提供商报告并缓存的用量条。`five-hour` 保持原有行为。`weekly` 使用每周用量条，并在仍有其他可用账户时跳过 5 小时用量已耗尽的账户；若没有其他账户，则回退使用这些账户。`max-utilization` 使用已知值中的最高值，因此每周用量尚不可用时仍可使用 5 小时用量；两者都未知时，账户遵循 unknown 用量排序。已知用量排在 unknown 之前，但如果所有可用账户都未知，仍会按可用顺序选择一个账户。在前述较低 5 小时用量的同分判定之后，完全相同时也保留可用顺序。不会主动重新平衡健康且已建立亲和性的会话。在新会话分配和符合条件的 429 替代后的路由恢复中，`quota` 直接按此窗口对可用候选账户排序；`fill-first` 按此窗口的阈值和耗尽规则以稳定顺序前进；`round-robin` 忽略此设置。冷却状态、故障转移上限和重新认证资格仍是独立的本地状态。各账户的每周用量只有在控制面板的提供商页面完成查询后才可用。 |
 | `anthropicAccountPool.stickyLimit?` | `number` | `1` | 在一次轮询选择中保留的成功新会话绑定次数。范围 1–100。 |
 
-启用后，429 会根据 `Retry-After` 记录有界冷却，或者使用默认退避，并且可能在同一请求内轮换。亲和性是进程本地的，并且有大小上限。凭据 401/403 会将账户标记为需要重新认证。如果所有合格账户都在冷却，客户端会在已知时收到带 `Retry-After` 的 429，而不是身份验证错误。
+启用后，429 会根据 `Retry-After` 记录有界冷却，或者使用默认退避，并且可能在同一请求内轮换。亲和性是进程本地的，并且有大小上限。令牌刷新失败保留原有重新认证规则。明确的订阅或账户计费 403 可在输出前切换账户，并按 `Retry-After` 或默认十分钟冷却；普通权限拒绝不会切换。如果所有合格账户都在冷却，客户端会在已知时收到带 `Retry-After` 的 429，而不是身份验证错误。
 
 :::caution[Experimental]
 除非你理解 Anthropic 账户策略风险，否则请保持关闭。若不确定，优先手动使用 `ocx account use anthropic <id>` 切换。
@@ -476,3 +508,7 @@ Vercel AI Gateway 可以在多个底层推理提供者之间路由一个模型�
   "visionSidecar": { "enabled": true }
 }
 ```
+
+### `anthropicAccountPool.routes`
+
+`anthropicAccountPool.routes` 将模型绑定到已保存的 Anthropic OAuth 账户 ID。启用账户池后，区分大小写的 `match` 通配模式按顺序取第一个匹配规则，限制首次选择和 429 重试。仅当该规则没有可用账户时，`fallback: true` 才回退到普通账户池。

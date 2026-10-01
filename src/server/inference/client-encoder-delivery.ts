@@ -87,10 +87,12 @@ export interface ClientEncodedDelivery {
   fold: {
     replayCacheScope?: OcxReasoningReplayScopeRef;
     hideThinkingSummary?: boolean;
+    hideRawReasoning?: boolean;
     toolNsMap?: Map<string, { namespace: string; name: string; freeform?: true }>;
     declaredToolNames?: ReadonlySet<string>;
     toolParameterSchemas?: ReadonlyMap<string, Record<string, unknown>>;
     freeformToolNames?: Set<string>;
+    bareCustomToolNames?: ReadonlySet<string>;
     toolSearchToolNames?: Set<string>;
   };
   stallTimeoutSec?: number;
@@ -163,6 +165,8 @@ export async function deliverClientEncodedResponse(input: ClientEncodedDelivery)
         enforceDeclaredToolNames: false,
         translatorBudget,
         recordBufferedDelivery: false,
+        // The client never receives this body, and its Chat/Messages wire has no envelope field.
+        omitHiddenReasoningEnvelope: true,
       });
     } catch {
       return undefined;

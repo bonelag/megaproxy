@@ -1,3 +1,4 @@
+import { rotateAnthropicAccountOnResponse } from "../../oauth/anthropic-account-refusal";
 import type { ResponsesRequestContext } from "./core-options";
 import type { PreparedResponsesRequest } from "./request-prepare";
 import type { ResponsesTransport } from "./request-transport";
@@ -32,7 +33,6 @@ import { persistKiroAccountState } from "../../providers/kiro-account-state-disk
 import { readDisplaySafeErrorText } from "./core-errors";
 import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
-  rotateAnthropicAccountOn429,
   getAnthropicPoolAccessSnapshot,
   formatAnthropicProviderForLog,
 } from "../../oauth/anthropic-routing";
@@ -67,6 +67,7 @@ export async function executeResponsesSidecars(
     | "genericFailoverLimit"
     | "replayOAuthCredentialSnapshot"
     | "applyFailoverSnapshot"
+    | "anthropicRouteDecision"
     | "anthropicPoolAccountId"
     | "anthropicPoolFailovers"
     | "anthropicSessionKey"
@@ -111,6 +112,17 @@ export async function executeResponsesSidecars(
     cancelResponseCompletion,
   } = responseEffects;
 
+  // Resolving the OpenAI search credential may hold the account's sole
+  // cooldown-recovery probe lease. A streamed sidecar result keeps it until the
+  // stream settles — completion or client cancel — so a later in-stream search
+  // outcome can still clear the cooldown; a response with no live body is
+  // terminal, so the lease is handed back before returning it. A recorded
+  // search outcome already settled the lease, making each release a
+  // generation-bound no-op.
+  const releaseSearchProbeLease = (): void => {
+    openAiSidecar?.releaseProbeLease?.();
+  };
+
 
   // Tool results are PAIRED by call_id. parseRequest writes it into OcxToolResultMessage.toolCallId
   // (parser.ts:738/752) without validating it, because inputItemSchema's permissive catch-all
@@ -133,6 +145,8 @@ export async function executeResponsesSidecars(
           || (message as { toolCallId: string }).toolCallId.length === 0),
     );
     if (unpaired) {
+      // Local validation has no running sidecar body to own this lease.
+      releaseSearchProbeLease();
       // Never interpolate the tool output: this message reaches the client and the logs.
       return formatErrorResponse(
         400,
@@ -169,7 +183,7 @@ export async function executeResponsesSidecars(
     retryParsed?: OcxParsedRequest,
     originalResponse?: Response,
   ): Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null> => {
-    if (route.providerName !== "kiro" && originalResponse && originalResponse.status !== 429) return null;
+    if (route.providerName !== "kiro" && !(route.providerName === "anthropic" && originalResponse?.status === 403) && originalResponse && originalResponse.status !== 429) return null;
     const refusal = route.providerName === "kiro" && originalResponse
       ? classifyKiroRefusal(originalResponse.status,
         await readDisplaySafeErrorText(originalResponse.clone(), options.abortSignal ?? new AbortController().signal, "")).kind
@@ -186,7 +200,7 @@ export async function executeResponsesSidecars(
     // sidecar loops used to flatten all three to `key-429`, so an account rotation read as a key
     // rotation in the attempt row and in the Logs UI.
     let recoveryKind: AttemptRecoveryKind = "key-429";
-    const rotated = route.providerName !== "kiro" || originalResponse?.status === 429
+    const rotated = !originalResponse || originalResponse.status === 429
       ? rotateProviderTransportOn429(config, route.providerName, route.provider, {
       retryAfter,
       now: Date.now(),
@@ -246,7 +260,6 @@ export async function executeResponsesSidecars(
       // web-search or image-bridge turn was terminal even with the pool fully enabled -- while
       // the very same 429 on the main response path rotated.
       transportState.anthropicPoolAccountId
-      && transportState.anthropicPoolFailovers < ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST
     ) {
       // Same intersection for the Anthropic roster: its own per-request bound still applies,
       // and the shared budget decides whether this request may spend another send at all.
@@ -254,15 +267,12 @@ export async function executeResponsesSidecars(
         "auth-recovery",
         `${route.providerName}|${route.modelId}|sidecar-anthropic-429`,
       );
-      if (!hop.allowed) return null;
-      const nextAccountId = rotateAnthropicAccountOn429(
-        config,
-        transportState.anthropicPoolAccountId,
-        retryAfter,
-        anthropicSessionKey,
-        Date.now(),
-        responseHeaders,
-      );
+      const nextAccountId = await rotateAnthropicAccountOnResponse(
+        originalResponse ?? new Response(null, { status: 429, headers: responseHeaders ?? (retryAfter ? { "retry-after": retryAfter } : undefined) }), {
+          config, accountId: transportState.anthropicPoolAccountId, sessionKey: anthropicSessionKey,
+          decision: transportState.anthropicRouteDecision, signal: options.abortSignal,
+          canRetry: hop.allowed && transportState.anthropicPoolFailovers < ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
+        });
       if (!nextAccountId) {
         hop.permit?.release();
         return null;
@@ -330,6 +340,7 @@ export async function executeResponsesSidecars(
     // the bridge entirely so enabling the feature doesn't break ordinary non-streaming traffic.
     if (!parsed.stream) {
       if (imgPlan) {
+        releaseSearchProbeLease();
         return formatErrorResponse(400, "invalid_request_error", "image bridge requires stream=true");
       }
       // Video-only: skip bridge for non-streaming requests
@@ -371,7 +382,7 @@ export async function executeResponsesSidecars(
     );
     const imgResponse = await runWithImageBridge({
       parsed, adapter: transportState.adapter,
-      incomingMeta: { headers: requestState.selectedForwardHeaders, abortSignal: options.abortSignal, translatorBudget },
+      incomingMeta: { headers: requestState.selectedForwardHeaders, providerName: route.providerName, abortSignal: options.abortSignal, translatorBudget },
       ...(imgPlan ? { plan: imgPlan } : {}),
       ...(vidPlan ? { videoPlan: vidPlan } : {}),
       forwardHeaders: requestState.selectedForwardHeaders,
@@ -431,11 +442,12 @@ export async function executeResponsesSidecars(
     if (imgResponse.body) {
       const imgTurnAc = new AbortController();
       imgTurnAc.signal.addEventListener("abort", cancelResponseCompletion, { once: true });
-      return new Response(trackStreamLifetime(imgResponse.body, imgTurnAc, undefined, options.turnAdmissionLease), {
+      return new Response(trackStreamLifetime(imgResponse.body, imgTurnAc, releaseSearchProbeLease, options.turnAdmissionLease), {
         status: imgResponse.status,
         headers: imgResponse.headers,
       });
     }
+    releaseSearchProbeLease();
     return imgResponse;
     } // end else (streaming bridge)
   }
@@ -462,6 +474,7 @@ export async function executeResponsesSidecars(
       }),
       incomingMeta: {
         headers: requestState.selectedForwardHeaders,
+        providerName: route.providerName,
         abortSignal: options.abortSignal,
         translatorBudget,
         providerFetch: routedProviderFetch,
@@ -511,11 +524,12 @@ export async function executeResponsesSidecars(
     if (wsResponse.body) {
       const wsTurnAc = new AbortController();
       wsTurnAc.signal.addEventListener("abort", cancelResponseCompletion, { once: true });
-      return new Response(trackStreamLifetime(wsResponse.body, wsTurnAc, undefined, options.turnAdmissionLease), {
+      return new Response(trackStreamLifetime(wsResponse.body, wsTurnAc, releaseSearchProbeLease, options.turnAdmissionLease), {
         status: wsResponse.status,
         headers: wsResponse.headers,
       });
     }
+    releaseSearchProbeLease();
     return wsResponse;
   }
 

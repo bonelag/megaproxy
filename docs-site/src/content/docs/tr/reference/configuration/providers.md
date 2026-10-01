@@ -178,17 +178,17 @@ yapılandırılır.
 
 ### Bir sağlayıcı kaydı neleri korur
 
-Var olan bir sağlayıcının adıyla gönderilen `POST /api/providers`, saklanan satırı istekten oluşturulan bir satırla değiştirir. Panodaki ekleme/düzenleme formu her alanı gönderemez; bu yüzden kayıt, isteğin atladığı bazı saklanan alanları korur. Bunlardan beşi belirli bir üst kaynağın nasıl davrandığını kaydeder: `preserveReasoningContentModels`, `requiresReasoningPlaceholderModels`, `foldDeveloperRoleToSystem`, `reasoningWireFormat`, `omitReasoningEffortWithToolsModels`.
+Var olan bir sağlayıcının adıyla gönderilen `POST /api/providers`, saklanan satırı istekten oluşturulan bir satırla değiştirir. Panodaki ekleme/düzenleme formu her alanı gönderemez; bu yüzden kayıt, isteğin atladığı bazı saklanan alanları korur. Bunlardan sekizi belirli bir üst kaynağın nasıl davrandığını kaydeder: `preserveReasoningContentModels`, `requiresReasoningPlaceholderModels`, `foldDeveloperRoleToSystem`, `reasoningWireFormat`, `omitReasoningEffortWithToolsModels`, `retryOn429`, `transientRetryOn5xx`, `retryOnReset`.
 
-| Kayıt | Beş ayar | Saklanan `apiKeyPool` |
+| Kayıt | Sekiz ayar | Saklanan `apiKeyPool` |
 | --- | --- | --- |
 | Aynı hedef, alan atlanmış | Saklanan değer korunur, açık bir `[]` veya `false` dahil | Korunur |
 | Yeni hedef, alan atlanmış | Korunmaz; yeni hedef için kayıt defteri varsayılanları uygulanabilir | Korunmaz |
 | Alan istekte gönderilmiş | İsteğin değeri | İsteğin değeri |
 
-Hedef; bağdaştırıcı, temel URL (şema ve ana makine büyük/küçük harf gözetmeden karşılaştırılır, sondaki eğik çizgiler yok sayılır) ve istek bir tane belirtiyorsa kimlik doğrulama modudur. Bir sağlayıcıyı başka bir hedefe taşımak, önceki üst kaynağı tanımlayan beş ayarı ve o kaynak için verilmiş anahtar havuzunu bırakır. Bir kayıt, eski satırın geri kalanını yenisiyle asla birleştirmez.
+Hedef; bağdaştırıcı, temel URL (şema ve ana makine büyük/küçük harf gözetmeden karşılaştırılır, sondaki eğik çizgiler yok sayılır) ve istek bir tane belirtiyorsa kimlik doğrulama modudur. Bir sağlayıcıyı başka bir hedefe taşımak, önceki üst kaynağı tanımlayan sekiz ayarı ve o kaynak için verilmiş anahtar havuzunu bırakır. Bir kayıt, eski satırın geri kalanını yenisiyle asla birleştirmez.
 
-`PATCH /api/providers?name=<provider>` yalnızca adını verdiği alanları değiştirir ve hedef ne olursa olsun diğer tüm saklanan alanları korur. Beş ayarın hepsini kabul eder; `null` birini temizler. İki akıl yürütme listesinde boş dizi silinmez, açık bir vazgeçme olarak saklanır.
+`PATCH /api/providers?name=<provider>` yalnızca adını verdiği alanları değiştirir ve hedef ne olursa olsun diğer tüm saklanan alanları korur. Sekiz ayarın hepsini kabul eder; `null` birini temizler. İki akıl yürütme listesinde boş dizi silinmez, açık bir vazgeçme olarak saklanır.
 
 ## Sağlayıcı teşhis giden güvenliği
 
@@ -277,8 +277,7 @@ ve otomatik rotasyon sağlayıcı kısıtlamalarını tetikleyebilir.
 
 Etkinleştirildiğinde 429, `Retry-After`'dan veya varsayılan bir geri çekilmeden
 sınırlı soğuma kaydeder ve istek içinde dönebilir. Bağlılık işleme özeldir ve
-boyut sınırlıdır. Kimlik bilgisi 401/403, hesabı yeniden kimlik doğrulama
-gerektiriyor olarak işaretler. Uygun tüm hesaplar soğuyorsa istemciler bir
+boyut sınırlıdır. Token yenileme hataları mevcut yeniden kimlik doğrulama kurallarını korur. Doğrulanmış abonelik veya hesap ödeme 403 hatası çıktı başlamadan hesap değiştirebilir ve `Retry-After` veya varsayılan on dakika soğuma uygular. Genel izin reddi hesap değiştirmez. Uygun tüm hesaplar soğuyorsa istemciler bir
 kimlik doğrulama hatası değil, bilindiğinde `Retry-After` ile 429 alır.
 
 :::caution[Deneysel]
@@ -602,3 +601,7 @@ geçerli adı kontrol edin.
   "visionSidecar": { "enabled": true }
 }
 ```
+
+### `anthropicAccountPool.routes`
+
+`anthropicAccountPool.routes`, modeli kayıtlı Anthropic OAuth hesap kimliklerine bağlar. Havuz açıkken büyük/küçük harfe duyarlı `match` kalıbıyla ilk eşleşen kural ilk seçimi ve 429 yeniden denemesini sınırlar. `fallback: true` yalnızca kuralda uygun hesap kalmadığında normal havuza döner.

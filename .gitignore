@@ -45,6 +45,7 @@ package-lock.json
 # becomes tracked again.
 .codexclaw/
 **/.codexclaw/
+.agents/
 .omo/
 **/.omo/
 

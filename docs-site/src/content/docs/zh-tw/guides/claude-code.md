@@ -26,7 +26,7 @@ sticky session affinity 與依用量的新工作階段選擇。它**不**控制 
 - 上游 **429** 會讓該帳號冷卻（有 `Retry-After` 時使用它，否則用預設 backoff）、清除其 affinity，
   並可能在同一個請求內輪換到另一個合格帳號（有上限）。
 - Affinity 是**程序本機**的（proxy 重啟後就會遺失）。
-- **401/403** 憑證失敗會隔離該帳號（`needsReauth`），直到重新認證前都不會參與選擇。
+- Token 更新失敗保留既有 `needsReauth` 規則。明確的訂閱或帳號計費 403 可在輸出前切換帳號，冷卻遵循 `Retry-After` 或預設十分鐘；一般權限拒絕不切換。詳見[帳號復原](/guides/claude-code/)。
 - 如果每個合格帳號都在冷卻，proxy 會回傳 **429**（不是 401），並在已知時附上 `Retry-After`。
 - 復原（包括 429 容錯移轉）會使用 `quotaWindow` 為合格的替代帳號排序，且不改變現有的冷卻或
   容錯移轉上限；`round-robin` 會忽略 `quotaWindow`。
@@ -143,7 +143,9 @@ unknown 表示 opencodex 無法確定設定是否仍指向自己的代理。外�
 Picker 模式是第一方模式的一部分。在 macOS 上選擇第一方時預設開啟；設定
 `claudeCode.intercept.picker: false` 後會保持關閉。它會修改第一方 Desktop 的 Code 分頁模型選擇器，
 依名稱列出可用的 opencodex 模型。首次開啟時，macOS 可能會要求你在登入鑰匙圈中信任本機憑證授權單位。
-該授權單位限制為 `claude.ai` 及其子網域；這個提示是對該本機 CA 的一次性信任步驟。
+該授權單位限制為 `claude.ai` 及其子網域。其簽章金鑰只存在於執行中的 OpenCodex 處理程序內，因此每次重新啟動
+OpenCodex 都會發佈新的授權單位，macOS 也會再次請求信任——請在每次重新啟動後核准該提示，或稍後執行
+`ocx claude desktop picker trust`。
 
 Picker 模式開啟期間，Claude Desktop 會透過 OpenCodex 存取網路。如果 OpenCodex 停止，Desktop 會離線，
 直到你完全重新啟動 Desktop 或關閉 Picker 模式。使用 `ocx claude desktop picker status` 查看狀態，
@@ -258,7 +260,7 @@ opencodex 路由：
 
 ```bash
 ocx claude desktop bind claude-sonnet-4-6 xai/grok-4.7
-ocx claude desktop bind claude-opus-4-6 native/gpt-6-sol
+ocx claude desktop bind claude-opus-4-6 native/gpt-6.1-sol
 ocx claude desktop unbind claude-opus-4-6
 ```
 
@@ -636,3 +638,7 @@ Claude 模型時自動載入。對於原生透傳，這是正常現象；對於�
 在 `config.json` 中設定 `claudeCode.stabilizePromptCache: true`，可在轉換路由上將系統指令末尾支援的 Claude 提示移到最後一則使用者訊息。預設值為 `false`。僅在用戶端允許這種角色變更時啟用。程式碼圍欄中的範例和不符合的文字會保留，Anthropic 原生轉送不變。沒有中繼資料時，快取鍵依穩定後的指令計算。此選項不會產生對話識別碼，也不保證上游快取命中。
 
 在所有轉換後的 Chat 路由上，時間線提醒都會保留在對話中的原有位置（排在尚待傳回的工具結果之後）。因此，新增提醒不會重寫開頭的系統提示，對話中途的指令也不會被移到它原本應跟隨的輪次之前。該位置攜帶哪個角色是另外決定的：除非提供者記錄了 `foldDeveloperRoleToSystem: false`，否則提醒以 `system` 傳送；該記錄表示上游接受 `developer` 角色，此時提醒在相同位置照原樣轉送。不接受該角色的上游會回應 `400 role 'developer' is not allowed`，該回合根本無法開始，所以未記錄的目的地採用摺疊。無論 `stabilizePromptCache` 是否啟用，此行為都會生效；Anthropic 原生轉送維持不變。快取重用仍需要穩定的工作階段識別碼和可用的上游快取。修改較早的指令或工具、壓縮對話也可能影響快取命中；僅保留提醒順序並不保證快取重用。
+
+### `anthropicAccountPool.routes`
+
+帳戶池啟用時，`anthropicAccountPool.routes` 依模型第一個符合的規則，將首次選擇和 429 重試限制在已儲存帳戶內。沒有可用帳戶時會在本機拒絕；`fallback: true` 才允許使用一般帳戶池。規則不代表帳戶確實有模型權限。
