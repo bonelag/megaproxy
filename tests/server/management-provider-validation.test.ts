@@ -1427,8 +1427,10 @@ describe("provider management validation", () => {
     saveConfig({
       port: 0,
       openaiProviderTierVersion: 2,
+      subagentModelsVersion: 3,
+      subagentModels: [],
       defaultProvider: "openai",
-      providers: { openai: { ...canonicalDirect } },
+      providers: { openai: { ...canonicalDirect, liveModels: false } },
     } as OcxConfig);
     const server = startServer(0);
     try {
@@ -1464,8 +1466,10 @@ describe("provider management validation", () => {
     saveConfig({
       port: 0,
       openaiProviderTierVersion: 2,
+      subagentModelsVersion: 3,
+      subagentModels: [],
       defaultProvider: "openai",
-      providers: { openai: { ...canonicalDirect } },
+      providers: { openai: { ...canonicalDirect, liveModels: false } },
     } as OcxConfig);
     const server = startServer(0);
     try {
@@ -1517,8 +1521,10 @@ describe("provider management validation", () => {
     saveConfig({
       port: 0,
       openaiProviderTierVersion: 2,
+      subagentModelsVersion: 3,
+      subagentModels: [],
       defaultProvider: "openai",
-      providers: { openai: { ...canonicalDirect } },
+      providers: { openai: { ...canonicalDirect, liveModels: false } },
     } as OcxConfig);
     const server = startServer(0);
     try {
