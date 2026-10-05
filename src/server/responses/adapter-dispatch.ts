@@ -1,3 +1,4 @@
+import { classifyAnthropic429 } from "../../oauth/anthropic-rate-limit-policy";
 import { rotateAnthropicAccountOnResponse } from "../../oauth/anthropic-account-refusal";
 import { isNonReplayableResponse } from "../../lib/upstream-retry";
 import { isLocalUpstream } from "../../lib/local-upstream";
@@ -45,9 +46,10 @@ import type { OpaqueBlobRecoveryGuard } from "./core-opaque-recovery";
 import type { AttemptRecoveryKind } from "../../usage/log";
 import type { OAuthAccessSnapshot } from "../../oauth";
 import { OAuthAccountPausedError, OAuthLoginRequiredError, publicOAuthAuthenticationErrorMessage } from "../../oauth";
-import { getAccountSet } from "../../oauth/store";
+import { getAccountSet, markAccountNeedsReauthIfGeneration } from "../../oauth/store";
 import { tryKiroAlternateAfterTerminalRefresh } from "../../oauth/kiro-terminal-failover";
 import { classifyKiroRefusal } from "../../adapters/kiro-refusal";
+import { classifyAntigravityRefusal } from "../../adapters/antigravity-refusal";
 import { normalizeFinalKiroHttpError } from "../../adapters/kiro-retry";
 import { noteKiroMonthlyRefusal } from "../../providers/kiro-usage";
 import { persistKiroAccountState } from "../../providers/kiro-account-state-disk";
@@ -691,7 +693,8 @@ export async function prepareAdapterExchange(
           refreshed = await refreshResolvedOAuthSelection(transportState.sentOAuthSnapshot);
         } catch (err) {
           const failed = transportState.sentOAuthSnapshot;
-          if (route.providerName === "google-antigravity" && err instanceof OAuthLoginRequiredError && failed
+          if (route.providerName === "google-antigravity" && !antigravityAuthRotationAttempted
+            && err instanceof OAuthLoginRequiredError && failed
             && getAccountSet(route.providerName)?.accounts.some(row =>
               row.id === failed.accountId && row.needsReauth === true)) {
             antigravityAuthRotationAttempted = true;
@@ -993,8 +996,8 @@ export async function prepareAdapterExchange(
       ) {
         const nextAccountId = await rotateAnthropicAccountOnResponse(upstreamResponse, {
           config, accountId: transportState.anthropicPoolAccountId, sessionKey: anthropicSessionKey,
-          decision: transportState.anthropicRouteDecision, signal: upstream.signal,
-          canRetry: transportState.anthropicPoolFailovers < ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
+          model: route.modelId, requestKey: transportState, decision: transportState.anthropicRouteDecision, signal: upstream.signal,
+          canRetry: !sendBudgetExhausted() && transportState.anthropicPoolFailovers < ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
         });
         if (!nextAccountId) break;
         try {
@@ -1091,6 +1094,11 @@ export async function prepareAdapterExchange(
             resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
             config.cacheRetention,
           );
+          bindRouteReasoningReplayScope({
+            parsed, providerName: route.providerName, provider: route.provider,
+            adapterName: transportState.activeAdapter.name,
+            oauthCredentialSnapshot: transportState.replayOAuthCredentialSnapshot,
+          });
           sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, transportState.activeAdapter.name, logCtx.accountLogLabel);
           recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, transportState.activeAdapter.name);
           // The replay IS this hop's send, so hand the reservation down and let the layer that
@@ -1190,6 +1198,13 @@ export async function prepareAdapterExchange(
             resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
             config.cacheRetention,
           );
+          // Same contract as the Kiro refusal arm: the replay must carry the replacement
+          // account's continuation owner and reasoning scope, never the account that just 429'd.
+          bindRouteReasoningReplayScope({
+            parsed, providerName: route.providerName, provider: route.provider,
+            adapterName: transportState.activeAdapter.name,
+            oauthCredentialSnapshot: transportState.replayOAuthCredentialSnapshot,
+          });
           sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, transportState.activeAdapter.name, logCtx.accountLogLabel);
           recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, transportState.activeAdapter.name);
           // The replay IS this hop's send, so hand the reservation down and let the layer that
@@ -1225,6 +1240,104 @@ export async function prepareAdapterExchange(
           // request for a send it never made, and a later recovery in the same request is
           // refused on an allowance nothing spent. release() is idempotent and a no-op once
           // used, so a throw from the rebuild keeps its charge.
+          hop.permit?.release();
+          break;
+        }
+      }
+      // Antigravity verify-account quarantine: a 403 demanding account verification
+      // is terminal for THAT account — its grant still refreshes, so only a manual
+      // verification followed by a re-login clears it. Mark it needsReauth (durable,
+      // shown as `needs-reauth(verify)` in `ocx account list` with a `verify_account`
+      // health reason in the management API, excluded from the pool until re-login)
+      // and replay the same request on the next eligible account so the pool keeps
+      // serving.
+      while (
+        upstreamResponse.status === 403
+        && route.providerName === "google-antigravity"
+        && transportState.genericFailoverAccountId
+      ) {
+        const refusal = classifyAntigravityRefusal(upstreamResponse.status,
+          await readDisplaySafeErrorText(upstreamResponse.clone(), upstream.signal, ""));
+        if (refusal.kind === "other") break;
+        const sent = transportState.sentOAuthSnapshot;
+        const failedAccountId = transportState.genericFailoverAccountId;
+        // Fenced write: a 403 arriving after the credential rotated (refresh or
+        // re-login) must not quarantine the new login. Without the matching sent
+        // snapshot there is no owner for this write, so skip marking.
+        if (!sent || sent.accountId !== failedAccountId) break;
+        try {
+          await markAccountNeedsReauthIfGeneration(route.providerName, failedAccountId, sent.generation, undefined, "verify_account");
+        } catch {
+          // A failed quarantine write must preserve the refusal, not authorize another send.
+          break recovery;
+        }
+        if (!antigravityPoolActivated || transportState.genericFailovers >= transportState.genericFailoverLimit) break;
+        const adapterOwnsDispatch = transportState.activeAdapter.fetchResponse !== undefined;
+        const hop = reserveCredentialHop(
+          "auth-recovery",
+          `${route.providerName}|${route.modelId}|adapter-recovery-oauth-verify`,
+          !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
+        );
+        if (!hop.allowed) break;
+        // Auth-refusal rotation, not the rate-limit one: a verification refusal
+        // must not record rate-limit cooldown semantics against the account.
+        const nextAccountId = rotateAntigravityAccountOnAuthRefusal(
+          antigravityPoolActivated,
+          failedAccountId,
+          sent.generation,
+          route.modelId,
+        );
+        if (!nextAccountId) {
+          hop.permit?.release();
+          break;
+        }
+        // The refusal body stays alive until the replacement owns the outcome: it
+        // is also the preserveFailureResponse below, so cancelling it early would
+        // hand back a 403 with a destroyed body when the rebuild is refused.
+        const failedResponse = upstreamResponse;
+        try {
+          // The FULL snapshot, not just the bearer: Antigravity pairs an
+          // account-matched projectId with its token, so a token-only swap would mix
+          // one account's credential with another's routing data.
+          const snapshot = await failoverAccountSnapshot(route.providerName, nextAccountId);
+          if (!await applyFailoverSnapshot(snapshot)) {
+            hop.permit?.release();
+            break;
+          }
+          invalidateSameTargetRequest();
+          transportState.activeAdapter = resolveSelectionAdapter(
+            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
+            config.cacheRetention,
+          );
+          bindRouteReasoningReplayScope({
+            parsed,
+            providerName: route.providerName,
+            provider: route.provider,
+            adapterName: transportState.activeAdapter.name,
+            oauthCredentialSnapshot: transportState.replayOAuthCredentialSnapshot,
+          });
+          sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, transportState.activeAdapter.name, logCtx.accountLogLabel);
+          recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, transportState.activeAdapter.name);
+          sendBudgetState.pendingHopPermit = hop.permit;
+          let result: Response | { failed: Response };
+          try {
+            result = await rebuildAndRefetch("oauth-account-403", () => {
+              if (!adapterOwnsDispatch) hop.permit?.use();
+            }, failedResponse);
+          } finally {
+            sendBudgetState.pendingHopPermit = undefined;
+          }
+          if ("failed" in result) {
+            hop.permit?.release();
+            if (result.failed !== failedResponse) return result.failed;
+            // Preserve common redaction and combo consumption without another recovery send.
+            break recovery;
+          }
+          transportState.genericFailovers += 1;
+          try { void failedResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+          upstreamResponse = result;
+          if (isNonReplayableResponse(upstreamResponse)) continue recovery;
+        } catch {
           hop.permit?.release();
           break;
         }
@@ -1414,6 +1527,7 @@ export async function prepareAdapterExchange(
           status: upstreamResponse.status,
           message,
           upstreamRetryAfter,
+          includeDefault: !(transportState.anthropicPoolAccountId && classifyAnthropic429(upstreamResponse.headers) === "request-scoped-unknown"),
         });
       return formatErrorResponse(
         upstreamResponse.status,

@@ -1,3 +1,4 @@
+import { isSubagentModelEntry, rawSubagentModelForce } from "./subagent-models";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -64,6 +65,7 @@ import {
   remoteGuiConfigSchema,
   runtimeRoleSchema,
   spendSchema,
+  chatgptDesktopSchema,
   compactionRoutingSchema,
   skillsConfigSchema,
   memoryModelsSchema,
@@ -99,9 +101,14 @@ function validFileConfigDiagnostics(config: OcxConfig, rawParsed: unknown): Conf
   // the entire config, which would hide unrelated providers/accounts. The next
   // ordinary save persists the normalized absence.
   const syncDisabledReason = nativeSubagentSyncDisabledReason(config, rawParsed);
+  const rawForce = rawSubagentModelForce(rawParsed);
   const rawEffort = rawClaudeSubagentEffort(rawParsed);
   const normalized = normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, rawParsed), rawParsed);
   const warnings = configPlaceholderWarnings(normalized);
+  if (rawForce !== undefined && !isSubagentModelEntry(rawForce)) warnings.push("claudeCode.subagentModelForce ignored: expected a safe roster-style model id");
+  if (normalized.chatgptDesktop?.appServerShim === true && process.platform !== "darwin") {
+    warnings.push("chatgptDesktop.appServerShim is experimental and macOS only; ignored on this platform");
+  }
   warnings.push(...inheritedFastWireConflictProviderNames(normalized).map(inheritedFastWireConflictWarning));
   warnings.push(...degradedCodexAccountPriorityWarnings(rawParsed, normalized));
   warnings.push(...degradedListenerWarnings(rawParsed, normalized));
@@ -463,6 +470,15 @@ function showCodexCreditsError(value: unknown): string | null {
   return "schema_invalid: showCodexCredits: must be a boolean or omitted";
 }
 
+function creditCodexAccountIdsError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "creditCodexAccountIds")) return null;
+  const ids = raw.creditCodexAccountIds;
+  if (ids === undefined) return null;
+  if (Array.isArray(ids) && ids.every(id => typeof id === "string" && /^[a-zA-Z0-9._-]{1,64}$/.test(id))) return null;
+  return "schema_invalid: creditCodexAccountIds: must be an array of account ids or omitted";
+}
+
 function oauthOpenBrowserError(value: unknown): string | null {
   const raw = rawConfigRecord(value);
   if (!raw || !Object.hasOwn(raw, "oauthOpenBrowser")) return null;
@@ -619,6 +635,10 @@ function skillsConfigError(value: unknown): string | null {
 }
 
 export function validateConfigCandidate(value: unknown): { ok: true; config: OcxConfig } | { ok: false; error: string } {
+  const chatgptDesktop = rawConfigRecord(value)?.chatgptDesktop;
+  if (chatgptDesktop !== undefined && !chatgptDesktopSchema.safeParse(chatgptDesktop).success) {
+    return { ok: false, error: "schema_invalid: chatgptDesktop: requires an optional boolean appServerShim and no other fields" };
+  }
   const compactionRouting = rawConfigRecord(value)?.compactionRouting;
   if (compactionRouting !== undefined && !compactionRoutingSchema.safeParse(compactionRouting).success) {
     return { ok: false, error: "schema_invalid: compactionRouting: requires a nonblank model, an optional valid reasoningEffort, and optional non-repeating triggers drawn from \"manual\" and \"auto\"" };
@@ -635,6 +655,7 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
   const boundaryError = blockedModelRedirectsError(value)
     ?? compactionRecoveryConfigError(value) ?? configReasoningPinsConfigError(value)
     ?? blankHostnameError(value)
+    ?? (rawSubagentModelForce(value) !== undefined && !isSubagentModelEntry(rawSubagentModelForce(value)) ? "schema_invalid: claudeCode.subagentModelForce: expected a safe roster-style model id" : null)
     ?? claudeSubagentEffortError(value)
     ?? appOwnedMemoryBudgetError(value)
     ?? upstreamHostCircuitThresholdError(value)
@@ -654,6 +675,7 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
     ?? dropCodexSafetyBufferingError(value)
     ?? oauthOpenBrowserError(value)
     ?? showCodexCreditsError(value)
+    ?? creditCodexAccountIdsError(value)
     ?? runtimeRoleError(value)
     ?? remoteGuiConfigError(value)
     ?? clientConnectionConfigError(value)

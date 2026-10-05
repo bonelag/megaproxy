@@ -22,7 +22,7 @@ test("every row maps one-to-one onto a page", () => {
   // The duplicate-row machinery is gone with the row that needed it.
   expect(src).not.toContain("activeHashes");
   expect(src).not.toContain("isNavEntryActive");
-  expect(src).not.toContain('tkey: "nav.claude"');
+  expect(src).toContain('tkey: "nav.claude"');
 
   const navBlock = src.slice(src.indexOf("const NAV: NavEntry[] = ["), src.indexOf("];", src.indexOf("const NAV: NavEntry[] = [")));
   const ids = [...navBlock.matchAll(/\{ id: "([^"]+)"/g)].map(m => m[1]);
@@ -32,7 +32,7 @@ test("every row maps one-to-one onto a page", () => {
   // Chat sits directly under Models: it is the surface for talking to the models
   // that page configures, so the two belong adjacent.
   expect(ids).toEqual([
-    "dashboard", "codex-set", "providers", "models", "chat", "subagents",
+    "dashboard", "codex-set", "claude", "providers", "models", "chat", "subagents",
     "logs", "usage", "storage", "remote", "remote-workspace", "integrations",
   ]);
   // No two rows share a page id, which is what made the correction helper necessary.

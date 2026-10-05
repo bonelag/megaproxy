@@ -1,7 +1,7 @@
 # Responses Failover And Replay
 
  `src/server/responses/request-transport.ts` resolves the final Anthropic model ID once for each enabled-pool request and holds its model route through admission. The three account-refusal retry sites in `adapter-dispatch.ts`, `adapter-continuation.ts` and `sidecar-execution.ts` use the same route, keep the original refusal if no replacement exists inside it, and preserve existing send and output replay limits. A local cooldown returns 429 with the earliest known Retry-After among accounts the route can use when they recover; explicit fallback includes usable ordinary-pool accounts even when the saved route IDs have been removed, while a strict route stays route-scoped. Selection, refusal and 429-rotation logs use the rule’s 1-based `route:#<n>` position, never its name.
-Classified account-entitlement 403 recovery follows the [Anthropic account-pool contract](../providers/anthropic-account-pool.md#account-entitlement-refusal-recovery).
+Classified 429 admission follows the [Anthropic account-pool contract](../providers/anthropic-account-pool.md#classified-429-admission). Classified account-entitlement 403 recovery follows the [Anthropic account-pool contract](../providers/anthropic-account-pool.md#account-entitlement-refusal-recovery).
 `src/server/responses/compaction-recovery-policy.ts` is a pure eligibility policy, not a dispatcher.
 It requires explicit configuration and normalized attempt evidence, preserves ordinary requests,
 and refuses cancellation, committed semantic output, tool effects, protected failures, exhausted
@@ -27,6 +27,8 @@ Retry, replay, and combo failover on the Responses data plane: upstream reset re
 ambiguous-resend gate and replay boundary, combo quota fallback and commit boundaries, compaction
 routing overrides, and output headroom. The endpoint and dispatch rules they build on are in
 [Responses transport](responses.md). `src/lib/errors.ts` classifies an HTTP 400 input-token-count overflow as `context_length_exceeded`, including the counted-token variant; the wording is Google's, but the shared classifier matches it for any provider. Output-token limits and protected failures retain their existing categories. Classification does not itself shorten input or authorize replay.
+
+Policy-selected turns also retain their [original candidate authorization](policy-fallback.md) through fallback and subagent recovery.
 
 ## Chat-to-Responses message phase inference
 
@@ -310,6 +312,9 @@ on which trigger it carries; copies that name different triggers are rejected ra
 Malformed, absent, and ordinary-turn metadata leave the request unchanged. WebSocket requests use
 only per-frame metadata; handshake headers can describe an earlier request.
 
+`compactionRouting.sourceModels` optionally restricts the override to exact incoming model or `provider/*` selectors, matched against
+the routed base id so a synthetic `--fast` or effort suffix cannot escape the list; omission keeps all-model routing and malformed or empty lists disable the override.
+
 `compactionRouting.triggers` names the `compaction.trigger` values the override covers, drawn
 from Codex's own `manual` and `auto`. Omission means `["manual"]`, so a block that does not
 mention triggers routes manual `/compact` only and leaves automatic compaction exactly where it
@@ -320,13 +325,11 @@ canonical `openai` provider exists (#2901), not when its quota is exhausted. A h
 `triggers` the schema would reject disables the whole block instead of widening it, so a
 malformed edit can never route more than it names.
 
-The override changes only the model and optional reasoning effort. Existing native forwarding,
-routed summaries, capability handling, and retry budgets remain authoritative; native compact
-still removes reasoning before sending. Internal handoffs carry the override record (with the
-conversation's source model) as a recursion guard so combo children and fallback attempts
-retain their selected targets. Overrides bypass shadow interception and conversation
-combo recall, and do not publish replacement combo/handoff recall. They never change the
-conversation's configured model or any compaction request outside the configured triggers.
+The override changes only the model and optional reasoning effort; native forwarding, routed summaries, capability handling, and retry
+budgets stay authoritative, and native compact still removes reasoning before sending. Handoffs carry the override record (with the source
+model) as a recursion guard so combo children and fallbacks keep their targets. Overrides bypass shadow interception and conversation
+combo recall, and do not publish replacement combo/handoff recall. They never change the conversation's model or compactions outside the
+configured triggers.
 
 `compactionRoutingKeepsProviderIdentity` compares the source model's concrete route with the
 selected route (provider name, Codex account mode and namespace; combos on either side never
@@ -341,9 +344,8 @@ build both honor for canonical ChatGPT destinations. Native ciphertext is replay
 backend that minted it; the conversation model would otherwise resume with an omission marker
 in place of its history.
 
-`tests/responses/responses-compaction-override.test.ts` covers trigger selection, config validation,
-native and routed handlers, same-provider credential retention, cross-provider portable summaries
-and their replay, combo failover, and subsequent conversation settings.
+`tests/responses/responses-compaction-override.test.ts` covers source filtering, trigger selection, config
+validation, native and routed handlers, credential retention, portable summaries and replay, and combo failover.
 ## Ambiguous connection-reset replay boundary
 
 Three failures look alike from the outside — the turn may have executed and we cannot

@@ -118,6 +118,10 @@ be configured on a separately named custom or self-hosted Ollama provider with
   is refused rather than mis-sent, and remote image URLs are not fetched.
 - **Tools:** declared in Ollama's native shape, streamed tool calls are whole-call records with
   object-valued `arguments`, and tool-result replay is paired strictly by call id and tool name.
+  Codex may record assistant commentary before a pending call's results. Text/thinking with no
+  new tool calls is deferred until the batch is settled, so genuine results remain beside their
+  originating calls. A new tool-call batch still settles the preceding one; missing results retain
+  an explicit unknown-status marker, and orphan or duplicate results remain invalid.
   `tool_choice: "none"` and `auto` behave normally; **`required` or an exact named choice fails
   closed**, because Ollama's `/api/chat` has no `tool_choice` field to enforce it with.
 - **Structured output is refused on canonical Ollama Cloud.** Ollama currently documents structured
@@ -137,8 +141,10 @@ configured provider key.
 The adapter preserves the incoming client's `User-Agent` as a fallback in both auth modes because
 some Responses-compatible providers use the Codex client fingerprint for compatibility behavior.
 An explicitly configured provider `User-Agent` remains authoritative regardless of header casing;
-if the caller sends none, OpenCodex does not invent one. No other caller header is widened by this
-exception.
+if the caller sends none, OpenCodex does not invent one. Additional caller metadata can be selected
+with `forwardClientHeaders`; provider `headers` win for this option, and credential or transport-owned
+names are refused. Canonical ChatGPT forward auth retains its separate fixed header allowlist.
+Only `originator`, `x-client-request-id`, `x-codex-app-version`, and `user-agent` are supported by `forwardClientHeaders`; arbitrary names are rejected on load/write and ignored at runtime.
 
 Adapter selection does not select the upstream transport. Eligible requests can use the
 [upstream WebSocket proxy route](/reference/proxy-formats/#json-and-sse-output); invalid or unsupported
@@ -654,6 +660,20 @@ still lands on it, so the request fails with that variant's own error rather tha
 quietly switching tier. Resolution never moves
 to another family. When the account catalog is unavailable, the effort is
 appended to the id instead.
+
+## `zed`
+
+**Targets:** Zed Hosted AI's `POST /completions` endpoint at `cloud.zed.dev`.
+**Auth:** Zed native-app account identity plus access token, exchanged for a short-lived LLM token.
+
+- Uses the native RSA callback login (`ocx login zed`) and pairs the returned `user_id` with the
+  access token for account-scoped user and organization lookups.
+- Wraps the existing Anthropic Messages, Google Gemini, OpenAI Responses, and xAI Chat builders
+  inside Zed's provider envelope, then unwraps Zed's NDJSON/SSE events back into `AdapterEvent`.
+- Fetches a bounded, account-scoped live model roster for display and provider-family inference;
+  the roster is not a model allowlist, so a caller-supplied model id is still forwarded.
+- Experimental, unofficial, and not endorsed by Zed. Using it may break Zed's terms of service
+  and can get the Zed account limited or suspended; that risk is the user's to accept.
 
 ## `azure-openai` (alias: `azure`)
 

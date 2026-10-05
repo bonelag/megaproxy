@@ -17,6 +17,7 @@ import type { LivenessIo, LiveProxy } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
 import type { OwnedIntegrationRefreshOutcome } from "../integrations/owned-refresh";
 import { hasHelpFlag, printSubcommandUsage, printUsage } from "./help";
+import { printUnknownCommand } from "./help-recovery";
 import {
   HUB_GATED_SKIP_MESSAGE,
   localClientSkipMessage,
@@ -351,7 +352,8 @@ const commandRunners: Record<string, CommandRunner> = {
       console.error(clientState.kind === "connected"
         ? "Client mode does not start a local provider proxy; use 'ocx sync'."
         : `Client state is ${clientState.kind}: ${clientState.reason}`);
-      return 1;
+      // A validated client delegates inference to its hub; no local startup is needed.
+      return clientState.kind === "connected" ? 0 : 1;
     }
     await deps.handleEnsure();
     return Number(process.exitCode ?? 0);
@@ -513,7 +515,7 @@ const commandRunners: Record<string, CommandRunner> = {
             },
             config,
             port: live.port,
-          }, ["mcode", "pi", "raycast", "omo", "cline", "droid"]));
+          }, ["mcode", "pi", "raycast", "omo", "cline", "droid", "opencode", "kilo"]));
         } catch (error) {
           console.warn(`Client integrations were not refreshed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -947,6 +949,10 @@ const commandRunners: Record<string, CommandRunner> = {
     const { handleLabCommand } = await import("./lab");
     return await handleLabCommand(deps.args.slice(1));
   },
+  chatgpt: async deps => {
+    const { handleChatgptCommand } = await import("./chatgpt-command");
+    return await handleChatgptCommand(deps.args.slice(1));
+  },
   claude: async deps => {
     const { cmdClaude } = await import("./claude");
     // "ocx claude desktop" → write Desktop 3P config
@@ -955,6 +961,10 @@ const commandRunners: Record<string, CommandRunner> = {
       const exitCode = await handleClaudeDesktopCommand(deps.args.slice(2));
       if (exitCode !== 0) return exitCode;
       return 0;
+    }
+    if (deps.args[1] === "intercept") {
+      const { handleClaudeInterceptCommand } = await import("./integrations");
+      return await handleClaudeInterceptCommand(deps.args.slice(2));
     }
     if (deps.args[1] === "config") {
       const { handleClaudeConfigCommand } = await import("./integrations");
@@ -1158,8 +1168,7 @@ export async function dispatchCommand(head: CliHead, deps: CliDispatchDeps): Pro
   }
   const runner = commandRunners[resolveDispatchCommand(command) ?? ""];
   if (!runner) {
-    console.error(`Unknown command: ${command}`);
-    printUsage();
+    printUnknownCommand(command);
     return 1;
   }
   return await runner(deps);

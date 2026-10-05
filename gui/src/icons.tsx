@@ -21,6 +21,7 @@ export const IconHardDrive = (p: P) => (<svg {...S(p)}><path d="M22 12H2"/><path
 export const IconCheck = (p: P) => (<svg {...S(p)}><path d="m20 6-11 11-5-5"/></svg>);
 export const IconX = (p: P) => (<svg {...S(p)}><path d="M18 6 6 18M6 6l12 12"/></svg>);
 export const IconPlus = (p: P) => (<svg {...S(p)}><path d="M12 5v14M5 12h14"/></svg>);
+export const IconMinus = (p: P) => (<svg {...S(p)}><path d="M5 12h14"/></svg>);
 export const IconRefresh = (p: P) => (<svg {...S(p)}><path d="M21 12a9 9 0 0 1-9 9 9.8 9.8 0 0 1-6.7-2.7L3 16M3 21v-5h5M3 12a9 9 0 0 1 9-9 9.8 9.8 0 0 1 6.7 2.7L21 8M21 3v5h-5"/></svg>);
 export const IconPause = (p: P) => (<svg {...S(p)}><path d="M8 5v14M16 5v14"/></svg>);
 export const IconPlay = (p: P) => (<svg {...S(p)}><path d="m7 4 13 8-13 8Z"/></svg>);
@@ -95,6 +96,9 @@ export const IconGrip = (p: P) => (
 );
 export const IconStar = (p: P) => (<svg {...S(p)}><path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>);
 export const IconFilter = (p: P) => (<svg {...S(p)}><path d="M4 5h16l-6 7v5l-4 2v-7L4 5z"/></svg>);
+/** Claude sunburst, using the same currentColor stroke as the navigation marks. */
+export const IconClaude = (p: P) => (<svg {...S(p)}><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M5.6 18.4 18.4 5.6M8.5 3.7l7 16.6M3.7 8.5l16.6 7M3.7 15.5l16.6-7M8.5 20.3l7-16.6"/></svg>);
+
 /** Speech bubble — Chat nav row. */
 export const IconMessage = (p: P) => (<svg {...S(p)}><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z"/></svg>);
 
@@ -128,4 +132,3 @@ export const IconSparkles = (p: P) => (
 );
 /** Clock with a counter-clockwise arrow — the History pill. */
 export const IconHistory = (p: P) => (<svg {...S(p)}><path d="M3.5 8.5V4M3.5 8.5H8"/><path d="M3.6 12a8.5 8.5 0 1 0 2.5-5.6L3.5 8.5"/><path d="M12 8v4.3l3.2 1.9"/></svg>);
-
