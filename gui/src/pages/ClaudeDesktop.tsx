@@ -19,6 +19,7 @@ import {
   roleListOrder,
   roleOptions,
   roleValue,
+  type Assignment,
   type DesktopProfile,
   type Family,
 } from "./claude-desktop-roles";
@@ -165,23 +166,28 @@ function cloneProfile(profile: DesktopProfile): DesktopProfile {
 }
 
 function normalizeProfile(data: DesktopResponse): DesktopProfile {
-  const assignments = { ...data.profile.assignments };
+  const assignments: Record<string, Assignment> = {};
   for (const model of data.models) {
-    const current = assignments[model.route] ?? model.assignment;
+    if (!model.available) continue;
+    const current = (data.profile.assignments[model.route] ?? model.assignment) as (Assignment & { supports1m?: boolean; prefer1m?: boolean }) | undefined;
     assignments[model.route] = {
-      family: FAMILIES.includes(current?.family) ? current.family : "opus",
+      ...(current && typeof current === "object" ? current : {}),
+      family: FAMILIES.includes(current?.family as Family) ? (current!.family as Family) : "opus",
       alias: typeof current?.alias === "string" ? current.alias : "",
     };
+  }
+  const defaults = { ...data.profile.defaults };
+  for (const family of FAMILIES) {
+    const currentDef = defaults[family];
+    if (!currentDef || !assignments[currentDef] || assignments[currentDef].family !== family) {
+      const members = Object.keys(assignments).filter(route => assignments[route]?.family === family).sort();
+      defaults[family] = members[0] ?? null;
+    }
   }
   return {
     version: 1,
     assignments,
-    defaults: {
-      opus: data.profile.defaults.opus ?? null,
-      fable: data.profile.defaults.fable ?? null,
-      sonnet: data.profile.defaults.sonnet ?? null,
-      haiku: data.profile.defaults.haiku ?? null,
-    },
+    defaults,
   };
 }
 
@@ -296,7 +302,8 @@ export default function ClaudeDesktop({
     // A successful read is authoritative until the user edits again. Updating drafts here keeps
     // the established save→reload contract without synchronizing resource data in an effect.
     setProfile(normalized);
-    setSavedProfile(cloneProfile(normalized));
+    const hasUnavailable = payload.models.some(m => !m.available && payload.profile.assignments[m.route]);
+    setSavedProfile(hasUnavailable ? cloneProfile(payload.profile) : cloneProfile(normalized));
     setDestinations(Object.fromEntries(payload.models.map(model => [model.route, normalized.assignments[model.route]?.family ?? "opus"])));
     // Fold empty families on load, but only while the user has no stored preference.
     // Doing it here rather than per render means a later move or import can never
@@ -425,13 +432,34 @@ export default function ClaudeDesktop({
     setPending("save");
     setMessage(null);
     try {
+      // Auto-clear any unavailable / deleted models before saving
+      const availableSet = new Set(data?.models.filter(m => m.available).map(m => m.route) ?? []);
+      const cleanAssignments = { ...profile.assignments };
+      if (data) {
+        for (const route of Object.keys(cleanAssignments)) {
+          if (!availableSet.has(route)) {
+            delete cleanAssignments[route];
+          }
+        }
+      }
+      const cleanDefaults = { ...profile.defaults };
+      for (const family of FAMILIES) {
+        const currentDef = cleanDefaults[family];
+        if (!currentDef || !cleanAssignments[currentDef] || cleanAssignments[currentDef].family !== family) {
+          const members = Object.keys(cleanAssignments).filter(route => cleanAssignments[route]?.family === family).sort();
+          cleanDefaults[family] = members[0] ?? null;
+        }
+      }
+      const profileToSave = { ...profile, assignments: cleanAssignments, defaults: cleanDefaults };
+
       const response = await fetch(`${apiBase}/api/claude-desktop`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profile }),
+        body: JSON.stringify({ profile: profileToSave }),
       });
       await readJsonOrThrow<{ error?: string }>(response, t("claudeDesktop.saveFailed"));
-      setSavedProfile(cloneProfile(profile));
+      setSavedProfile(cloneProfile(profileToSave));
+      setProfile(profileToSave);
 
       if (applyAfter) {
         setPending("apply");
@@ -461,6 +489,7 @@ export default function ClaudeDesktop({
       }
       // Apply/save change the bar tone; do not wait for the 5s poll or the strip flips late.
       void statusResource.refresh();
+      void desktopResource.refresh();
     } catch (error) {
       const text = error instanceof Error ? error.message : t("claudeDesktop.updateFailed");
       setMessage({ tone: "err", text });
@@ -685,6 +714,22 @@ export default function ClaudeDesktop({
 
       {data.models.length === 0 && (
         <EmptyState title={t("claudeDesktop.emptyTitle")}>{t("claudeDesktop.emptyHint")}</EmptyState>
+      )}
+
+      {data.models.some(m => !m.available) && (
+        <Notice tone="warn">
+          <span style={{ display: "inline-flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <span>{t("claudeDesktop.hiddenUnavailable", { count: data.models.filter(m => !m.available).length })}</span>
+            <button
+              type="button"
+              className="btn btn-sm btn-ghost"
+              onClick={() => void save(true)}
+              disabled={pending !== null}
+            >
+              {pending === "save" || pending === "apply" ? t("claudeDesktop.saving") : t("claudeDesktop.saveApply")}
+            </button>
+          </span>
+        </Notice>
       )}
 
       {data.models.length > 0 && (
